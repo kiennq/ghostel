@@ -255,12 +255,14 @@ PROCESS is the shell process."
 
 (defun ghostel--start-process ()
   "Start the shell process with a PTY."
-  (let* ((process-environment
+  (let* ((height (max 1 (window-body-height)))
+         (width (max 1 (window-max-chars-per-line)))
+         (process-environment
           (append
            (list
             (format "TERM=%s" "xterm-256color")
-            (format "COLUMNS=%d" (window-max-chars-per-line))
-            (format "LINES=%d" (window-body-height)))
+            (format "COLUMNS=%d" width)
+            (format "LINES=%d" height))
            process-environment))
          (proc (make-process
                 :name "ghostel"
@@ -272,6 +274,9 @@ PROCESS is the shell process."
     (setq ghostel--process proc)
     ;; Raw binary I/O — no encoding/decoding by Emacs
     (set-process-coding-system proc 'binary 'binary)
+    ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
+    ;; the shell's line editor (readline/ZLE) can render properly.
+    (set-process-window-size proc height width)
     (set-process-query-on-exit-flag proc nil)
     proc))
 
@@ -296,14 +301,17 @@ PROCESS is the shell process."
 
 ;;; Window resize
 
-(defun ghostel--window-adjust-process-window-size (_process windows)
+(defun ghostel--window-adjust-process-window-size (process windows)
   "Resize the terminal when the Emacs window changes size.
-WINDOWS is the list of windows displaying the process buffer."
+PROCESS is the shell process, WINDOWS is the list of windows."
   (let* ((window (car windows))
          (width (window-max-chars-per-line window))
          (height (window-body-height window)))
     (when ghostel--term
       (ghostel--set-size ghostel--term height width)
+      ;; Update PTY dimensions (sends SIGWINCH to the shell)
+      (when (process-live-p process)
+        (set-process-window-size process height width))
       (ghostel--invalidate))
     (cons width height)))
 
