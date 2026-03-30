@@ -484,6 +484,55 @@
                                 (ghostel--filter-soft-wraps s))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ANSI color palette customization
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-color-palette ()
+  "Test setting a custom ANSI color palette."
+  (message "--- color palette ---")
+  (let ((buf (generate-new-buffer " *ghostel-test-palette*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            ;; Set a custom palette with bright red = #ff0000
+            (let ((palette (make-list 16 "#000000")))
+              (setcar (nthcdr 1 palette) "#ff0000")   ; red
+              (setcar (nthcdr 2 palette) "#00ff00")   ; green
+              (ghostel--set-palette term
+                                   (mapconcat #'identity palette "")))
+            ;; Write red text (SGR 31 = ANSI red = palette index 1)
+            (ghostel--write-input term "\e[31mRED\e[0m")
+            (ghostel--redraw term)
+            ;; Check that the text appears
+            (ghostel-test--assert-match "red text rendered"
+                                        "RED"
+                                        (buffer-substring-no-properties
+                                         (point-min) (point-max)))
+            ;; Check that the face property uses our custom red
+            (goto-char (point-min))
+            (let ((face (get-text-property (point) 'face)))
+              (ghostel-test--assert "face property exists" face)
+              (when face
+                (let ((fg (plist-get face :foreground)))
+                  (ghostel-test--assert "foreground is custom red"
+                                        (and fg (string= fg "#ff0000"))))))))
+      (kill-buffer buf))))
+
+(defun ghostel-test-apply-palette ()
+  "Test the Elisp apply-palette helper."
+  (message "--- apply-palette ---")
+  (let ((term (ghostel--new 5 40 100))
+        (ghostel-color-palette
+         '("#111111" "#ff0000" "#00ff00" "#ffff00"
+           "#0000ff" "#ff00ff" "#00ffff" "#ffffff"
+           "#333333" "#ff3333" "#33ff33" "#ffff33"
+           "#3333ff" "#ff33ff" "#33ffff" "#ffffff")))
+    ;; Should not error
+    (ghostel-test--assert "apply-palette succeeds"
+                          (ghostel--apply-palette term))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -514,6 +563,8 @@
   (ghostel-test-incremental-redraw)
   (ghostel-test-focus-events)
   (ghostel-test-soft-wrap-copy)
+  (ghostel-test-color-palette)
+  (ghostel-test-apply-palette)
 
   ;; Integration test (spawns a real shell)
   (ghostel-test-shell-integration)

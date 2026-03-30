@@ -152,6 +152,24 @@ pub fn setColorBackground(self: *Self, color: *const gt.ColorRgb) void {
     );
 }
 
+/// Set the color palette (256 entries).
+pub fn setColorPalette(self: *Self, palette: *const [256]gt.ColorRgb) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_COLOR_PALETTE,
+        palette,
+    );
+}
+
+/// Get the current color palette (256 entries).
+pub fn getColorPalette(self: *Self, palette: *[256]gt.ColorRgb) bool {
+    return gt.c.ghostty_terminal_get(
+        self.terminal,
+        gt.DATA_COLOR_PALETTE,
+        @ptrCast(palette),
+    ) == gt.SUCCESS;
+}
+
 /// Feed VT data from the PTY into the terminal.
 pub fn vtWrite(self: *Self, data: []const u8) void {
     gt.c.ghostty_terminal_vt_write(self.terminal, data.ptr, data.len);

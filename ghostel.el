@@ -36,6 +36,7 @@
 (declare-function ghostel--encode-key "ghostel-module")
 (declare-function ghostel--mouse-event "ghostel-module")
 (declare-function ghostel--focus-event "ghostel-module")
+(declare-function ghostel--set-palette "ghostel-module")
 
 ;;; Customization
 
@@ -71,6 +72,27 @@ These keys pass through to Emacs instead."
   :type '(repeat string)
   :group 'ghostel)
 
+(defcustom ghostel-color-palette
+  '("#000000"    ; 0  black
+    "#aa0000"    ; 1  red
+    "#00aa00"    ; 2  green
+    "#aa5500"    ; 3  yellow
+    "#0000aa"    ; 4  blue
+    "#aa00aa"    ; 5  magenta
+    "#00aaaa"    ; 6  cyan
+    "#aaaaaa"    ; 7  white
+    "#555555"    ; 8  bright black
+    "#ff5555"    ; 9  bright red
+    "#55ff55"    ; 10 bright green
+    "#ffff55"    ; 11 bright yellow
+    "#5555ff"    ; 12 bright blue
+    "#ff55ff"    ; 13 bright magenta
+    "#55ffff"    ; 14 bright cyan
+    "#ffffff")   ; 15 bright white
+  "ANSI 16-color palette for the terminal.
+Each entry is a hex color string.  Changes take effect on new terminals."
+  :type '(repeat color)
+  :group 'ghostel)
 
 ;;; Internal variables
 
@@ -542,6 +564,16 @@ DIR may be a file:// URL or a plain path."
       (when (and path (file-directory-p path))
         (setq default-directory (file-name-as-directory path))))))
 
+;;; Palette
+
+(defun ghostel--apply-palette (term)
+  "Apply `ghostel-color-palette' to TERM."
+  (when (and term ghostel-color-palette)
+    (let ((colors (mapconcat #'identity
+                             (seq-take ghostel-color-palette 16)
+                             "")))
+      (ghostel--set-palette term colors))))
+
 ;;; Focus events
 
 (defun ghostel--focus-in ()
@@ -696,7 +728,8 @@ PROCESS is the shell process, WINDOWS is the list of windows."
       (let* ((height (window-body-height))
              (width (window-max-chars-per-line)))
         (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback)))
+              (ghostel--new height width ghostel-max-scrollback))
+        (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))
     (switch-to-buffer buffer)))
 

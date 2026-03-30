@@ -35,6 +35,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--encode-key", 3, 4, &fnEncodeKey, "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)");
     env.bindFunction("ghostel--mouse-event", 6, 6, &fnMouseEvent, "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)");
     env.bindFunction("ghostel--focus-event", 2, 2, &fnFocusEvent, "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)");
+    env.bindFunction("ghostel--set-palette", 2, 2, &fnSetPalette, "Set the ANSI color palette.\n\n(ghostel--set-palette TERM COLORS-STRING)");
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
 
@@ -269,6 +270,74 @@ fn fnFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 
     _ = env.call1(env.intern("ghostel--flush-output"), env.makeString(buf[0..written]));
     return env.t();
+}
+
+/// (ghostel--set-palette TERM COLORS-STRING)
+/// Set the 16 ANSI colors from a concatenated hex string like "#000000#aa0000...".
+/// The remaining 240 palette entries are taken from the terminal's current palette.
+fn fnSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse {
+        env.signalError("ghostel: invalid terminal handle");
+        return env.nil();
+    };
+
+    var str_buf: [2048]u8 = undefined;
+    const colors_str = env.extractString(args[1], &str_buf) orelse {
+        env.signalError("ghostel: invalid palette string");
+        return env.nil();
+    };
+
+    // Get current palette as base (keeps entries 16-255)
+    var palette: [256]gt.ColorRgb = undefined;
+    if (!term.getColorPalette(&palette)) {
+        env.signalError("ghostel: failed to get current palette");
+        return env.nil();
+    }
+
+    // Parse "#RRGGBB" entries — 7 chars each
+    var idx: usize = 0;
+    var pos: usize = 0;
+    while (idx < 16 and pos + 7 <= colors_str.len) {
+        if (colors_str[pos] != '#') {
+            pos += 1;
+            continue;
+        }
+        const r = parseHexByte(colors_str[pos + 1], colors_str[pos + 2]) orelse {
+            pos += 7;
+            idx += 1;
+            continue;
+        };
+        const g = parseHexByte(colors_str[pos + 3], colors_str[pos + 4]) orelse {
+            pos += 7;
+            idx += 1;
+            continue;
+        };
+        const b = parseHexByte(colors_str[pos + 5], colors_str[pos + 6]) orelse {
+            pos += 7;
+            idx += 1;
+            continue;
+        };
+        palette[idx] = .{ .r = r, .g = g, .b = b };
+        idx += 1;
+        pos += 7;
+    }
+
+    term.setColorPalette(&palette);
+    return env.t();
+}
+
+fn parseHexByte(hi: u8, lo: u8) ?u8 {
+    const h = hexDigit(hi) orelse return null;
+    const l = hexDigit(lo) orelse return null;
+    return (h << 4) | l;
+}
+
+fn hexDigit(ch: u8) ?u8 {
+    if (ch >= '0' and ch <= '9') return ch - '0';
+    if (ch >= 'a' and ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' and ch <= 'F') return ch - 'A' + 10;
+    return null;
 }
 
 /// (ghostel--debug-state TERM)
