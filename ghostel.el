@@ -244,6 +244,7 @@ These keys pass through to Emacs instead."
     (define-key map (kbd "C-c C-k")   #'ghostel-copy-mode)
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
     (define-key map (kbd "C-c C-l")   #'ghostel-clear-scrollback)
+    (define-key map (kbd "C-c C-q")   #'ghostel-send-next-key)
     ;; Cursor and navigation keys — raw escape sequences
     (define-key map (kbd "<escape>")  (lambda () (interactive) (ghostel--send-key "\e")))
     (define-key map (kbd "<up>")      (lambda () (interactive) (ghostel--send-key "\e[A")))
@@ -295,6 +296,30 @@ These keys pass through to Emacs instead."
   "Keymap for `ghostel-mode'.")
 
 ;;; Key sending
+
+(defun ghostel-send-next-key ()
+  "Read the next key event and send it to the terminal.
+This is an escape hatch for sending keys that are normally
+intercepted by Emacs (e.g., C-g, C-x)."
+  (interactive)
+  (let* ((key (read-key-sequence "Send key: "))
+         (char (aref key 0)))
+    (cond
+     ;; Control character
+     ((and (integerp char) (<= char 31))
+      (ghostel--send-key (string char)))
+     ;; Regular character
+     ((and (integerp char) (< char 128))
+      (ghostel--send-key (string char)))
+     ;; Multi-byte character
+     ((integerp char)
+      (ghostel--send-key (encode-coding-string (string char) 'utf-8)))
+     ;; Function key / special key — look up in keymap
+     (t
+      (let* ((binding (key-binding key)))
+        (if (and binding (commandp binding))
+            (call-interactively binding)
+          (message "ghostel: unrecognized key %S" key)))))))
 
 (defun ghostel--send-key (key)
   "Send KEY string to the terminal process."
