@@ -137,9 +137,9 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     const normalized = norm_buf[0..npos];
     term.vtWrite(normalized);
 
-    // Scan for OSC 7 (report pwd) — libghostty-vt discards it, so we
-    // extract the URL ourselves and store it via OPT_PWD.
+    // Scan for OSC sequences that libghostty-vt discards.
     extractAndSetPwd(term, normalized);
+    extractOsc52(env, normalized);
 
     return env.nil();
 }
@@ -166,6 +166,51 @@ fn extractAndSetPwd(term: *Terminal, data: []const u8) void {
                 _ = gt.c.ghostty_terminal_set(term.terminal, gt.OPT_PWD, &gs);
             }
             pos = url_end;
+        } else {
+            pos += 1;
+        }
+    }
+}
+
+/// Scan data for OSC 52 clipboard sequences.
+/// OSC 52 format: ESC ] 52 ; <selection> ; <base64-data> (ST | BEL)
+/// Calls ghostel--osc52-handle with the selection and base64 data.
+fn extractOsc52(env: emacs.Env, data: []const u8) void {
+    const prefix = "\x1b]52;";
+    var pos: usize = 0;
+    while (pos + prefix.len < data.len) {
+        if (std.mem.startsWith(u8, data[pos..], prefix)) {
+            const after_prefix = pos + prefix.len;
+            // Find the ';' separating selection from data
+            var semi: usize = after_prefix;
+            while (semi < data.len and data[semi] != ';') : (semi += 1) {}
+            if (semi >= data.len) {
+                pos = after_prefix;
+                continue;
+            }
+            const selection = data[after_prefix..semi];
+            const data_start = semi + 1;
+            // Find the terminator: BEL (0x07) or ST (ESC \)
+            var data_end: usize = data_start;
+            while (data_end < data.len) {
+                if (data[data_end] == 0x07) break;
+                if (data[data_end] == 0x1b and data_end + 1 < data.len and data[data_end + 1] == '\\') break;
+                data_end += 1;
+            }
+            if (data_end > data_start) {
+                const b64 = data[data_start..data_end];
+                // Ignore clipboard queries ('?')
+                if (b64.len == 1 and b64[0] == '?') {
+                    pos = data_end;
+                    continue;
+                }
+                _ = env.call2(
+                    env.intern("ghostel--osc52-handle"),
+                    env.makeString(selection),
+                    env.makeString(b64),
+                );
+            }
+            pos = data_end;
         } else {
             pos += 1;
         }

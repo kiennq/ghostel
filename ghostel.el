@@ -77,6 +77,18 @@ exit event string."
   :type 'hook
   :group 'ghostel)
 
+(defcustom ghostel-enable-osc52 nil
+  "Allow terminal applications to set the clipboard via OSC 52.
+When non-nil, programs running in the terminal can copy text to the
+Emacs kill ring and system clipboard using OSC 52 escape sequences.
+This is useful for remote SSH sessions where the application cannot
+access the local clipboard directly.
+
+Disabled by default for security: a malicious escape sequence in
+command output could silently overwrite your clipboard."
+  :type 'boolean
+  :group 'ghostel)
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -698,6 +710,18 @@ the original terminal content."
   (ghostel-copy-mode-exit))
 
 ;;; Callbacks from native module
+
+(defun ghostel--osc52-handle (_selection base64-data)
+  "Handle an OSC 52 clipboard set request.
+SELECTION is the target (e.g. \"c\" for clipboard).
+BASE64-DATA is the base64-encoded text.
+Only acts when `ghostel-enable-osc52' is non-nil."
+  (when ghostel-enable-osc52
+    (let ((text (ignore-errors (base64-decode-string base64-data))))
+      (when (and text (> (length text) 0))
+        (kill-new text)
+        (when (fboundp 'gui-set-selection)
+          (gui-set-selection 'CLIPBOARD text))))))
 
 (defun ghostel--flush-output (data)
   "Write DATA back to the shell process (response from terminal)."

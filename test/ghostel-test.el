@@ -409,6 +409,49 @@
                                 (ghostel--get-pwd term))))
 
 ;; -----------------------------------------------------------------------
+;; Test: OSC 52 clipboard
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-osc52 ()
+  "Test OSC 52 clipboard handling."
+  (message "--- OSC 52 ---")
+  (let ((term (ghostel--new 25 80 1000)))
+    ;; With osc52 disabled, kill ring should not be modified
+    (let ((ghostel-enable-osc52 nil)
+          (kill-ring nil))
+      ;; "hello" = "aGVsbG8=" in base64
+      (ghostel--write-input term "\e]52;c;aGVsbG8=\e\\")
+      (ghostel-test--assert-equal "osc52 disabled: no kill"
+                                  nil kill-ring))
+
+    ;; With osc52 enabled, text should appear in kill ring
+    (let ((ghostel-enable-osc52 t)
+          (kill-ring nil))
+      (ghostel--write-input term "\e]52;c;aGVsbG8=\e\\")
+      (ghostel-test--assert "osc52 enabled: kill ring has entry"
+                            (> (length kill-ring) 0))
+      (when kill-ring
+        (ghostel-test--assert-equal "osc52 decoded text"
+                                    "hello"
+                                    (car kill-ring))))
+
+    ;; BEL terminator
+    (let ((ghostel-enable-osc52 t)
+          (kill-ring nil))
+      (ghostel--write-input term "\e]52;c;d29ybGQ=\a")
+      (when kill-ring
+        (ghostel-test--assert-equal "osc52 BEL terminator"
+                                    "world"
+                                    (car kill-ring))))
+
+    ;; Query ('?') should be ignored
+    (let ((ghostel-enable-osc52 t)
+          (kill-ring nil))
+      (ghostel--write-input term "\e]52;c;?\e\\")
+      (ghostel-test--assert-equal "osc52 query ignored"
+                                  nil kill-ring))))
+
+;; -----------------------------------------------------------------------
 ;; Test: focus events gated by mode 1004
 ;; -----------------------------------------------------------------------
 
@@ -609,6 +652,7 @@
   (ghostel-test-multibyte-rendering)
   (ghostel-test-title)
   (ghostel-test-osc7-parsing)
+  (ghostel-test-osc52)
   (ghostel-test-crlf)
   (ghostel-test-incremental-redraw)
   (ghostel-test-focus-events)
