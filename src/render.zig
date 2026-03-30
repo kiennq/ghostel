@@ -241,6 +241,17 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
 
+    // Set the buffer's default face to terminal colors so that
+    // unstyled text (default fg/bg) is always visible regardless
+    // of the user's Emacs theme.
+    var fg_hex: [7]u8 = undefined;
+    var bg_hex: [7]u8 = undefined;
+    _ = env.call2(
+        env.intern("ghostel--set-buffer-face"),
+        env.makeString(formatColor(default_fg, &fg_hex)),
+        env.makeString(formatColor(default_bg, &bg_hex)),
+    );
+
     // Erase buffer and redraw everything
     _ = env.call0(env.intern("erase-buffer"));
 
@@ -339,28 +350,22 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
             run_count += 1;
         }
 
-        // Trim trailing spaces
-        var end = text_len;
-        while (end > 0 and text_buf[end - 1] == ' ') end -= 1;
-
-        if (end == 0) continue;
+        // Don't trim trailing spaces — terminal content is column-aligned
+        // and the cursor must be positionable at any column.
+        if (text_len == 0) continue;
 
         // Record buffer position before insertion for property offsets
-        // (point) gives current position, insert moves it forward
         const insert_start = env.extractInteger(env.call0(env.intern("point")));
 
-        // Insert the row text
-        _ = env.call1(env.intern("insert"), env.makeString(text_buf[0..end]));
+        // Insert the row text (full width, no trimming)
+        _ = env.call1(env.intern("insert"), env.makeString(text_buf[0..text_len]));
 
         // Apply face properties to each style run
         for (runs[0..run_count]) |run| {
-            if (run.start_byte >= end) break;
-            const run_end = @min(run.end_byte, end);
+            if (run.start_byte >= text_len) break;
+            const run_end = @min(run.end_byte, text_len);
             if (run_end <= run.start_byte) continue;
 
-            // Convert byte offsets to Emacs buffer positions (1-indexed)
-            // For ASCII/Latin text, byte offset ≈ char offset. For
-            // multi-byte, this is approximate but acceptable for Phase 3.
             const prop_start = insert_start + @as(i64, @intCast(run.start_byte));
             const prop_end = insert_start + @as(i64, @intCast(run_end));
 
