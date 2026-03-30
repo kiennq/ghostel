@@ -361,6 +361,44 @@
       (ghostel-test--assert-equal "dedup" old ghostel--last-directory))))
 
 ;; -----------------------------------------------------------------------
+;; Test: incremental (partial) redraw
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-incremental-redraw ()
+  "Test that incremental redraw correctly updates dirty rows."
+  (message "--- incremental redraw ---")
+  (let ((buf (generate-new-buffer " *ghostel-test-redraw*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            ;; Write some initial content
+            (ghostel--write-input term "line-A\r\nline-B\r\nline-C")
+            ;; Full redraw
+            (ghostel--redraw term)
+            (ghostel-test--assert-match "initial row0" "line-A"
+                                        (buffer-substring-no-properties (point-min) (point-max)))
+            (ghostel-test--assert-match "initial row1" "line-B"
+                                        (buffer-substring-no-properties (point-min) (point-max)))
+            (ghostel-test--assert-match "initial row2" "line-C"
+                                        (buffer-substring-no-properties (point-min) (point-max)))
+
+            ;; Now write more text on the current line (row 2) — only that row should be dirty
+            (ghostel--write-input term " updated")
+            ;; This redraw should be incremental (DIRTY_PARTIAL)
+            (ghostel--redraw term)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (ghostel-test--assert-match "row0 preserved" "line-A" content)
+              (ghostel-test--assert-match "row1 preserved" "line-B" content)
+              (ghostel-test--assert-match "row2 updated" "line-C updated" content))
+
+            ;; Verify buffer has proper line structure (5 rows)
+            (ghostel-test--assert-equal "line count"
+                                        5
+                                        (count-lines (point-min) (point-max)))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -387,6 +425,7 @@
   (ghostel-test-sgr)
   (ghostel-test-title)
   (ghostel-test-crlf)
+  (ghostel-test-incremental-redraw)
 
   ;; Integration test (spawns a real shell)
   (ghostel-test-shell-integration)

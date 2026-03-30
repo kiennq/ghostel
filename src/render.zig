@@ -348,10 +348,11 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         return;
     }
 
-    // Always do full redraw for now — incremental (DIRTY_PARTIAL) needs
-    // more testing to verify per-row dirty detection works reliably.
-    _ = env.call0(env.intern("erase-buffer"));
-    const partial = false;
+    // Incremental redraw: only update dirty rows when possible.
+    const partial = (dirty == gt.DIRTY_PARTIAL);
+    if (!partial) {
+        _ = env.call0(env.intern("erase-buffer"));
+    }
 
     // Shared buffers for row content
     var runs: [512]RunInfo = undefined;
@@ -378,12 +379,23 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         if (partial) {
             // Navigate to this row and clear its content
             _ = env.call1(env.intern("goto-char"), env.makeInteger(1));
-            _ = env.call1(env.intern("forward-line"), env.makeInteger(@as(i64, @intCast(row_count))));
-            _ = env.call2(
-                env.intern("delete-region"),
-                env.call0(env.intern("point")),
-                env.call0(env.intern("line-end-position")),
+            const moved = env.extractInteger(
+                env.call1(env.intern("forward-line"), env.makeInteger(@as(i64, @intCast(row_count)))),
             );
+            if (moved != 0) {
+                // Row doesn't exist yet — fall through to append
+                _ = env.call1(env.intern("goto-char"), env.call0(env.intern("point-max")));
+                _ = env.call1(env.intern("insert"), env.makeString("\n"));
+            } else {
+                _ = env.call2(
+                    env.intern("delete-region"),
+                    env.call0(env.intern("point")),
+                    env.call0(env.intern("line-end-position")),
+                );
+            }
+            // Clear per-row dirty flag
+            const row_clean: bool = false;
+            _ = gt.c.ghostty_render_state_row_set(term.row_iterator, gt.RS_ROW_OPT_DIRTY, @ptrCast(&row_clean));
         } else {
             // Full redraw: insert newline between rows
             if (row_count > 0) {
