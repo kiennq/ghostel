@@ -1,0 +1,172 @@
+/// Terminal state management wrapping libghostty-vt.
+///
+/// Holds the GhosttyTerminal, RenderState, and associated iterators.
+/// All ghostty resources are created and destroyed together.
+const std = @import("std");
+const gt = @import("ghostty.zig");
+const emacs = @import("emacs.zig");
+
+const Self = @This();
+
+/// The libghostty terminal handle.
+terminal: gt.Terminal,
+
+/// Render state for incremental screen updates.
+render_state: gt.RenderState,
+
+/// Reusable row iterator (populated during redraw).
+row_iterator: gt.RenderStateRowIterator,
+
+/// Reusable row cells handle (populated during redraw).
+row_cells: gt.RenderStateRowCells,
+
+/// Terminal dimensions.
+cols: u16,
+rows: u16,
+
+/// Cached Emacs env pointer — only valid during a callback from Emacs.
+env: ?emacs.Env = null,
+
+/// Create a new terminal with the given dimensions and scrollback.
+pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
+    var terminal: gt.Terminal = undefined;
+    const opts = gt.TerminalOptions{
+        .cols = cols,
+        .rows = rows,
+        .max_scrollback = max_scrollback,
+    };
+
+    if (gt.c.ghostty_terminal_new(null, &terminal, opts) != gt.SUCCESS) {
+        return error.TerminalCreateFailed;
+    }
+    errdefer gt.c.ghostty_terminal_free(terminal);
+
+    var render_state: gt.RenderState = undefined;
+    if (gt.c.ghostty_render_state_new(null, &render_state) != gt.SUCCESS) {
+        return error.RenderStateCreateFailed;
+    }
+    errdefer gt.c.ghostty_render_state_free(render_state);
+
+    var row_iterator: gt.RenderStateRowIterator = undefined;
+    if (gt.c.ghostty_render_state_row_iterator_new(null, &row_iterator) != gt.SUCCESS) {
+        return error.RowIteratorCreateFailed;
+    }
+    errdefer gt.c.ghostty_render_state_row_iterator_free(row_iterator);
+
+    var row_cells: gt.RenderStateRowCells = undefined;
+    if (gt.c.ghostty_render_state_row_cells_new(null, &row_cells) != gt.SUCCESS) {
+        return error.RowCellsCreateFailed;
+    }
+
+    return .{
+        .terminal = terminal,
+        .render_state = render_state,
+        .row_iterator = row_iterator,
+        .row_cells = row_cells,
+        .cols = cols,
+        .rows = rows,
+    };
+}
+
+/// Free all ghostty resources.
+pub fn deinit(self: *Self) void {
+    gt.c.ghostty_render_state_row_cells_free(self.row_cells);
+    gt.c.ghostty_render_state_row_iterator_free(self.row_iterator);
+    gt.c.ghostty_render_state_free(self.render_state);
+    gt.c.ghostty_terminal_free(self.terminal);
+}
+
+/// Register the userdata pointer for callbacks.
+pub fn setUserdata(self: *Self, userdata: ?*anyopaque) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_USERDATA,
+        userdata,
+    );
+}
+
+/// Register the write_pty callback.
+pub fn setWritePty(self: *Self, cb: gt.WritePtyFn) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_WRITE_PTY,
+        @ptrCast(cb),
+    );
+}
+
+/// Register the bell callback.
+pub fn setBell(self: *Self, cb: gt.BellFn) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_BELL,
+        @ptrCast(cb),
+    );
+}
+
+/// Register the title_changed callback.
+pub fn setTitleChanged(self: *Self, cb: gt.TitleChangedFn) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_TITLE_CHANGED,
+        @ptrCast(cb),
+    );
+}
+
+/// Set default foreground color.
+pub fn setColorForeground(self: *Self, color: *const gt.ColorRgb) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_COLOR_FOREGROUND,
+        color,
+    );
+}
+
+/// Set default background color.
+pub fn setColorBackground(self: *Self, color: *const gt.ColorRgb) void {
+    _ = gt.c.ghostty_terminal_set(
+        self.terminal,
+        gt.OPT_COLOR_BACKGROUND,
+        color,
+    );
+}
+
+/// Feed VT data from the PTY into the terminal.
+pub fn vtWrite(self: *Self, data: []const u8) void {
+    gt.c.ghostty_terminal_vt_write(self.terminal, data.ptr, data.len);
+}
+
+/// Resize the terminal.
+pub fn resize(self: *Self, cols: u16, rows: u16) !void {
+    if (gt.c.ghostty_terminal_resize(self.terminal, cols, rows, 1, 1) != gt.SUCCESS) {
+        return error.ResizeFailed;
+    }
+    self.cols = cols;
+    self.rows = rows;
+}
+
+/// Scroll the viewport.
+pub fn scrollViewport(self: *Self, tag: c_int, delta: isize) void {
+    var behavior: gt.TerminalScrollViewport = undefined;
+    behavior.tag = @intCast(tag);
+    behavior.value.delta = delta;
+    gt.c.ghostty_terminal_scroll_viewport(self.terminal, behavior);
+}
+
+/// Get the terminal title as a borrowed string.
+pub fn getTitle(self: *Self) ?[]const u8 {
+    var title: gt.GhosttyString = undefined;
+    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_TITLE, &title) != gt.SUCCESS) {
+        return null;
+    }
+    if (title.len == 0) return null;
+    return title.ptr[0..title.len];
+}
+
+/// Emacs finalizer — called when the user-ptr is garbage collected.
+pub fn emacsFinalize(ptr: ?*anyopaque) callconv(.c) void {
+    if (ptr) |p| {
+        const self: *Self = @ptrCast(@alignCast(p));
+        self.deinit();
+        std.heap.c_allocator.destroy(self);
+    }
+}
