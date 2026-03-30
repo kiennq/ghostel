@@ -320,7 +320,7 @@ These keys pass through to Emacs instead."
 (defun ghostel-send-next-key ()
   "Read the next key event and send it to the terminal.
 This is an escape hatch for sending keys that are normally
-intercepted by Emacs (e.g., C-g, C-x)."
+intercepted by Emacs (e.g., interrupt or prefix keys)."
   (interactive)
   (let* ((key (read-key-sequence "Send key: "))
          (char (aref key 0)))
@@ -684,7 +684,7 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (message "Copy mode exited")))
 
 (defun ghostel--filter-soft-wraps (text)
-  "direRemove newlines from TEXT that were inserted by soft line wrapping.
+  "Remove newlines from TEXT that were inserted by soft line wrapping.
 These are newlines with the `ghostel-wrap' text property."
   (let ((result "")
         (pos 0)
@@ -800,23 +800,17 @@ Falls back to \"#000000\" if the color cannot be resolved."
 
 ;;; Focus events
 
-(defun ghostel--focus-in ()
-  "Notify the terminal that Emacs gained focus.
+(defun ghostel--focus-change ()
+  "Notify ghostel terminals in the selected frame about focus changes.
 Only sends the event if the terminal has enabled focus reporting (mode 1004)."
-  (when (and (eq major-mode 'ghostel-mode)
-             ghostel--term
-             ghostel--process
-             (process-live-p ghostel--process))
-    (ghostel--focus-event ghostel--term t)))
-
-(defun ghostel--focus-out ()
-  "Notify the terminal that Emacs lost focus.
-Only sends the event if the terminal has enabled focus reporting (mode 1004)."
-  (when (and (eq major-mode 'ghostel-mode)
-             ghostel--term
-             ghostel--process
-             (process-live-p ghostel--process))
-    (ghostel--focus-event ghostel--term nil)))
+  (let ((focused (frame-focus-state)))
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and (eq major-mode 'ghostel-mode)
+                   ghostel--term
+                   ghostel--process
+                   (process-live-p ghostel--process))
+          (ghostel--focus-event ghostel--term focused))))))
 
 ;;; Process management
 
@@ -841,8 +835,7 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--redraw-timer
           (cancel-timer ghostel--redraw-timer)
           (setq ghostel--redraw-timer nil))
-        (remove-hook 'focus-in-hook #'ghostel--focus-in)
-        (remove-hook 'focus-out-hook #'ghostel--focus-out)
+        (remove-function after-focus-change-function #'ghostel--focus-change)
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
             (kill-buffer buf)
@@ -942,8 +935,7 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (setq-local scroll-conservatively 101)
   (setq-local window-adjust-process-window-size-function
               #'ghostel--window-adjust-process-window-size)
-  (add-hook 'focus-in-hook #'ghostel--focus-in)
-  (add-hook 'focus-out-hook #'ghostel--focus-out))
+  (add-function :after after-focus-change-function #'ghostel--focus-change))
 
 ;;; Entry point
 
