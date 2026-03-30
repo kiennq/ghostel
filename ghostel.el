@@ -234,7 +234,8 @@ These keys pass through to Emacs instead."
     (define-key map (kbd "C-p")       (lambda () (interactive) (ghostel--send-key "\x10")))
     (define-key map (kbd "C-r")       (lambda () (interactive) (ghostel--send-key "\x12")))
     (define-key map (kbd "C-w")       (lambda () (interactive) (ghostel--send-key "\x17")))
-    (define-key map (kbd "C-y")       (lambda () (interactive) (ghostel--send-key "\x19")))
+    (define-key map (kbd "C-y")       #'ghostel-yank)
+    (define-key map (kbd "M-y")       #'ghostel-yank-pop)
     (define-key map (kbd "C-z")       (lambda () (interactive) (ghostel--send-key "\x1a")))
     ;; Terminal control via C-c prefix (pass through to Emacs, then handled here)
     (define-key map (kbd "C-c C-c")   #'ghostel-send-C-c)
@@ -447,17 +448,49 @@ Returns the sequence string, or nil for unknown keys."
   (interactive)
   (ghostel--send-encoded "d" "ctrl"))
 
-;;; Paste
+;;; Paste / yank
+
+(defvar-local ghostel--yank-index 0
+  "Current kill ring index for `ghostel-yank-pop'.")
+
+(defun ghostel--paste-text (text)
+  "Send TEXT to the terminal using bracketed paste."
+  (when (and text ghostel--process (process-live-p ghostel--process))
+    (process-send-string ghostel--process
+                         (concat "\e[200~" text "\e[201~"))))
 
 (defun ghostel-paste ()
   "Paste text from the Emacs kill ring into the terminal.
 Uses bracketed paste mode so that shells can distinguish
 pasted text from typed input."
   (interactive)
-  (let ((text (current-kill 0)))
-    (when (and text ghostel--process (process-live-p ghostel--process))
+  (ghostel--paste-text (current-kill 0)))
+
+(defun ghostel-yank ()
+  "Yank the most recent kill into the terminal.
+Use `ghostel-yank-pop' afterwards to cycle through older kills."
+  (interactive)
+  (setq ghostel--yank-index 0)
+  (ghostel--paste-text (current-kill 0))
+  (setq this-command 'ghostel-yank))
+
+(defun ghostel-yank-pop ()
+  "Replace the just-yanked text with the next kill ring entry.
+Must be called after `ghostel-yank' or `ghostel-yank-pop'.
+Sends backspaces to erase the previous yank, then pastes the next entry."
+  (interactive)
+  (unless (memq last-command '(ghostel-yank ghostel-yank-pop))
+    (user-error "Previous command was not a yank"))
+  (let* ((prev-text (current-kill ghostel--yank-index t))
+         (prev-len (length prev-text)))
+    (setq ghostel--yank-index (1+ ghostel--yank-index))
+    ;; Erase previous paste: send backspaces
+    (when (and ghostel--process (process-live-p ghostel--process))
       (process-send-string ghostel--process
-                           (concat "\e[200~" text "\e[201~")))))
+                           (make-string prev-len ?\x7f)))
+    ;; Paste the next entry
+    (ghostel--paste-text (current-kill ghostel--yank-index t))
+    (setq this-command 'ghostel-yank-pop)))
 
 ;;; Drag and drop
 
