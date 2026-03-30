@@ -488,19 +488,17 @@
 ;; -----------------------------------------------------------------------
 
 (defun ghostel-test-color-palette ()
-  "Test setting a custom ANSI color palette."
+  "Test setting a custom ANSI color palette via faces."
   (message "--- color palette ---")
   (let ((buf (generate-new-buffer " *ghostel-test-palette*")))
     (unwind-protect
         (with-current-buffer buf
           (let* ((term (ghostel--new 5 40 100))
                  (inhibit-read-only t))
-            ;; Set a custom palette with bright red = #ff0000
-            (let ((palette (make-list 16 "#000000")))
-              (setcar (nthcdr 1 palette) "#ff0000")   ; red
-              (setcar (nthcdr 2 palette) "#00ff00")   ; green
+            ;; Set palette index 1 (red) to a known color via set-palette
+            (let ((rest (apply #'concat (make-list 14 "#000000"))))
               (ghostel--set-palette term
-                                   (mapconcat #'identity palette "")))
+                                   (concat "#000000" "#ff0000" rest)))
             ;; Write red text (SGR 31 = ANSI red = palette index 1)
             (ghostel--write-input term "\e[31mRED\e[0m")
             (ghostel--redraw term)
@@ -520,17 +518,19 @@
       (kill-buffer buf))))
 
 (defun ghostel-test-apply-palette ()
-  "Test the Elisp apply-palette helper."
+  "Test the face-based apply-palette helper."
   (message "--- apply-palette ---")
-  (let ((term (ghostel--new 5 40 100))
-        (ghostel-color-palette
-         '("#111111" "#ff0000" "#00ff00" "#ffff00"
-           "#0000ff" "#ff00ff" "#00ffff" "#ffffff"
-           "#333333" "#ff3333" "#33ff33" "#ffff33"
-           "#3333ff" "#ff33ff" "#33ffff" "#ffffff")))
-    ;; Should not error
+  (let ((term (ghostel--new 5 40 100)))
+    ;; Should extract colors from ghostel-color-* faces and apply
     (ghostel-test--assert "apply-palette succeeds"
-                          (ghostel--apply-palette term))))
+                          (ghostel--apply-palette term)))
+
+  ;; Test face-hex-color extraction
+  (let ((color (ghostel--face-hex-color 'ghostel-color-red :foreground)))
+    (ghostel-test--assert "face color is hex string"
+                          (and (stringp color)
+                               (string-prefix-p "#" color)
+                               (= (length color) 7)))))
 
 ;; -----------------------------------------------------------------------
 ;; Runner

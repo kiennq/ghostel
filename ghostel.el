@@ -72,27 +72,122 @@ These keys pass through to Emacs instead."
   :type '(repeat string)
   :group 'ghostel)
 
-(defcustom ghostel-color-palette
-  '("#000000"    ; 0  black
-    "#aa0000"    ; 1  red
-    "#00aa00"    ; 2  green
-    "#aa5500"    ; 3  yellow
-    "#0000aa"    ; 4  blue
-    "#aa00aa"    ; 5  magenta
-    "#00aaaa"    ; 6  cyan
-    "#aaaaaa"    ; 7  white
-    "#555555"    ; 8  bright black
-    "#ff5555"    ; 9  bright red
-    "#55ff55"    ; 10 bright green
-    "#ffff55"    ; 11 bright yellow
-    "#5555ff"    ; 12 bright blue
-    "#ff55ff"    ; 13 bright magenta
-    "#55ffff"    ; 14 bright cyan
-    "#ffffff")   ; 15 bright white
-  "ANSI 16-color palette for the terminal.
-Each entry is a hex color string.  Changes take effect on new terminals."
-  :type '(repeat color)
+;;; ANSI color faces
+
+(defface ghostel-color-black
+  '((t :inherit term-color-black))
+  "Face used to render black color code."
   :group 'ghostel)
+
+(defface ghostel-color-red
+  '((t :inherit term-color-red))
+  "Face used to render red color code."
+  :group 'ghostel)
+
+(defface ghostel-color-green
+  '((t :inherit term-color-green))
+  "Face used to render green color code."
+  :group 'ghostel)
+
+(defface ghostel-color-yellow
+  '((t :inherit term-color-yellow))
+  "Face used to render yellow color code."
+  :group 'ghostel)
+
+(defface ghostel-color-blue
+  '((t :inherit term-color-blue))
+  "Face used to render blue color code."
+  :group 'ghostel)
+
+(defface ghostel-color-magenta
+  '((t :inherit term-color-magenta))
+  "Face used to render magenta color code."
+  :group 'ghostel)
+
+(defface ghostel-color-cyan
+  '((t :inherit term-color-cyan))
+  "Face used to render cyan color code."
+  :group 'ghostel)
+
+(defface ghostel-color-white
+  '((t :inherit term-color-white))
+  "Face used to render white color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-black
+  `((t :inherit ,(if (facep 'term-color-bright-black)
+                     'term-color-bright-black
+                   'term-color-black)))
+  "Face used to render bright black color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-red
+  `((t :inherit ,(if (facep 'term-color-bright-red)
+                     'term-color-bright-red
+                   'term-color-red)))
+  "Face used to render bright red color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-green
+  `((t :inherit ,(if (facep 'term-color-bright-green)
+                     'term-color-bright-green
+                   'term-color-green)))
+  "Face used to render bright green color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-yellow
+  `((t :inherit ,(if (facep 'term-color-bright-yellow)
+                     'term-color-bright-yellow
+                   'term-color-yellow)))
+  "Face used to render bright yellow color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-blue
+  `((t :inherit ,(if (facep 'term-color-bright-blue)
+                     'term-color-bright-blue
+                   'term-color-blue)))
+  "Face used to render bright blue color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-magenta
+  `((t :inherit ,(if (facep 'term-color-bright-magenta)
+                     'term-color-bright-magenta
+                   'term-color-magenta)))
+  "Face used to render bright magenta color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-cyan
+  `((t :inherit ,(if (facep 'term-color-bright-cyan)
+                     'term-color-bright-cyan
+                   'term-color-cyan)))
+  "Face used to render bright cyan color code."
+  :group 'ghostel)
+
+(defface ghostel-color-bright-white
+  `((t :inherit ,(if (facep 'term-color-bright-white)
+                     'term-color-bright-white
+                   'term-color-white)))
+  "Face used to render bright white color code."
+  :group 'ghostel)
+
+(defvar ghostel-color-palette
+  [ghostel-color-black
+   ghostel-color-red
+   ghostel-color-green
+   ghostel-color-yellow
+   ghostel-color-blue
+   ghostel-color-magenta
+   ghostel-color-cyan
+   ghostel-color-white
+   ghostel-color-bright-black
+   ghostel-color-bright-red
+   ghostel-color-bright-green
+   ghostel-color-bright-yellow
+   ghostel-color-bright-blue
+   ghostel-color-bright-magenta
+   ghostel-color-bright-cyan
+   ghostel-color-bright-white]
+  "Color palette for the terminal (vector of 16 face names).")
 
 ;;; Internal variables
 
@@ -490,7 +585,7 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (message "Copy mode exited")))
 
 (defun ghostel--filter-soft-wraps (text)
-  "Remove newlines from TEXT that were inserted by soft line wrapping.
+  "direRemove newlines from TEXT that were inserted by soft line wrapping.
 These are newlines with the `ghostel-wrap' text property."
   (let ((result "")
         (pos 0)
@@ -566,12 +661,30 @@ DIR may be a file:// URL or a plain path."
 
 ;;; Palette
 
+(defun ghostel--face-hex-color (face attr)
+  "Extract hex color string from FACE's ATTR (:foreground or :background).
+Falls back to \"#000000\" if the color cannot be resolved."
+  (or (let ((color (face-attribute face attr nil 'default)))
+        (when (and (stringp color) (not (string= color "unspecified")))
+          (let ((rgb (color-values color)))
+            (if rgb
+                (apply #'format "#%02x%02x%02x"
+                       (mapcar (lambda (c) (ash c -8)) rgb))
+              ;; Batch mode: color-values returns nil without a display.
+              ;; If the color is already "#RRGGBB", use it directly.
+              (and (string-prefix-p "#" color) (= (length color) 7)
+                   color)))))
+      "#000000"))
+
 (defun ghostel--apply-palette (term)
-  "Apply `ghostel-color-palette' to TERM."
+  "Apply colors from `ghostel-color-palette' faces to TERM."
   (when (and term ghostel-color-palette)
-    (let ((colors (mapconcat #'identity
-                             (seq-take ghostel-color-palette 16)
-                             "")))
+    (let ((colors
+           (mapconcat
+            (lambda (face)
+              (ghostel--face-hex-color face :foreground))
+            ghostel-color-palette
+            "")))
       (ghostel--set-palette term colors))))
 
 ;;; Focus events
