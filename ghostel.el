@@ -243,6 +243,7 @@ These keys pass through to Emacs instead."
     (define-key map (kbd "C-c C-d")   #'ghostel-send-C-d)
     (define-key map (kbd "C-c C-k")   #'ghostel-copy-mode)
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
+    (define-key map (kbd "C-c C-l")   #'ghostel-clear-scrollback)
     ;; Cursor and navigation keys — raw escape sequences
     (define-key map (kbd "<escape>")  (lambda () (interactive) (ghostel--send-key "\e")))
     (define-key map (kbd "<up>")      (lambda () (interactive) (ghostel--send-key "\e[A")))
@@ -459,7 +460,23 @@ pasted using bracketed paste."
         (ghostel--send-key
          (mapconcat #'shell-quote-argument payload " ")))))))
 
-;;; Scrollback
+;;; Scrollback / clearing
+
+(defun ghostel-clear-scrollback ()
+  "Clear the scrollback buffer."
+  (interactive)
+  (when (and ghostel--process (process-live-p ghostel--process))
+    ;; CSI 3 J = erase scrollback
+    (process-send-string ghostel--process "\e[3J")
+    (ghostel--invalidate)))
+
+(defun ghostel-clear ()
+  "Clear the screen and scrollback buffer."
+  (interactive)
+  (when (and ghostel--process (process-live-p ghostel--process))
+    ;; CSI H = cursor home, CSI 2 J = erase screen, CSI 3 J = erase scrollback
+    (process-send-string ghostel--process "\e[H\e[2J\e[3J")
+    (ghostel--invalidate)))
 
 (defun ghostel--scroll-up (&optional _event)
   "Scroll the terminal viewport up (into scrollback)."
