@@ -944,6 +944,16 @@ PROCESS is the shell process, WINDOWS is the list of windows."
               #'ghostel--window-adjust-process-window-size)
   (add-function :after after-focus-change-function #'ghostel--focus-change))
 
+;;; Module compilation
+
+(defun ghostel-module-compile ()
+  "Compile the ghostel native module by running build.sh.
+The output is shown in a *ghostel-build* compilation buffer."
+  (interactive)
+  (let ((default-directory (file-name-directory (or (locate-library "ghostel")
+                                                    default-directory))))
+    (compile (expand-file-name "build.sh") t)))
+
 ;;; Entry point
 
 ;;;###autoload
