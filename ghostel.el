@@ -697,13 +697,20 @@ These are newlines with the `ghostel-wrap' text property."
               pos (1+ pos))))
     result))
 
+(defun ghostel--clean-copy-text (text)
+  "Clean TEXT for copying: remove soft-wrap newlines, strip trailing whitespace."
+  (let* ((unwrapped (ghostel--filter-soft-wraps text))
+         (lines (split-string unwrapped "\n"))
+         (trimmed (mapcar (lambda (line) (string-trim-right line)) lines)))
+    (mapconcat #'identity trimmed "\n")))
+
 (defun ghostel-copy-mode-copy ()
   "Copy the selected region and exit copy mode.
-Soft-wrapped newlines are removed so the copied text matches
-the original terminal content."
+Soft-wrapped newlines are removed and trailing whitespace is
+stripped so the copied text matches the original terminal content."
   (interactive)
   (when (use-region-p)
-    (let ((text (ghostel--filter-soft-wraps
+    (let ((text (ghostel--clean-copy-text
                  (buffer-substring (region-beginning) (region-end)))))
       (kill-new text)
       (message "Copied to kill ring")))
