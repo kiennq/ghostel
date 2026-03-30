@@ -18,6 +18,7 @@
 
 (require 'cl-lib)
 (require 'url-parse)
+(require 'face-remap)
 
 ;; Load the native module
 (unless (featurep 'ghostel-module)
@@ -25,6 +26,15 @@
    (expand-file-name
     (concat "ghostel-module" module-file-suffix)
     (file-name-directory (or load-file-name buffer-file-name)))))
+
+;; Declare native module functions for the byte compiler
+(declare-function ghostel--new "ghostel-module")
+(declare-function ghostel--write-input "ghostel-module")
+(declare-function ghostel--set-size "ghostel-module")
+(declare-function ghostel--redraw "ghostel-module")
+(declare-function ghostel--scroll "ghostel-module")
+(declare-function ghostel--encode-key "ghostel-module")
+(declare-function ghostel--mouse-event "ghostel-module")
 
 ;;; Customization
 
@@ -230,13 +240,13 @@ Returns the sequence string, or nil for unknown keys."
     n))
 
 (defun ghostel--csi-letter (letter mod-num)
-  "Format CSI cursor-key sequence: \\e[A or \\e[1;{mod+1}A."
+  "Format CSI cursor-key sequence for LETTER with MOD-NUM modifier."
   (if (> mod-num 0)
       (format "\e[1;%d%s" (1+ mod-num) letter)
     (format "\e[%s" letter)))
 
 (defun ghostel--csi-tilde (param mod-num)
-  "Format CSI tilde sequence: \\e[N~ or \\e[N;{mod+1}~."
+  "Format CSI tilde sequence for PARAM with MOD-NUM modifier."
   (if (> mod-num 0)
       (format "\e[%d;%d~" param (1+ mod-num))
     (format "\e[%d~" param)))
@@ -269,12 +279,12 @@ Returns the sequence string, or nil for unknown keys."
 ;;; Terminal control commands (C-c prefix)
 
 (defun ghostel-send-C-c ()
-  "Send C-c (interrupt) to the terminal."
+  "Send interrupt signal to the terminal."
   (interactive)
   (ghostel--send-encoded "c" "ctrl"))
 
 (defun ghostel-send-C-z ()
-  "Send C-z (suspend) to the terminal."
+  "Send suspend signal to the terminal."
   (interactive)
   (ghostel--send-encoded "z" "ctrl"))
 
@@ -284,7 +294,7 @@ Returns the sequence string, or nil for unknown keys."
   (ghostel--send-key "\x1c"))
 
 (defun ghostel-send-C-d ()
-  "Send C-d (EOF) to the terminal."
+  "Send EOF to the terminal."
   (interactive)
   (ghostel--send-encoded "d" "ctrl"))
 
@@ -345,9 +355,7 @@ pasted using bracketed paste."
 ;;; Mouse input
 
 (defun ghostel--mouse-button-number (event)
-  "Return the ghostty mouse button number for EVENT.
-Emacs: mouse-1=left, mouse-2=middle, mouse-3=right.
-Ghostty: 1=left, 2=right, 3=middle."
+  "Return the ghostty mouse button number for EVENT."
   (pcase (event-basic-type event)
     ('mouse-1 1)
     ('mouse-2 3)
@@ -415,8 +423,8 @@ Ghostty: 1=left, 2=right, 3=middle."
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
     map)
   "Keymap for `ghostel-copy-mode'.
-Standard Emacs navigation works (C-f, C-b, C-n, C-p, etc.).
-Use C-SPC to set mark, navigate to select, then M-w or C-w to copy.")
+Standard Emacs navigation works.
+Set mark, navigate to select, then \\[ghostel-copy-mode-copy] to copy.")
 
 (defvar-local ghostel--copy-mode-active nil
   "Non-nil when copy mode is active.")
@@ -427,8 +435,8 @@ Use C-SPC to set mark, navigate to select, then M-w or C-w to copy.")
 (defun ghostel-copy-mode ()
   "Enter copy mode for selecting and copying terminal text.
 The display is frozen and standard Emacs navigation keys work.
-Use C-SPC to set mark, navigate to select, then M-w to copy.
-Press q or C-c C-k to exit without copying."
+Set mark, navigate to select, then \\[ghostel-copy-mode-copy] to copy.
+Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
   (interactive)
   (if ghostel--copy-mode-active
       (ghostel-copy-mode-exit)
