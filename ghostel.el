@@ -65,6 +65,11 @@
   :type 'string
   :group 'ghostel)
 
+(defcustom ghostel-kill-buffer-on-exit t
+  "Kill the buffer when the shell process exits."
+  :type 'boolean
+  :group 'ghostel)
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -731,9 +736,11 @@ PROCESS is the shell process."
         (setq ghostel--redraw-timer nil))
       (remove-hook 'focus-in-hook #'ghostel--focus-in)
       (remove-hook 'focus-out-hook #'ghostel--focus-out)
-      (let ((inhibit-read-only t))
-        (goto-char (point-max))
-        (insert "\n[Process exited]\n")))))
+      (if ghostel-kill-buffer-on-exit
+          (kill-buffer (process-buffer process))
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert "\n[Process exited]\n"))))))
 
 (defun ghostel--start-process ()
   "Start the shell process with a PTY."
