@@ -79,23 +79,20 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
         return env.nil();
     };
 
-    // Register callbacks
-    term.setUserdata(term) catch {
-        env.signalError("ghostel: failed to set terminal userdata");
-        return env.nil();
+    // Register callbacks — clean up on failure to avoid leaking the terminal.
+    const setup_ok = blk: {
+        term.setUserdata(term) catch break :blk false;
+        term.setWritePty(&writePtyCallback) catch break :blk false;
+        term.setBell(&bellCallback) catch break :blk false;
+        term.setTitleChanged(&titleChangedCallback) catch break :blk false;
+        break :blk true;
     };
-    term.setWritePty(&writePtyCallback) catch {
-        env.signalError("ghostel: failed to set write_pty callback");
+    if (!setup_ok) {
+        term.deinit();
+        std.heap.c_allocator.destroy(term);
+        env.signalError("ghostel: failed to configure terminal callbacks");
         return env.nil();
-    };
-    term.setBell(&bellCallback) catch {
-        env.signalError("ghostel: failed to set bell callback");
-        return env.nil();
-    };
-    term.setTitleChanged(&titleChangedCallback) catch {
-        env.signalError("ghostel: failed to set title_changed callback");
-        return env.nil();
-    };
+    }
 
     // Set default colors (light gray on black)
     const default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };

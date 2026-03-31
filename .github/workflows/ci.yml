@@ -72,12 +72,12 @@ jobs:
             -f ghostel-test-run-elisp
 
   build-native:
-    # Full native build requires the ghostty submodule which needs
-    # Zig >= 0.15.2 (not yet released as a stable version).
-    # For now, build on macOS and Linux using Zig 0.15.1 and skip the
-    # ghostty submodule build — only verify our module compiles against
-    # a pre-built libghostty-vt if available.
-    # Once Zig 0.15.2+ is released, switch to: ./build.sh
+    # Ghostel itself requires Zig 0.14+, but building the vendored
+    # ghostty submodule (libghostty-vt) requires Zig >= 0.15.2.
+    # CI uses Zig 0.15.1 with "zig build check" which compiles our
+    # module source against headers without linking the ghostty
+    # static libraries.  Switch to ./build.sh once Zig >= 0.15.2
+    # is available as a stable release.
     strategy:
       fail-fast: false
       matrix:
@@ -105,7 +105,43 @@ jobs:
 
       - name: Find Emacs module header
         run: |
-          HEADER=$(find / -name emacs-module.h -print -quit 2>/dev/null || true)
+          set -e
+          EMACS_BIN="$(command -v emacs || true)"
+          HEADER=""
+
+          # Check directories relative to the Emacs binary first
+          if [ -n "$EMACS_BIN" ]; then
+            EMACS_BIN_DIR="$(dirname "$EMACS_BIN")"
+            for dir in "$EMACS_BIN_DIR/../include" "$EMACS_BIN_DIR/../share/emacs/include"; do
+              if [ -f "$dir/emacs-module.h" ]; then
+                HEADER="$(cd "$dir" && pwd)/emacs-module.h"
+                break
+              fi
+            done
+
+            # Nix-installed Emacs: follow the symlink to the store path
+            if [ -z "$HEADER" ] && [ -L "$EMACS_BIN" ]; then
+              REAL_DIR="$(dirname "$(readlink -f "$EMACS_BIN")")"
+              for dir in "$REAL_DIR/../include" "$REAL_DIR/../../include"; do
+                if [ -f "$dir/emacs-module.h" ]; then
+                  HEADER="$(cd "$dir" && pwd)/emacs-module.h"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          # Fallback: common system paths
+          if [ -z "$HEADER" ]; then
+            for dir in /usr/include /usr/local/include /opt/homebrew/include; do
+              FOUND="$(find "$dir" -maxdepth 5 -name emacs-module.h -print -quit 2>/dev/null || true)"
+              if [ -n "$FOUND" ]; then
+                HEADER="$FOUND"
+                break
+              fi
+            done
+          fi
+
           if [ -z "$HEADER" ]; then
             echo "::error::emacs-module.h not found"
             exit 1

@@ -130,6 +130,9 @@ Does nothing if the platform is unsupported or the download fails."
                                 asset-name)))
                  (dest (expand-file-name
                         (concat "ghostel-module" module-file-suffix) dir)))
+            ;; Enforce HTTPS for security
+            (unless (string-prefix-p "https://" url)
+              (error "Refusing non-HTTPS download URL: %s" url))
             (message "ghostel: downloading native module from %s..." url)
             (when (ghostel--download-file url dest)
               (message "ghostel: native module downloaded to %s" dest)))))
@@ -138,11 +141,13 @@ Does nothing if the platform is unsupported or the download fails."
      nil)))
 
 (defun ghostel--package-version ()
-  "Return ghostel package version string, or nil."
-  (let ((pkg (and (fboundp 'package-desc-version)
-                  (car (alist-get 'ghostel package-alist)))))
-    (when pkg
-      (package-version-join (package-desc-version pkg)))))
+  "Return ghostel package version string, or nil.
+Returns nil without error when `package.el' is unavailable."
+  (when (and (require 'package nil t)
+             (boundp 'package-alist))
+    (let ((pkg (car (alist-get 'ghostel package-alist))))
+      (when pkg
+        (package-version-join (package-desc-version pkg))))))
 
 (defun ghostel--download-file (url dest)
   "Download URL to DEST.  Return non-nil on success."
