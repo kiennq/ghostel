@@ -751,6 +751,12 @@ pasted using bracketed paste."
       (ghostel--redraw ghostel--term))
     (goto-char (point-max))))
 
+(defun ghostel-copy-mode-end-of-line ()
+  "Move to the last non-whitespace character on the line."
+  (interactive)
+  (end-of-line)
+  (skip-chars-backward " \t"))
+
 ;;; Mouse input
 
 (defun ghostel--mouse-button-number (event)
@@ -834,6 +840,7 @@ pasted using bracketed paste."
     (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
     (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
+    (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
