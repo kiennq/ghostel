@@ -671,16 +671,67 @@ pasted using bracketed paste."
   (interactive "e")
   (when ghostel--term
     (ghostel--scroll ghostel--term -3)
-    (setq ghostel--force-next-redraw t)
-    (ghostel--invalidate)))
+    (if ghostel--copy-mode-active
+        (let ((inhibit-read-only t))
+          (ghostel--redraw ghostel--term))
+      (setq ghostel--force-next-redraw t)
+      (ghostel--invalidate))))
 
 (defun ghostel--scroll-down (&optional _event)
   "Scroll the terminal viewport down."
   (interactive "e")
   (when ghostel--term
     (ghostel--scroll ghostel--term 3)
-    (setq ghostel--force-next-redraw t)
-    (ghostel--invalidate)))
+    (if ghostel--copy-mode-active
+        (let ((inhibit-read-only t))
+          (ghostel--redraw ghostel--term))
+      (setq ghostel--force-next-redraw t)
+      (ghostel--invalidate))))
+
+(defun ghostel-copy-mode-scroll-up ()
+  "Scroll the terminal viewport up by a page in copy mode."
+  (interactive)
+  (when ghostel--term
+    (let ((height (count-lines (point-min) (point-max))))
+      (ghostel--scroll ghostel--term (- 2 height))
+      (let ((inhibit-read-only t))
+        (ghostel--redraw ghostel--term)))))
+
+(defun ghostel-copy-mode-scroll-down ()
+  "Scroll the terminal viewport down by a page in copy mode."
+  (interactive)
+  (when ghostel--term
+    (let ((height (count-lines (point-min) (point-max))))
+      (ghostel--scroll ghostel--term (- height 2))
+      (let ((inhibit-read-only t))
+        (ghostel--redraw ghostel--term)))))
+
+(defun ghostel-copy-mode-previous-line ()
+  "Move to the previous line, scrolling the viewport if at the top."
+  (interactive)
+  (if (= (line-number-at-pos) 1)
+      (when ghostel--term
+        (let ((col (current-column)))
+          (ghostel--scroll ghostel--term -1)
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term))
+          (goto-char (point-min))
+          (move-to-column col)))
+    (forward-line -1)))
+
+(defun ghostel-copy-mode-next-line ()
+  "Move to the next line, scrolling the viewport if at the bottom."
+  (interactive)
+  (if (>= (line-number-at-pos) (line-number-at-pos (point-max)))
+      (when ghostel--term
+        (let ((col (current-column)))
+          (ghostel--scroll ghostel--term 1)
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term))
+          (goto-char (point-max))
+          (beginning-of-line)
+          (move-to-column col)))
+    (forward-line 1)))
 
 ;;; Mouse input
 
@@ -754,6 +805,15 @@ pasted using bracketed paste."
     ;; Prompt navigation works in copy mode too
     (define-key map (kbd "C-c C-n") #'ghostel-next-prompt)
     (define-key map (kbd "C-c C-p") #'ghostel-previous-prompt)
+    ;; Scrollback
+    (define-key map (kbd "<mouse-4>")       #'ghostel--scroll-up)
+    (define-key map (kbd "<mouse-5>")       #'ghostel--scroll-down)
+    (define-key map (kbd "<wheel-up>")      #'ghostel--scroll-up)
+    (define-key map (kbd "<wheel-down>")    #'ghostel--scroll-down)
+    (define-key map (kbd "M-v")             #'ghostel-copy-mode-scroll-up)
+    (define-key map (kbd "C-v")             #'ghostel-copy-mode-scroll-down)
+    (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
+    (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
