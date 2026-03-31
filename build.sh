@@ -20,11 +20,21 @@ echo "Building libghostty-vt..."
 (cd vendor/ghostty && zig build -Demit-lib-vt=true)
 
 # Copy bundled C++ dependencies to stable paths.
-# These are built by ghostty's zig build into .zig-cache with hash-based
-# directory names.  We copy them to zig-out/lib/ for reproducible builds.
+# These are built by ghostty's zig build into a cache directory with
+# hash-based names.  Search the local .zig-cache first, then fall back
+# to the global/local cache dirs (which CI tools like setup-zig may override).
 echo "Copying dependency libraries..."
-SIMDUTF=$(find vendor/ghostty/.zig-cache -name "libsimdutf.a" -print -quit 2>/dev/null)
-HIGHWAY=$(find vendor/ghostty/.zig-cache -name "libhighway.a" -print -quit 2>/dev/null)
+SEARCH_DIRS="vendor/ghostty/.zig-cache"
+[ -n "$ZIG_LOCAL_CACHE_DIR" ] && SEARCH_DIRS="$SEARCH_DIRS $ZIG_LOCAL_CACHE_DIR"
+[ -n "$ZIG_GLOBAL_CACHE_DIR" ] && SEARCH_DIRS="$SEARCH_DIRS $ZIG_GLOBAL_CACHE_DIR"
+
+SIMDUTF=""
+HIGHWAY=""
+for dir in $SEARCH_DIRS; do
+    [ -d "$dir" ] || continue
+    [ -z "$SIMDUTF" ] && SIMDUTF=$(find "$dir" -name "libsimdutf.a" -print -quit 2>/dev/null)
+    [ -z "$HIGHWAY" ] && HIGHWAY=$(find "$dir" -name "libhighway.a" -print -quit 2>/dev/null)
+done
 
 if [ -z "$SIMDUTF" ]; then
     echo "Error: could not find libsimdutf.a in vendor/ghostty/.zig-cache"
