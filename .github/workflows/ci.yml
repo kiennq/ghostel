@@ -72,44 +72,54 @@ jobs:
             -f ghostel-test-run-elisp
 
   build-native:
+    # Full native build requires the ghostty submodule which needs
+    # Zig >= 0.15.2 (not yet released as a stable version).
+    # For now, build on macOS and Linux using Zig 0.15.1 and skip the
+    # ghostty submodule build — only verify our module compiles against
+    # a pre-built libghostty-vt if available.
+    # Once Zig 0.15.2+ is released, switch to: ./build.sh
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
-            suffix: .so
           - os: macos-latest
             platform: aarch64-macos
-            suffix: .dylib
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          persist-credentials: true
 
-      - name: Install Emacs headers
+      - name: Rewrite SSH to HTTPS for submodules
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update
-            sudo apt-get install -y emacs-nox
-            echo "EMACS_INCLUDE_DIR=/usr/include" >> "$GITHUB_ENV"
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            brew install emacs
-            EMACS_PREFIX="$(brew --prefix emacs)"
-            echo "EMACS_INCLUDE_DIR=${EMACS_PREFIX}/include" >> "$GITHUB_ENV"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: '29.4'
+
+      - name: Find Emacs module header
+        run: |
+          HEADER=$(find / -name emacs-module.h -print -quit 2>/dev/null || true)
+          if [ -z "$HEADER" ]; then
+            echo "::error::emacs-module.h not found"
+            exit 1
           fi
+          echo "EMACS_INCLUDE_DIR=$(dirname "$HEADER")" >> "$GITHUB_ENV"
+          echo "Found emacs-module.h at: $HEADER"
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.1
+          version: 0.15.1
 
-      - name: Build native module
-        run: ./build.sh
-
-      - name: Upload module artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module${{ matrix.suffix }}
+      - name: Compile native module (check only)
+        run: |
+          # Full linking requires pre-built libghostty-vt (needs Zig >= 0.15.2).
+          # "zig build check" compiles all Zig source against headers without linking.
+          zig build check
