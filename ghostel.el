@@ -120,8 +120,18 @@
   :group 'ghostel)
 
 (defcustom ghostel-timer-delay 0.033
-  "Delay in seconds before redrawing after output (roughly 30fps)."
+  "Delay in seconds before redrawing after output (roughly 30fps).
+When `ghostel-adaptive-fps' is non-nil, this serves as the base
+delay between frames during sustained output."
   :type 'number
+  :group 'ghostel)
+
+(defcustom ghostel-adaptive-fps t
+  "Use adaptive frame rate for terminal redraw.
+When non-nil, use a shorter initial delay for responsive interactive
+feedback and stop the timer entirely when idle.  When nil, use the
+fixed `ghostel-timer-delay' unconditionally."
+  :type 'boolean
   :group 'ghostel)
 
 (defcustom ghostel-buffer-name "*ghostel*"
@@ -1332,13 +1342,29 @@ PROCESS is the shell process, EVENT describes the state change."
 
 ;;; Rendering
 
+(defvar-local ghostel--last-output-time nil
+  "Time of the last process output, for adaptive frame rate.")
+
 (defun ghostel--invalidate ()
-  "Schedule a redraw after a short delay."
+  "Schedule a redraw after a short delay.
+With `ghostel-adaptive-fps', use a shorter delay for the first
+frame after idle to improve interactive responsiveness."
   (unless ghostel--redraw-timer
-    (setq ghostel--redraw-timer
-          (run-with-timer ghostel-timer-delay nil
-                          #'ghostel--delayed-redraw
-                          (current-buffer)))))
+    (let ((delay (if (and ghostel-adaptive-fps ghostel--last-output-time)
+                     (let ((idle-secs (float-time
+                                       (time-subtract nil
+                                                      ghostel--last-output-time))))
+                       ;; If idle for more than 100ms, use a short delay
+                       ;; for snappy first-frame response.
+                       (if (> idle-secs 0.1)
+                           (min 0.016 ghostel-timer-delay)
+                         ghostel-timer-delay))
+                   ghostel-timer-delay)))
+      (setq ghostel--last-output-time (current-time))
+      (setq ghostel--redraw-timer
+            (run-with-timer delay nil
+                            #'ghostel--delayed-redraw
+                            (current-buffer))))))
 
 (defun ghostel--delayed-redraw (buffer)
   "Perform the actual redraw in BUFFER."

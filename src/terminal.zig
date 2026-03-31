@@ -98,67 +98,46 @@ pub fn deinit(self: *Self) void {
     gt.c.ghostty_terminal_free(self.terminal);
 }
 
+/// Helper to call ghostty_terminal_set and check the return code.
+fn terminalSet(self: *Self, opt: gt.c.GhosttyTerminalOption, value: ?*const anyopaque) !void {
+    if (gt.c.ghostty_terminal_set(self.terminal, opt, value) != gt.SUCCESS) {
+        return error.TerminalSetFailed;
+    }
+}
+
 /// Register the userdata pointer for callbacks.
-pub fn setUserdata(self: *Self, userdata: ?*anyopaque) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_USERDATA,
-        userdata,
-    );
+pub fn setUserdata(self: *Self, userdata: ?*anyopaque) !void {
+    try self.terminalSet(gt.OPT_USERDATA, userdata);
 }
 
 /// Register the write_pty callback.
-pub fn setWritePty(self: *Self, cb: gt.WritePtyFn) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_WRITE_PTY,
-        @ptrCast(cb),
-    );
+pub fn setWritePty(self: *Self, cb: gt.WritePtyFn) !void {
+    try self.terminalSet(gt.OPT_WRITE_PTY, @ptrCast(cb));
 }
 
 /// Register the bell callback.
-pub fn setBell(self: *Self, cb: gt.BellFn) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_BELL,
-        @ptrCast(cb),
-    );
+pub fn setBell(self: *Self, cb: gt.BellFn) !void {
+    try self.terminalSet(gt.OPT_BELL, @ptrCast(cb));
 }
 
 /// Register the title_changed callback.
-pub fn setTitleChanged(self: *Self, cb: gt.TitleChangedFn) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_TITLE_CHANGED,
-        @ptrCast(cb),
-    );
+pub fn setTitleChanged(self: *Self, cb: gt.TitleChangedFn) !void {
+    try self.terminalSet(gt.OPT_TITLE_CHANGED, @ptrCast(cb));
 }
 
 /// Set default foreground color.
-pub fn setColorForeground(self: *Self, color: *const gt.ColorRgb) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_COLOR_FOREGROUND,
-        color,
-    );
+pub fn setColorForeground(self: *Self, color: *const gt.ColorRgb) !void {
+    try self.terminalSet(gt.OPT_COLOR_FOREGROUND, color);
 }
 
 /// Set default background color.
-pub fn setColorBackground(self: *Self, color: *const gt.ColorRgb) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_COLOR_BACKGROUND,
-        color,
-    );
+pub fn setColorBackground(self: *Self, color: *const gt.ColorRgb) !void {
+    try self.terminalSet(gt.OPT_COLOR_BACKGROUND, color);
 }
 
 /// Set the color palette (256 entries).
-pub fn setColorPalette(self: *Self, palette: *const [256]gt.ColorRgb) void {
-    _ = gt.c.ghostty_terminal_set(
-        self.terminal,
-        gt.OPT_COLOR_PALETTE,
-        palette,
-    );
+pub fn setColorPalette(self: *Self, palette: *const [256]gt.ColorRgb) !void {
+    try self.terminalSet(gt.OPT_COLOR_PALETTE, palette);
 }
 
 /// Get the current color palette (256 entries).

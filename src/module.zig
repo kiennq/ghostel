@@ -80,16 +80,28 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
     };
 
     // Register callbacks
-    term.setUserdata(term);
-    term.setWritePty(&writePtyCallback);
-    term.setBell(&bellCallback);
-    term.setTitleChanged(&titleChangedCallback);
+    term.setUserdata(term) catch {
+        env.signalError("ghostel: failed to set terminal userdata");
+        return env.nil();
+    };
+    term.setWritePty(&writePtyCallback) catch {
+        env.signalError("ghostel: failed to set write_pty callback");
+        return env.nil();
+    };
+    term.setBell(&bellCallback) catch {
+        env.signalError("ghostel: failed to set bell callback");
+        return env.nil();
+    };
+    term.setTitleChanged(&titleChangedCallback) catch {
+        env.signalError("ghostel: failed to set title_changed callback");
+        return env.nil();
+    };
 
     // Set default colors (light gray on black)
     const default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
     const default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
-    term.setColorForeground(&default_fg);
-    term.setColorBackground(&default_bg);
+    term.setColorForeground(&default_fg) catch {};
+    term.setColorBackground(&default_bg) catch {};
 
     return env.makeUserPtr(&Terminal.emacsFinalize, term);
 }
@@ -149,30 +161,59 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     return env.nil();
 }
 
+// ---------------------------------------------------------------------------
+// OSC sequence helpers
+// ---------------------------------------------------------------------------
+
+/// Find the end of an OSC sequence payload starting at `start`.
+/// Scans for the terminator: BEL (0x07) or ST (ESC \).
+/// Returns the index of the first terminator byte, or data.len if none found.
+fn findOscTerminator(data: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < data.len) {
+        if (data[pos] == 0x07) return pos; // BEL
+        if (data[pos] == 0x1b and pos + 1 < data.len and data[pos + 1] == '\\') return pos; // ST
+        pos += 1;
+    }
+    return data.len;
+}
+
+/// Iterator-style scanner that yields successive OSC sequences matching `prefix`.
+/// Each call to `next()` returns the payload slice (after the prefix, before the
+/// terminator), or null when no more matches exist.
+const OscScanner = struct {
+    data: []const u8,
+    prefix: []const u8,
+    pos: usize = 0,
+
+    const Match = struct {
+        payload: []const u8,
+        end: usize,
+    };
+
+    fn next(self: *OscScanner) ?Match {
+        while (self.pos + self.prefix.len < self.data.len) {
+            if (std.mem.startsWith(u8, self.data[self.pos..], self.prefix)) {
+                const payload_start = self.pos + self.prefix.len;
+                const payload_end = findOscTerminator(self.data, payload_start);
+                self.pos = payload_end;
+                return .{ .payload = self.data[payload_start..payload_end], .end = payload_end };
+            } else {
+                self.pos += 1;
+            }
+        }
+        return null;
+    }
+};
+
 /// Scan data for OSC 7 sequences and set the terminal PWD.
 /// OSC 7 format: ESC ] 7 ; <url> (ST | BEL)
-/// ST = ESC \   BEL = 0x07
 fn extractAndSetPwd(term: *Terminal, data: []const u8) void {
-    const prefix = "\x1b]7;";
-    var pos: usize = 0;
-    while (pos + prefix.len < data.len) {
-        if (std.mem.startsWith(u8, data[pos..], prefix)) {
-            const url_start = pos + prefix.len;
-            // Find the terminator: BEL (0x07) or ST (ESC \)
-            var url_end: usize = url_start;
-            while (url_end < data.len) {
-                if (data[url_end] == 0x07) break; // BEL
-                if (data[url_end] == 0x1b and url_end + 1 < data.len and data[url_end + 1] == '\\') break; // ST
-                url_end += 1;
-            }
-            if (url_end > url_start and url_end <= data.len) {
-                const url = data[url_start..url_end];
-                const gs = gt.GhosttyString{ .ptr = url.ptr, .len = url.len };
-                _ = gt.c.ghostty_terminal_set(term.terminal, gt.OPT_PWD, &gs);
-            }
-            pos = url_end;
-        } else {
-            pos += 1;
+    var scanner = OscScanner{ .data = data, .prefix = "\x1b]7;" };
+    while (scanner.next()) |match| {
+        if (match.payload.len > 0) {
+            const gs = gt.GhosttyString{ .ptr = match.payload.ptr, .len = match.payload.len };
+            _ = gt.c.ghostty_terminal_set(term.terminal, gt.OPT_PWD, &gs);
         }
     }
 }
@@ -181,44 +222,21 @@ fn extractAndSetPwd(term: *Terminal, data: []const u8) void {
 /// OSC 52 format: ESC ] 52 ; <selection> ; <base64-data> (ST | BEL)
 /// Calls ghostel--osc52-handle with the selection and base64 data.
 fn extractOsc52(env: emacs.Env, data: []const u8) void {
-    const prefix = "\x1b]52;";
-    var pos: usize = 0;
-    while (pos + prefix.len < data.len) {
-        if (std.mem.startsWith(u8, data[pos..], prefix)) {
-            const after_prefix = pos + prefix.len;
-            // Find the ';' separating selection from data
-            var semi: usize = after_prefix;
-            while (semi < data.len and data[semi] != ';') : (semi += 1) {}
-            if (semi >= data.len) {
-                pos = after_prefix;
-                continue;
-            }
-            const selection = data[after_prefix..semi];
-            const data_start = semi + 1;
-            // Find the terminator: BEL (0x07) or ST (ESC \)
-            var data_end: usize = data_start;
-            while (data_end < data.len) {
-                if (data[data_end] == 0x07) break;
-                if (data[data_end] == 0x1b and data_end + 1 < data.len and data[data_end + 1] == '\\') break;
-                data_end += 1;
-            }
-            if (data_end > data_start) {
-                const b64 = data[data_start..data_end];
-                // Ignore clipboard queries ('?')
-                if (b64.len == 1 and b64[0] == '?') {
-                    pos = data_end;
-                    continue;
-                }
-                _ = env.call2(
-                    emacs.sym.@"ghostel--osc52-handle",
-                    env.makeString(selection),
-                    env.makeString(b64),
-                );
-            }
-            pos = data_end;
-        } else {
-            pos += 1;
-        }
+    var scanner = OscScanner{ .data = data, .prefix = "\x1b]52;" };
+    while (scanner.next()) |match| {
+        const payload = match.payload;
+        // Find the ';' separating selection from data
+        const semi = std.mem.indexOfScalar(u8, payload, ';') orelse continue;
+        const selection = payload[0..semi];
+        const b64 = payload[semi + 1 ..];
+        if (b64.len == 0) continue;
+        // Ignore clipboard queries ('?')
+        if (b64.len == 1 and b64[0] == '?') continue;
+        _ = env.call2(
+            emacs.sym.@"ghostel--osc52-handle",
+            env.makeString(selection),
+            env.makeString(b64),
+        );
     }
 }
 
@@ -227,60 +245,30 @@ fn extractOsc52(env: emacs.Env, data: []const u8) void {
 /// type: A = prompt start, B = command start, C = output start, D = command finished
 /// For type D, param is the exit status.
 fn extractOsc133(env: emacs.Env, data: []const u8) void {
-    const prefix = "\x1b]133;";
-    var pos: usize = 0;
-    while (pos + prefix.len < data.len) {
-        if (std.mem.startsWith(u8, data[pos..], prefix)) {
-            const type_pos = pos + prefix.len;
-            if (type_pos >= data.len) break;
-            const marker_type = data[type_pos];
+    var scanner = OscScanner{ .data = data, .prefix = "\x1b]133;" };
+    while (scanner.next()) |match| {
+        const payload = match.payload;
+        if (payload.len == 0) continue;
+        const marker_type = payload[0];
 
-            // Only handle known types
-            if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D') {
-                pos += 1;
-                continue;
-            }
+        // Only handle known types
+        if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D') continue;
 
-            // Look for optional parameter (;param) and terminator
-            var param_start: usize = type_pos + 1;
-            var param_end: usize = param_start;
-            var has_param = false;
+        // Check for optional parameter after ';'
+        const has_param = payload.len > 1 and payload[1] == ';';
+        const param_data = if (has_param) payload[2..] else &[_]u8{};
 
-            if (param_start < data.len and data[param_start] == ';') {
-                has_param = true;
-                param_start += 1; // skip the ';'
-                param_end = param_start;
-                while (param_end < data.len) {
-                    if (data[param_end] == 0x07) break; // BEL
-                    if (data[param_end] == 0x1b and param_end + 1 < data.len and data[param_end + 1] == '\\') break; // ST
-                    param_end += 1;
-                }
-            } else {
-                // No param — find terminator directly
-                param_end = param_start;
-                while (param_end < data.len) {
-                    if (data[param_end] == 0x07) break;
-                    if (data[param_end] == 0x1b and param_end + 1 < data.len and data[param_end + 1] == '\\') break;
-                    param_end += 1;
-                }
-            }
+        const type_str: [1]u8 = .{marker_type};
+        const param_val = if (has_param and param_data.len > 0)
+            env.makeString(param_data)
+        else
+            env.nil();
 
-            const type_str: [1]u8 = .{marker_type};
-            const param_val = if (has_param and param_end > param_start)
-                env.makeString(data[param_start..param_end])
-            else
-                env.nil();
-
-            _ = env.call2(
-                emacs.sym.@"ghostel--osc133-marker",
-                env.makeString(&type_str),
-                param_val,
-            );
-
-            pos = param_end;
-        } else {
-            pos += 1;
-        }
+        _ = env.call2(
+            emacs.sym.@"ghostel--osc133-marker",
+            env.makeString(&type_str),
+            param_val,
+        );
     }
 }
 
@@ -506,7 +494,10 @@ fn fnSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         pos += 7;
     }
 
-    term.setColorPalette(&palette);
+    term.setColorPalette(&palette) catch {
+        env.signalError("ghostel: failed to set color palette");
+        return env.nil();
+    };
     return env.t();
 }
 
