@@ -318,6 +318,13 @@ These keys pass through to Emacs instead."
 (defvar-local ghostel--redraw-timer nil
   "Timer for delayed redraw.")
 
+(defvar-local ghostel--force-next-redraw nil
+  "When non-nil, redraw regardless of synchronized output mode.")
+
+(defvar-local ghostel--resize-timer nil
+  "Timer for debounced SIGWINCH on alt screen.")
+
+
 (defvar-local ghostel--last-directory nil
   "Last known working directory from OSC 7, used for dedup.")
 
@@ -655,6 +662,7 @@ pasted using bracketed paste."
   (interactive "e")
   (when ghostel--term
     (ghostel--scroll ghostel--term -3)
+    (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)))
 
 (defun ghostel--scroll-down (&optional _event)
@@ -662,6 +670,7 @@ pasted using bracketed paste."
   (interactive "e")
   (when ghostel--term
     (ghostel--scroll ghostel--term 3)
+    (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)))
 
 ;;; Mouse input
@@ -844,7 +853,7 @@ at the given line in another window."
       (browse-url url)))))
 
 (defun ghostel-open-link-at-click (event)
-  "Open the hyperlink at the mouse click position."
+  "Open the hyperlink at the mouse click EVENT position."
   (interactive "e")
   (ghostel--open-link
    (get-text-property (posn-point (event-start event)) 'help-echo)))
@@ -1092,6 +1101,9 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--redraw-timer
           (cancel-timer ghostel--redraw-timer)
           (setq ghostel--redraw-timer nil))
+        (when ghostel--resize-timer
+          (cancel-timer ghostel--resize-timer)
+          (setq ghostel--resize-timer nil))
         (remove-function after-focus-change-function #'ghostel--focus-change)
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
@@ -1211,11 +1223,16 @@ PROCESS is the shell process, EVENT describes the state change."
     (with-current-buffer buffer
       (setq ghostel--redraw-timer nil)
       (when (and ghostel--term (not ghostel--copy-mode-active))
-        (let ((inhibit-read-only t)
-              (inhibit-redisplay t))
-          (ghostel--redraw ghostel--term)
-          (when ghostel-prompt-reapply-on-redraw
-            (ghostel--reapply-prompt-properties)))))))
+        ;; Skip during synchronized output unless forced by scroll/resize.
+        (unless (and (not ghostel--force-next-redraw)
+                     (ghostel--mode-enabled ghostel--term 2026))
+          (setq ghostel--force-next-redraw nil)
+          (let ((inhibit-read-only t)
+                (inhibit-redisplay t)
+                (inhibit-modification-hooks t))
+            (ghostel--redraw ghostel--term)
+            (when ghostel-prompt-reapply-on-redraw
+              (ghostel--reapply-prompt-properties))))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
@@ -1233,12 +1250,44 @@ PROCESS is the shell process, WINDOWS is the list of windows."
          (width (window-max-chars-per-line window))
          (height (window-body-height window)))
     (when ghostel--term
-      (ghostel--set-size ghostel--term height width)
-      ;; Update PTY dimensions (sends SIGWINCH to the shell)
-      (when (process-live-p process)
-        (set-process-window-size process height width))
-      (ghostel--invalidate))
+      (if (ghostel--mode-enabled ghostel--term 1049)
+          ;; Alt screen: debounce the entire resize (terminal + SIGWINCH)
+          ;; so we never interrupt a BSU/ESU cycle mid-render.
+          (progn
+            (when ghostel--resize-timer
+              (cancel-timer ghostel--resize-timer))
+            (setq ghostel--resize-timer
+                  (run-with-timer 0.05 nil
+                                  #'ghostel--resize-settled
+                                  (current-buffer) process height width)))
+        ;; Primary screen: resize + SIGWINCH + render immediately.
+        (ghostel--set-size ghostel--term height width)
+        (when (process-live-p process)
+          (set-process-window-size process height width))
+        (setq ghostel--force-next-redraw t)
+        (ghostel--invalidate)))
     (cons width height)))
+
+(defun ghostel--resize-settled (buffer process height width)
+  "Resize terminal in BUFFER and send SIGWINCH after debounce settles.
+Renders synchronously before returning to the event loop so the
+reflowed content is visible before the app's BSU can arrive.
+PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq ghostel--resize-timer nil)
+      (when ghostel--term
+        (ghostel--set-size ghostel--term height width)
+        (when (and process (process-live-p process))
+          (set-process-window-size process height width))
+        ;; Render NOW, before returning to the event loop.
+        ;; The app's BSU response can't arrive until we return.
+        (let ((inhibit-read-only t)
+              (inhibit-redisplay t)
+              (inhibit-modification-hooks t))
+          (ghostel--redraw ghostel--term)
+          (when ghostel-prompt-reapply-on-redraw
+            (ghostel--reapply-prompt-properties)))))))
 
 ;;; Major mode
 

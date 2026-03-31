@@ -866,6 +866,56 @@
                           (< (point) (point-max)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: resize during sync output (alt screen)
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-resize-sync ()
+  "Test that resize between BSU/ESU cycles gives clean content."
+  (message "--- resize + sync ---")
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-sync*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 10 40 100))
+                 (inhibit-read-only t))
+            ;; Enter alt screen, write content, cursor at bottom
+            (ghostel--write-input term "\e[?1049h")
+            (dotimes (i 9) (ghostel--write-input term (format "line %d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel-test--assert "alt screen enabled"
+                                  (ghostel--mode-enabled term 1049))
+            ;; Simulate a full BSU/ESU cycle (app redraw)
+            (ghostel--write-input term "\e[?2026h\e[H\e[2J")
+            (dotimes (i 9) (ghostel--write-input term (format "new %d\r\n" i)))
+            (ghostel--write-input term "new prompt> ")
+            (ghostel--write-input term "\e[?2026l")
+            (ghostel-test--assert "sync off after ESU"
+                                  (not (ghostel--mode-enabled term 2026)))
+            ;; Resize between cycles (sync OFF) — should get clean content
+            (ghostel--set-size term 6 40)
+            (ghostel--redraw term)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (ghostel-test--assert-match "prompt visible after resize"
+                                          "new prompt>" content)
+              (ghostel-test--assert "cursor not at top"
+                                    (> (line-number-at-pos) 1))
+              (ghostel-test--assert-equal "correct line count" 6
+                                          (count-lines (point-min) (point-max))))
+            ;; Verify: resize DURING BSU gives garbage (cursor at top)
+            (ghostel--write-input term "\e[?2026h\e[H\e[2J")
+            (ghostel--write-input term "BANNER\r\n")
+            (ghostel-test--assert "sync on during BSU"
+                                  (ghostel--mode-enabled term 2026))
+            (ghostel--set-size term 5 40)
+            (ghostel--redraw term)
+            ;; This SHOULD show garbage — cursor near top, no prompt
+            (ghostel-test--assert "mid-BSU: cursor near top"
+                                  (<= (line-number-at-pos) 2))
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (ghostel-test--assert "mid-BSU: no prompt"
+                                    (not (string-match-p "new prompt>" content))))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -905,6 +955,9 @@
   (ghostel-test-url-detection)
   (ghostel-test-osc133-parsing)
   (ghostel-test-osc133-text-properties)
+
+  ;; Resize + sync output test
+  (ghostel-test-resize-sync)
 
   ;; Pure Elisp prompt navigation test
   (ghostel-test-prompt-navigation)
