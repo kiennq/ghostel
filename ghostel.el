@@ -709,29 +709,29 @@ pasted using bracketed paste."
 (defun ghostel-copy-mode-previous-line ()
   "Move to the previous line, scrolling the viewport if at the top."
   (interactive)
-  (if (= (line-number-at-pos) 1)
-      (when ghostel--term
-        (let ((col (current-column)))
+  (let ((col (current-column)))
+    (if (= (line-number-at-pos) 1)
+        (when ghostel--term
           (ghostel--scroll ghostel--term -1)
           (let ((inhibit-read-only t))
             (ghostel--redraw ghostel--term))
-          (goto-char (point-min))
-          (move-to-column col)))
-    (forward-line -1)))
+          (goto-char (point-min)))
+      (forward-line -1))
+    (move-to-column col)))
 
 (defun ghostel-copy-mode-next-line ()
   "Move to the next line, scrolling the viewport if at the bottom."
   (interactive)
-  (if (>= (line-number-at-pos) (line-number-at-pos (point-max)))
-      (when ghostel--term
-        (let ((col (current-column)))
+  (let ((col (current-column)))
+    (if (>= (line-number-at-pos) (line-number-at-pos (point-max)))
+        (when ghostel--term
           (ghostel--scroll ghostel--term 1)
           (let ((inhibit-read-only t))
             (ghostel--redraw ghostel--term))
           (goto-char (point-max))
-          (beginning-of-line)
-          (move-to-column col)))
-    (forward-line 1)))
+          (beginning-of-line))
+      (forward-line 1))
+    (move-to-column col)))
 
 (defun ghostel-copy-mode-beginning-of-buffer ()
   "Scroll to the top of scrollback in copy mode."
