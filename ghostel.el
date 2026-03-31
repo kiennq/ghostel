@@ -82,6 +82,9 @@
 (require 'url-parse)
 (require 'face-remap)
 
+(declare-function package-version-join "package" (vlist))
+(declare-function package-desc-version "package" (pkg-desc))
+
 (defvar ghostel-github-release-url
   "https://github.com/dakra/ghostel/releases"
   "Base URL for ghostel GitHub releases.")
@@ -173,9 +176,9 @@ Behavior is controlled by `ghostel-module-auto-install'."
       ('compile  (ghostel--compile-module dir))
       (_         nil))))
 
-(defun ghostel--ask-install-action (dir)
+(defun ghostel--ask-install-action (_dir)
   "Prompt the user to choose how to install the missing native module.
-DIR is the target directory.  Returns \\='download, \\='compile, or nil."
+Returns \\='download, \\='compile, or nil."
   (let* ((url (or (ghostel--module-download-url) "GitHub releases"))
          (choice (read-char-choice
                   (format "Ghostel native module not found.
@@ -271,6 +274,8 @@ Returns nil without error when `package.el' is unavailable."
 (declare-function ghostel--focus-event "ghostel-module")
 (declare-function ghostel--set-palette "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
+(declare-function ghostel--scroll-top "ghostel-module")
+(declare-function ghostel--scroll-bottom "ghostel-module")
 
 ;;; Customization
 
@@ -484,6 +489,9 @@ These keys pass through to Emacs instead."
 
 (defvar-local ghostel--term nil
   "Handle to the native terminal instance.")
+
+(defvar-local ghostel--copy-mode-active nil
+  "Non-nil when copy mode is active.")
 
 (defvar-local ghostel--process nil
   "The shell process.")
@@ -1026,9 +1034,6 @@ pasted using bracketed paste."
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
 Set mark, navigate to select, then \\[ghostel-copy-mode-copy] to copy.")
-
-(defvar-local ghostel--copy-mode-active nil
-  "Non-nil when copy mode is active.")
 
 (defvar-local ghostel--saved-local-map nil
   "Saved keymap before entering copy mode.")

@@ -24,7 +24,7 @@
   (advice-remove 'ghostel--send-encoded #'ghostel-debug--log-encoded)
   (message "ghostel-debug: logging stopped"))
 
-(defun ghostel-debug--log-filter (proc output)
+(defun ghostel-debug--log-filter (_proc output)
   (when ghostel-debug--log-buffer
     (with-current-buffer ghostel-debug--log-buffer
       (goto-char (point-max))
