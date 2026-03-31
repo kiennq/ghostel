@@ -996,6 +996,32 @@
 ;; Runner
 ;; -----------------------------------------------------------------------
 
+(defun ghostel-test--report-and-exit ()
+  "Print test results and exit with appropriate code."
+  (message "\n========================================")
+  (message "Results: %d passed, %d failed" ghostel-test--pass ghostel-test--fail)
+  (when ghostel-test--errors
+    (message "Failures:")
+    (dolist (e (nreverse ghostel-test--errors))
+      (message "  - %s" e)))
+  (message "========================================")
+  (kill-emacs (if (= ghostel-test--fail 0) 0 1)))
+
+(defun ghostel-test-run-elisp ()
+  "Run only pure Elisp tests (no native module required)."
+  (setq ghostel-test--pass 0
+        ghostel-test--fail 0
+        ghostel-test--errors nil)
+  (message "Running ghostel pure Elisp tests...\n")
+  (ghostel-test-raw-key-sequences)
+  (ghostel-test-modifier-number)
+  (ghostel-test-send-event)
+  (ghostel-test-raw-key-modified-specials)
+  (ghostel-test-update-directory)
+  (ghostel-test-filter-soft-wraps)
+  (ghostel-test-prompt-navigation)
+  (ghostel-test--report-and-exit))
+
 (defun ghostel-test-run ()
   "Run all ghostel tests."
   (setq ghostel-test--pass 0
@@ -1044,14 +1070,6 @@
   ;; Integration test (spawns a real shell)
   (ghostel-test-shell-integration)
 
-  (message "\n========================================")
-  (message "Results: %d passed, %d failed" ghostel-test--pass ghostel-test--fail)
-  (when ghostel-test--errors
-    (message "Failures:")
-    (dolist (e (nreverse ghostel-test--errors))
-      (message "  - %s" e)))
-  (message "========================================")
-
-  (kill-emacs (if (= ghostel-test--fail 0) 0 1)))
+  (ghostel-test--report-and-exit))
 
 ;;; ghostel-test.el ends here

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs_version:
+          - '27.2'
+          - '29.4'
+          - 'snapshot'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Byte-compile
+        run: |
+          emacs --batch -Q -L . \
+            -f batch-byte-compile \
+            ghostel.el ghostel-debug.el
+
+      - name: Checkdoc
+        run: |
+          output=$(emacs --batch -Q -L . \
+            --eval "(require 'checkdoc)" \
+            --eval "(checkdoc-file \"ghostel.el\")" 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "Warning"; then
+            exit 1
+          fi
+
+      - name: Package-lint
+        run: |
+          emacs --batch -Q \
+            --eval "(progn
+                      (require 'package)
+                      (push '(\"melpa\" . \"https://melpa.org/packages/\") package-archives)
+                      (package-initialize)
+                      (package-refresh-contents)
+                      (package-install 'package-lint))" \
+            -L . \
+            -f package-lint-batch-and-exit \
+            ghostel.el
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs_version:
+          - '27.2'
+          - '29.4'
+          - 'snapshot'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Run pure Elisp tests
+        run: |
+          emacs --batch -Q -L . \
+            -l test/ghostel-test.el \
+            -f ghostel-test-run-elisp
