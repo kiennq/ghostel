@@ -45,8 +45,9 @@ Then `M-x ghostel` to open a terminal.
 
 ## Shell Integration
 
-Shell integration (directory tracking via OSC 7, etc.) is **automatic** for
-bash, zsh, and fish.  No changes to your shell configuration files are needed.
+Shell integration (directory tracking via OSC 7, prompt navigation via OSC 133,
+etc.) is **automatic** for bash, zsh, and fish.  No changes to your shell
+configuration files are needed.
 
 This is controlled by `ghostel-shell-integration` (default `t`).  Set it to
 `nil` to disable auto-injection and source the scripts manually instead:
@@ -86,6 +87,8 @@ test "$INSIDE_EMACS" = 'ghostel'; and source "$EMACS_GHOSTEL_PATH/etc/ghostel.fi
 | `M-y`       | Yank-pop (cycle through kill ring)     |
 | `C-c C-y`   | Paste from kill ring                   |
 | `C-c C-l`   | Clear scrollback                       |
+| `C-c C-n`   | Jump to next prompt                    |
+| `C-c C-p`   | Jump to previous prompt                |
 | `C-c C-q`   | Send next key literally (escape hatch) |
 | Mouse wheel | Scroll through scrollback              |
 
@@ -100,6 +103,8 @@ Enter with `C-c C-k`. Standard Emacs navigation works.
 |---------------|-------------------------|
 | `C-SPC`       | Set mark                |
 | `M-w` / `C-w` | Copy selection and exit |
+| `C-c C-n`     | Jump to next prompt     |
+| `C-c C-p`     | Jump to previous prompt |
 | `q`           | Exit without copying    |
 
 Soft-wrapped newlines are automatically stripped from copied text.
@@ -128,6 +133,7 @@ Soft-wrapped newlines are automatically stripped from copied text.
 
 ### Shell Integration
 - Directory tracking via OSC 7
+- Prompt navigation via OSC 133 — jump between prompts with `C-c C-n` / `C-c C-p`
 - Title tracking (buffer renamed from OSC 2)
 - OSC 8 hyperlinks — clickable URLs in terminal output (click or `RET` to open)
 - OSC 52 clipboard support (opt-in, for remote sessions)
@@ -162,6 +168,7 @@ individual faces with `M-x customize-face`.
 | `ghostel-timer-delay`         | `0.033`             | Redraw delay in seconds (~30fps)       |
 | `ghostel-kill-buffer-on-exit` | `t`                 | Kill buffer when shell exits           |
 | `ghostel-enable-osc52`        | `nil`               | Allow apps to set clipboard via OSC 52 |
+| `ghostel-prompt-reapply-on-redraw` | `nil`          | Re-apply prompt markers after full redraws |
 | `ghostel-keymap-exceptions`   | `("C-c" "C-x" ...)` | Keys passed through to Emacs           |
 | `ghostel-exit-functions`      | `nil`               | Hook run when the shell process exits  |
 
@@ -176,6 +183,8 @@ individual faces with `M-x customize-face`.
 | `M-x ghostel-copy-mode`        | Enter copy mode                       |
 | `M-x ghostel-paste`            | Paste from kill ring                  |
 | `M-x ghostel-send-next-key`    | Send next key literally               |
+| `M-x ghostel-next-prompt`      | Jump to next shell prompt             |
+| `M-x ghostel-previous-prompt`  | Jump to previous shell prompt         |
 | `M-x ghostel-force-redraw`     | Force a full terminal redraw          |
 
 ## Running Tests

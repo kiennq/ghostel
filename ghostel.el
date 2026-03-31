@@ -173,6 +173,15 @@ shell configuration files.  Supports bash, zsh, and fish."
   :type 'boolean
   :group 'ghostel)
 
+(defcustom ghostel-prompt-reapply-on-redraw nil
+  "Re-apply prompt markers after a full terminal redraw.
+When non-nil, OSC 133 prompt positions are re-applied to the buffer
+after a full redraw (triggered by resize or clear).  This preserves
+prompt navigation across redraws at the cost of a small post-redraw
+pass.  When nil, prompt markers are lost on full redraws."
+  :type 'boolean
+  :group 'ghostel)
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -311,6 +320,13 @@ These keys pass through to Emacs instead."
 (defvar-local ghostel--last-directory nil
   "Last known working directory from OSC 7, used for dedup.")
 
+(defvar-local ghostel--prompt-positions nil
+  "List of prompt positions as (buffer-line . exit-status) pairs.
+Used for prompt navigation and optional re-application after full redraws.")
+
+(defvar-local ghostel--last-prompt-start nil
+  "Buffer position of the most recent OSC 133;A (prompt start).")
+
 (defvar ghostel--buffer-counter 0
   "Counter for generating unique terminal buffer names.")
 
@@ -349,6 +365,9 @@ These keys pass through to Emacs instead."
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
     (define-key map (kbd "C-c C-l")   #'ghostel-clear-scrollback)
     (define-key map (kbd "C-c C-q")   #'ghostel-send-next-key)
+    ;; Prompt navigation (OSC 133)
+    (define-key map (kbd "C-c C-n")   #'ghostel-next-prompt)
+    (define-key map (kbd "C-c C-p")   #'ghostel-previous-prompt)
     ;; Cursor and navigation keys — raw escape sequences
     (define-key map (kbd "<escape>")  (lambda () (interactive) (ghostel--send-key "\e")))
     (define-key map (kbd "<up>")      (lambda () (interactive) (ghostel--send-key "\e[A")))
@@ -728,6 +747,9 @@ pasted using bracketed paste."
     (define-key map (kbd "C-c C-t") #'ghostel-copy-mode-exit)
     (define-key map (kbd "M-w") #'ghostel-copy-mode-copy)
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
+    ;; Prompt navigation works in copy mode too
+    (define-key map (kbd "C-c C-n") #'ghostel-next-prompt)
+    (define-key map (kbd "C-c C-p") #'ghostel-previous-prompt)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
@@ -883,6 +905,81 @@ Skips regions that already have a `help-echo' property (e.g. from OSC 8)."
                 (put-text-property beg end 'mouse-face 'highlight)
                 (put-text-property beg end 'keymap ghostel-link-map)))))))))
 
+;;; Prompt navigation (OSC 133)
+
+(defun ghostel--osc133-marker (type param)
+  "Handle an OSC 133 semantic prompt marker from the Zig module.
+TYPE is a single character string: A, B, C, or D.
+PARAM is the exit status string for type D, or nil."
+  (pcase type
+    ("A"
+     ;; Prompt start — record position and line number.
+     (setq ghostel--last-prompt-start (point-max))
+     (push (cons (count-lines (point-min) (point-max)) nil)
+           ghostel--prompt-positions))
+    ("B"
+     ;; Prompt end / command start — apply text property.
+     (when ghostel--last-prompt-start
+       (let ((inhibit-read-only t))
+         (put-text-property ghostel--last-prompt-start (point-max)
+                            'ghostel-prompt t))
+       (setq ghostel--last-prompt-start nil)))
+    ("D"
+     ;; Command finished — store exit status on the most recent entry.
+     (when (and ghostel--prompt-positions param)
+       (setcdr (car ghostel--prompt-positions)
+               (string-to-number param))))))
+
+(defun ghostel--reapply-prompt-properties ()
+  "Re-apply `ghostel-prompt' text properties from stored positions.
+Called after a full redraw when `ghostel-prompt-reapply-on-redraw' is non-nil."
+  (when ghostel--prompt-positions
+    (save-excursion
+      (let ((inhibit-read-only t))
+        (dolist (entry ghostel--prompt-positions)
+          (let ((line (car entry)))
+            (goto-char (point-min))
+            (when (zerop (forward-line line))
+              (let ((bol (line-beginning-position))
+                    (eol (line-end-position)))
+                (when (< bol eol)
+                  (put-text-property bol eol 'ghostel-prompt t))))))))))
+
+(defun ghostel-next-prompt (&optional n)
+  "Move to the Nth next prompt.
+With prefix argument N, skip forward N prompts."
+  (interactive "p")
+  (let ((pos (point)))
+    (dotimes (_ (or n 1))
+      ;; First skip past the current prompt region if we're inside one.
+      (let ((next (next-single-property-change pos 'ghostel-prompt)))
+        (when next
+          ;; If we were inside a prompt, this takes us to the end of it.
+          ;; Now find the start of the next prompt region.
+          (setq pos next)
+          (unless (get-text-property pos 'ghostel-prompt)
+            (setq pos (or (next-single-property-change pos 'ghostel-prompt)
+                          pos))))))
+    (when (and pos (/= pos (point)))
+      (goto-char pos))))
+
+(defun ghostel-previous-prompt (&optional n)
+  "Move to the Nth previous prompt.
+With prefix argument N, skip backward N prompts."
+  (interactive "p")
+  (let ((pos (point)))
+    (dotimes (_ (or n 1))
+      ;; Move backward to find start of previous prompt region.
+      (let ((prev (previous-single-property-change pos 'ghostel-prompt)))
+        (when prev
+          (setq pos prev)
+          ;; If we landed at the end of a prompt, step inside it.
+          (when (get-text-property (max (1- pos) (point-min)) 'ghostel-prompt)
+            (setq pos (or (previous-single-property-change pos 'ghostel-prompt)
+                          pos))))))
+    (when (and pos (/= pos (point)))
+      (goto-char pos))))
+
 ;;; Callbacks from native module
 
 (defun ghostel--osc52-handle (_selection base64-data)
@@ -1017,6 +1114,14 @@ PROCESS is the shell process, EVENT describes the state change."
             (goto-char (point-max))
             (insert "\n[Process exited]\n")))))))
 
+(defun ghostel--detect-shell (shell)
+  "Return shell type symbol (bash, zsh, fish) from SHELL path, or nil."
+  (let ((base (file-name-nondirectory shell)))
+    (cond
+     ((string-match-p "bash" base) 'bash)
+     ((string-match-p "zsh" base) 'zsh)
+     ((string-match-p "fish" base) 'fish))))
+
 (defun ghostel--start-process ()
   "Start the shell process with a PTY."
   (let* ((height (max 1 (window-body-height)))
@@ -1122,7 +1227,9 @@ PROCESS is the shell process, EVENT describes the state change."
       (when (and ghostel--term (not ghostel--copy-mode-active))
         (let ((inhibit-read-only t)
               (inhibit-redisplay t))
-          (ghostel--redraw ghostel--term))))))
+          (ghostel--redraw ghostel--term)
+          (when ghostel-prompt-reapply-on-redraw
+            (ghostel--reapply-prompt-properties)))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."

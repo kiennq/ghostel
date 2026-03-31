@@ -727,6 +727,145 @@
                                   test-file opened))))
 
 ;; -----------------------------------------------------------------------
+;; Test: OSC 133 prompt marker parsing
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-osc133-parsing ()
+  "Test that OSC 133 sequences are detected and the callback fires."
+  (message "--- OSC 133 parsing ---")
+  (let ((term (ghostel--new 25 80 1000))
+        (markers nil))
+    ;; Temporarily override the callback to capture markers
+    (cl-letf (((symbol-function 'ghostel--osc133-marker)
+               (lambda (type param) (push (cons type param) markers))))
+      ;; Feed OSC 133;A (prompt start) with ST terminator
+      (ghostel--write-input term "\e]133;A\e\\")
+      (ghostel-test--assert "133;A detected"
+                            (assoc "A" markers))
+
+      ;; Feed OSC 133;B (command start) with BEL terminator
+      (ghostel--write-input term "\e]133;B\a")
+      (ghostel-test--assert "133;B detected"
+                            (assoc "B" markers))
+
+      ;; Feed OSC 133;C (output start)
+      (ghostel--write-input term "\e]133;C\e\\")
+      (ghostel-test--assert "133;C detected"
+                            (assoc "C" markers))
+
+      ;; Feed OSC 133;D;0 (command finished with exit code)
+      (ghostel--write-input term "\e]133;D;0\e\\")
+      (let ((d-entry (assoc "D" markers)))
+        (ghostel-test--assert "133;D detected" d-entry)
+        (ghostel-test--assert-equal "133;D param is exit code"
+                                    "0" (cdr d-entry)))
+
+      ;; Feed 133;D;1 (non-zero exit)
+      (setq markers nil)
+      (ghostel--write-input term "\e]133;D;1\e\\")
+      (let ((d-entry (assoc "D" markers)))
+        (ghostel-test--assert-equal "133;D non-zero exit"
+                                    "1" (cdr d-entry)))
+
+      ;; Mixed with other output
+      (setq markers nil)
+      (ghostel--write-input term "hello\e]133;A\e\\world\e]133;B\e\\")
+      (ghostel-test--assert "133;A in mixed stream" (assoc "A" markers))
+      (ghostel-test--assert "133;B in mixed stream" (assoc "B" markers)))))
+
+;; -----------------------------------------------------------------------
+;; Test: OSC 133 prompt text properties
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-osc133-text-properties ()
+  "Test that prompt markers set ghostel-prompt text property."
+  (message "--- OSC 133 text properties ---")
+  (let ((buf (generate-new-buffer " *ghostel-test-osc133*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t)
+                 (ghostel--prompt-positions nil)
+                 (ghostel--last-prompt-start nil))
+            ;; Simulate a prompt: A, prompt text, B, command, output, D
+            (ghostel--write-input term "\e]133;A\e\\")
+            (ghostel--write-input term "$ ")
+            (ghostel--redraw term)
+            (ghostel--write-input term "\e]133;B\e\\")
+            (ghostel--write-input term "echo hi\r\n")
+            (ghostel--write-input term "hi\r\n")
+            (ghostel--write-input term "\e]133;D;0\e\\")
+            (ghostel--redraw term)
+
+            ;; Check that ghostel-prompt property exists somewhere in buffer
+            (goto-char (point-min))
+            (let ((prompt-pos (text-property-any (point-min) (point-max)
+                                                 'ghostel-prompt t)))
+              (ghostel-test--assert "ghostel-prompt property set" prompt-pos))
+
+            ;; Check prompt-positions list was populated
+            (ghostel-test--assert "prompt-positions has entry"
+                                  (> (length ghostel--prompt-positions) 0))
+
+            ;; Check exit status stored
+            (when ghostel--prompt-positions
+              (ghostel-test--assert-equal "exit status stored"
+                                          0
+                                          (cdr (car ghostel--prompt-positions))))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: prompt navigation
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-prompt-navigation ()
+  "Test next/previous prompt navigation."
+  (message "--- prompt navigation ---")
+  (with-temp-buffer
+    ;; Set up a buffer simulating terminal output with prompt markers
+    (insert "$ cmd1\n")
+    (put-text-property 1 7 'ghostel-prompt t)
+    (insert "output1\n")
+    (insert "$ cmd2\n")
+    (let ((p2-start (- (point) 6)))
+      (put-text-property p2-start (+ p2-start 6) 'ghostel-prompt t))
+    (insert "output2\n")
+    (insert "$ cmd3\n")
+    (let ((p3-start (- (point) 6)))
+      (put-text-property p3-start (+ p3-start 6) 'ghostel-prompt t))
+    (insert "output3\n")
+
+    ;; Start at beginning
+    (goto-char (point-min))
+
+    ;; Next prompt should skip to second prompt (we're in the first)
+    (ghostel-next-prompt 1)
+    (let ((pos (point)))
+      (ghostel-test--assert "next-prompt moves forward"
+                            (> pos (point-min)))
+      ;; Should not be on the first prompt anymore
+      (ghostel-test--assert "past first prompt"
+                            (> pos 8)))
+
+    ;; Next prompt again
+    (let ((before (point)))
+      (ghostel-next-prompt 1)
+      (ghostel-test--assert "next-prompt moves further"
+                            (> (point) before)))
+
+    ;; Previous prompt should go back
+    (let ((before (point)))
+      (ghostel-previous-prompt 1)
+      (ghostel-test--assert "previous-prompt moves backward"
+                            (< (point) before)))
+
+    ;; From end, previous should find a prompt
+    (goto-char (point-max))
+    (ghostel-previous-prompt 1)
+    (ghostel-test--assert "previous from end finds prompt"
+                          (< (point) (point-max)))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -764,6 +903,11 @@
   (ghostel-test-apply-palette)
   (ghostel-test-hyperlinks)
   (ghostel-test-url-detection)
+  (ghostel-test-osc133-parsing)
+  (ghostel-test-osc133-text-properties)
+
+  ;; Pure Elisp prompt navigation test
+  (ghostel-test-prompt-navigation)
 
   ;; Integration test (spawns a real shell)
   (ghostel-test-shell-integration)

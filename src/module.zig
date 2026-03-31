@@ -142,6 +142,7 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // Scan for OSC sequences that libghostty-vt discards.
     extractAndSetPwd(term, normalized);
     extractOsc52(env, normalized);
+    extractOsc133(env, normalized);
 
     return env.nil();
 }
@@ -213,6 +214,68 @@ fn extractOsc52(env: emacs.Env, data: []const u8) void {
                 );
             }
             pos = data_end;
+        } else {
+            pos += 1;
+        }
+    }
+}
+
+/// Scan data for OSC 133 semantic prompt markers.
+/// OSC 133 format: ESC ] 133 ; <type> [; <param>] (ST | BEL)
+/// type: A = prompt start, B = command start, C = output start, D = command finished
+/// For type D, param is the exit status.
+fn extractOsc133(env: emacs.Env, data: []const u8) void {
+    const prefix = "\x1b]133;";
+    var pos: usize = 0;
+    while (pos + prefix.len < data.len) {
+        if (std.mem.startsWith(u8, data[pos..], prefix)) {
+            const type_pos = pos + prefix.len;
+            if (type_pos >= data.len) break;
+            const marker_type = data[type_pos];
+
+            // Only handle known types
+            if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D') {
+                pos += 1;
+                continue;
+            }
+
+            // Look for optional parameter (;param) and terminator
+            var param_start: usize = type_pos + 1;
+            var param_end: usize = param_start;
+            var has_param = false;
+
+            if (param_start < data.len and data[param_start] == ';') {
+                has_param = true;
+                param_start += 1; // skip the ';'
+                param_end = param_start;
+                while (param_end < data.len) {
+                    if (data[param_end] == 0x07) break; // BEL
+                    if (data[param_end] == 0x1b and param_end + 1 < data.len and data[param_end + 1] == '\\') break; // ST
+                    param_end += 1;
+                }
+            } else {
+                // No param — find terminator directly
+                param_end = param_start;
+                while (param_end < data.len) {
+                    if (data[param_end] == 0x07) break;
+                    if (data[param_end] == 0x1b and param_end + 1 < data.len and data[param_end + 1] == '\\') break;
+                    param_end += 1;
+                }
+            }
+
+            const type_str: [1]u8 = .{marker_type};
+            const param_val = if (has_param and param_end > param_start)
+                env.makeString(data[param_start..param_end])
+            else
+                env.nil();
+
+            _ = env.call2(
+                emacs.sym.@"ghostel--osc133-marker",
+                env.makeString(&type_str),
+                param_val,
+            );
+
+            pos = param_end;
         } else {
             pos += 1;
         }

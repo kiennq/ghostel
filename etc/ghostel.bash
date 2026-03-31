@@ -14,4 +14,49 @@ builtin command stty echo 2>/dev/null
 __ghostel_osc7() {
     printf '\e]7;file://%s%s\e\\' "$HOSTNAME" "$PWD"
 }
-PROMPT_COMMAND="__ghostel_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# --- Semantic prompt markers (OSC 133) ---
+
+# Save exit status before PROMPT_COMMAND overwrites $?.
+__ghostel_save_status() {
+    __ghostel_last_status="$?"
+}
+
+# Emit "command finished" (D) for the previous command, then "prompt start" (A).
+# D is skipped on the very first prompt (no previous command).
+__ghostel_prompt_start() {
+    if [[ -n "$__ghostel_prompt_shown" ]]; then
+        printf '\e]133;D;%s\e\\' "$__ghostel_last_status"
+    fi
+    printf '\e]133;A\e\\'
+}
+
+# Emit "prompt end / command start" (B).
+__ghostel_prompt_end() {
+    printf '\e]133;B\e\\'
+    __ghostel_prompt_shown=1
+}
+
+# Emit "command output start" (C) via the DEBUG trap.
+# Guard: skip when running inside PROMPT_COMMAND itself.
+__ghostel_in_prompt_command=0
+__ghostel_preexec() {
+    [[ "$__ghostel_in_prompt_command" = 1 ]] && return
+    printf '\e]133;C\e\\'
+}
+
+__ghostel_wrapped_prompt_command() {
+    __ghostel_in_prompt_command=1
+    __ghostel_save_status
+    __ghostel_prompt_start
+    __ghostel_osc7
+    eval "${__ghostel_original_prompt_command:-}"
+    __ghostel_prompt_end
+    __ghostel_in_prompt_command=0
+}
+
+# Preserve any existing PROMPT_COMMAND.
+__ghostel_original_prompt_command="${PROMPT_COMMAND:+$PROMPT_COMMAND}"
+PROMPT_COMMAND="__ghostel_wrapped_prompt_command"
+
+trap '__ghostel_preexec' DEBUG
