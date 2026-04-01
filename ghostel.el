@@ -1479,7 +1479,8 @@ PROCESS is the shell process, EVENT describes the state change."
   (let* ((height (max 1 (window-body-height)))
          (width (max 1 (window-max-chars-per-line)))
          (ghostel-dir (file-name-directory
-                       (or load-file-name buffer-file-name
+                       (or (locate-library "ghostel")
+                           load-file-name buffer-file-name
                            default-directory)))
          (shell-type (and ghostel-shell-integration
                           (ghostel--detect-shell ghostel-shell)))
