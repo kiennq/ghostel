@@ -1384,7 +1384,7 @@ Only send the event if the terminal has enabled focus reporting (mode 1004)."
   (let ((focused (frame-focus-state)))
     (dolist (buf (buffer-list))
       (with-current-buffer buf
-        (when (and (eq major-mode 'ghostel-mode)
+        (when (and (derived-mode-p 'ghostel-mode)
                    ghostel--term
                    ghostel--process
                    (process-live-p ghostel--process))
@@ -1669,7 +1669,7 @@ The output is shown in a *ghostel-build* compilation buffer."
   (let* ((bufs (cl-remove-if-not
                 (lambda (b)
                   (with-current-buffer b
-                    (eq major-mode 'ghostel-mode)))
+                    (derived-mode-p 'ghostel-mode)))
                 (buffer-list)))
          (current (current-buffer))
          (others (cl-remove current bufs)))
