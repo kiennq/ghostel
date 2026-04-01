@@ -3,7 +3,7 @@
 ;;; Commentary:
 
 ;; Compare terminal emulator performance: ghostel (incremental & full
-;; redraw), vterm, and eat.
+;; redraw), vterm, eat, and Emacs built-in term.
 ;;
 ;; The primary benchmark spawns a real `cat' process through each
 ;; terminal's PTY and measures wall-clock time — this matches what
@@ -40,6 +40,10 @@
 
 (defvar ghostel-bench-include-eat t
   "When non-nil, include eat in benchmarks.")
+
+(defvar ghostel-bench-include-term t
+  "When non-nil, include Emacs built-in term in benchmarks.
+Always available since term is built into Emacs.")
 
 (defvar ghostel-bench-chunk-size 4096
   "Chunk size for streaming benchmarks.")
@@ -133,7 +137,7 @@ Simulates compiler output or build logs with linkifiable content."
 
 (defun ghostel-bench--encode-for-backend (data backend)
   "Encode DATA for BACKEND.
-Native backends (ghostel, vterm) need unibyte strings.
+Native backends (ghostel, vterm) and term need unibyte strings.
 Eat works with multibyte strings directly."
   (if (eq backend 'eat)
       (if (multibyte-string-p data) data
@@ -201,6 +205,18 @@ for reliable measurement."
     (eat-term-resize term cols rows)
     (eat-term-set-parameter term 'input-function (lambda (_term _str)))
     term))
+
+(defun ghostel-bench--make-term (rows cols)
+  "Set up current buffer for term-mode benchmarking.
+Returns a dummy `cat' process for use with `term-emulate-terminal'.
+The caller must call `delete-process' when done."
+  (term-mode)
+  (setq term-width cols)
+  (setq term-height rows)
+  (setq term-buffer-maximum-size ghostel-bench-scrollback)
+  (let ((proc (start-process "term-bench" (current-buffer) "cat")))
+    (set-process-query-on-exit-flag proc nil)
+    proc))
 
 ;; =========================================================================
 ;; SECTION 1: PTY benchmark — the real-world test
@@ -332,6 +348,31 @@ When NO-DETECT is non-nil, disable URL and file detection."
       (eat-term-redisplay term)
       (eat-term-delete term))))
 
+(defun ghostel-bench--pty-term (data-file)
+  "Benchmark Emacs built-in term processing `cat DATA-FILE' through a pipe.
+Uses `term-emulate-terminal' directly as the process filter, which is
+how real `M-x term' works — no timer batching since term does parse
+and render in a single call."
+  (with-temp-buffer
+    (term-mode)
+    (setq term-width 80 term-height 24)
+    (setq term-buffer-maximum-size ghostel-bench-scrollback)
+    (let* ((inhibit-read-only t)
+           (done nil)
+           (proc (make-process
+                  :name "term-bench"
+                  :buffer (current-buffer)
+                  :command (list "cat" (expand-file-name data-file))
+                  :connection-type 'pipe
+                  :coding 'binary
+                  :noquery t
+                  :filter #'term-emulate-terminal
+                  :sentinel (lambda (_proc _event)
+                              (setq done t)))))
+      (set-process-window-size proc 24 80)
+      (while (not done)
+        (accept-process-output proc 30)))))
+
 (defun ghostel-bench--run-pty-scenarios ()
   "Run real PTY benchmarks — the most representative test."
   (message "\n--- Real-World PTY Benchmark (cat %s through process pipe) ---"
@@ -366,7 +407,12 @@ When NO-DETECT is non-nil, disable URL and file detection."
           (when ghostel-bench-include-eat
             (ghostel-bench--measure
              "pty/plain/eat" ghostel-bench-data-size ghostel-bench-iterations
-             (lambda () (ghostel-bench--pty-eat data-file)))))
+             (lambda () (ghostel-bench--pty-eat data-file))))
+          ;; term
+          (when ghostel-bench-include-term
+            (ghostel-bench--measure
+             "pty/plain/term" ghostel-bench-data-size ghostel-bench-iterations
+             (lambda () (ghostel-bench--pty-term data-file)))))
       (delete-file data-file)))
   ;; --- URL/path-heavy data ---
   (let ((data-file (ghostel-bench--write-data-file
@@ -391,7 +437,12 @@ When NO-DETECT is non-nil, disable URL and file detection."
           (when ghostel-bench-include-eat
             (ghostel-bench--measure
              "pty/urls/eat" ghostel-bench-data-size ghostel-bench-iterations
-             (lambda () (ghostel-bench--pty-eat data-file)))))
+             (lambda () (ghostel-bench--pty-eat data-file))))
+          ;; term (baseline)
+          (when ghostel-bench-include-term
+            (ghostel-bench--measure
+             "pty/urls/term" ghostel-bench-data-size ghostel-bench-iterations
+             (lambda () (ghostel-bench--pty-term data-file)))))
       (delete-file data-file))))
 
 ;; =========================================================================
@@ -497,7 +548,23 @@ terminal engine with periodic redraws, all in a tight loop."
                    (cl-incf chunk-count)
                    (when (zerop (% chunk-count redraw-every))
                      (eat-term-redisplay term)))))))
-          (eat-term-delete term))))))
+          (eat-term-delete term))))
+    ;; term
+    (when ghostel-bench-include-term
+      (with-temp-buffer
+        (let* ((data (ghostel-bench--encode-for-backend raw-data 'term))
+               (data-len (length data))
+               (proc (ghostel-bench--make-term 24 80))
+               (inhibit-read-only t))
+          (ghostel-bench--measure
+           "stream/term" (string-bytes data) ghostel-bench-iterations
+           (lambda ()
+             (let ((offset 0))
+               (while (< offset data-len)
+                 (let ((end (min (+ offset chunk-size) data-len)))
+                   (term-emulate-terminal proc (substring data offset end))
+                   (setq offset end))))))
+          (delete-process proc))))))
 
 ;; =========================================================================
 ;; SECTION 3: TUI frame benchmark (full-screen rewrites)
@@ -569,7 +636,21 @@ content — relevant for apps like htop, vim, claude-code."
                         (eat-term-process-output term frame)
                         (eat-term-redisplay term)))))
                 (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))
-              (eat-term-delete term))))))))
+              (eat-term-delete term))))
+        ;; term
+        (when ghostel-bench-include-term
+          (with-temp-buffer
+            (let* ((frame (ghostel-bench--encode-for-backend raw-frame 'term))
+                   (proc (ghostel-bench--make-term rows cols))
+                   (inhibit-read-only t))
+              (let ((result
+                     (ghostel-bench--measure
+                      (format "tui-frame/term/%s" label)
+                      (string-bytes frame) tui-iterations
+                      (lambda ()
+                        (term-emulate-terminal proc frame)))))
+                (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))
+              (delete-process proc))))))))
 
 ;; =========================================================================
 ;; SECTION 4: Engine micro-benchmarks (bulk parse/render, single call)
@@ -648,7 +729,24 @@ When RENDER-P is non-nil, also call redraw after write-input."
                  (eat-term-process-output term data)
                  (eat-term-redisplay term))
              (lambda () (eat-term-process-output term data))))
-          (eat-term-delete term))))))
+          (eat-term-delete term))))
+    ;; term
+    (when ghostel-bench-include-term
+      (with-temp-buffer
+        (let* ((data (ghostel-bench--encode-for-backend raw-data 'term))
+               (proc (ghostel-bench--make-term rows cols))
+               (inhibit-read-only t)
+               (counter 0))
+          (ghostel-bench--measure
+           (format "%s/term/%s" name label)
+           (string-bytes data) iters
+           (if render-p
+               (lambda ()
+                 (setq counter (1+ counter))
+                 (term-emulate-terminal proc (format "\e[H%d\r\n" counter))
+                 (term-emulate-terminal proc data))
+             (lambda () (term-emulate-terminal proc data))))
+          (delete-process proc))))))
 
 (defun ghostel-bench--run-engine-scenarios ()
   "Run engine micro-benchmarks.
@@ -693,9 +791,10 @@ real-world performance (see PTY and streaming benchmarks for that)."
   (message "  Data size:  %s" (ghostel-bench--human-size ghostel-bench-data-size))
   (message "  Iterations: %d" ghostel-bench-iterations)
   (message "  Scrollback: %d" ghostel-bench-scrollback)
-  (message "  Backends:   ghostel-incr, ghostel-full%s%s"
+  (message "  Backends:   ghostel-incr, ghostel-full%s%s%s"
            (if ghostel-bench-include-vterm ", vterm" "")
-           (if ghostel-bench-include-eat ", eat" ""))
+           (if ghostel-bench-include-eat ", eat" "")
+           (if ghostel-bench-include-term ", term" ""))
   (message ""))
 
 (defun ghostel-bench--print-summary ()
@@ -735,7 +834,13 @@ real-world performance (see PTY and streaming benchmarks for that)."
         (require 'eat)
       (error
        (message "WARNING: eat not available, skipping (%s)" (error-message-string err))
-       (setq ghostel-bench-include-eat nil)))))
+       (setq ghostel-bench-include-eat nil))))
+  (when ghostel-bench-include-term
+    (condition-case err
+        (require 'term)
+      (error
+       (message "WARNING: term not available, skipping (%s)" (error-message-string err))
+       (setq ghostel-bench-include-term nil)))))
 
 (defun ghostel-bench-run-all ()
   "Run all benchmarks and print results."

@@ -198,6 +198,37 @@ individual faces with `M-x customize-face`.
 emacs --batch -Q -L . -l test/ghostel-test.el -f ghostel-test-run
 ```
 
+## Performance
+
+Ghostel includes a benchmark suite comparing throughput against other Emacs
+terminal emulators: [vterm](https://github.com/akermu/emacs-libvterm) (native
+module), [eat](https://codeberg.org/akib/emacs-eat) (pure Elisp), and Emacs
+built-in `term`.
+
+The primary benchmark streams 1 MB of data through a real process pipe,
+matching actual terminal usage.  Results on Apple M4 Max, Emacs 31.0.50:
+
+| Backend              | Plain ASCII | URL-heavy |
+|----------------------|------------:|----------:|
+| ghostel              |    72 MB/s  |  26 MB/s  |
+| ghostel (no detect)  |    74 MB/s  |  74 MB/s  |
+| vterm                |    33 MB/s  |  27 MB/s  |
+| eat                  |   4.4 MB/s  | 3.4 MB/s  |
+| term                 |   5.4 MB/s  | 4.6 MB/s  |
+
+Ghostel scans terminal output for URLs and file paths, making them clickable.
+The "no detect" row shows throughput with this detection disabled
+(`ghostel-enable-url-detection` / `ghostel-enable-file-detection`).  The other
+emulators do not have this feature, so their numbers are comparable to the "no
+detect" row.
+
+Run the benchmarks yourself:
+
+```sh
+bench/run-bench.sh              # full suite
+bench/run-bench.sh --quick      # quick sanity check
+```
+
 ## Architecture
 
 ```

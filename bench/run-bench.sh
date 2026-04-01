@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ghostel-bench — benchmark ghostel vs vterm vs eat (and optionally ghostty)
+# ghostel-bench — benchmark ghostel vs vterm vs eat vs term (and optionally ghostty)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,6 +12,7 @@ SIZE=""
 ITERS=""
 INCLUDE_VTERM="t"
 INCLUDE_EAT="t"
+INCLUDE_TERM="t"
 GHOSTTY=false
 OUTPUT=""
 
@@ -47,6 +48,7 @@ Options:
   --quick          Quick run (100KB data, 3 iterations, single size)
   --no-vterm       Skip vterm benchmarks
   --no-eat         Skip eat benchmarks
+  --no-term        Skip Emacs built-in term benchmarks
   --ghostty        Generate data files for ghostty comparison
   --output FILE    Tee output to FILE
   --size N         Data size in bytes (default: 1048576)
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --quick)      MODE="quick"; shift ;;
         --no-vterm)   INCLUDE_VTERM="nil"; shift ;;
         --no-eat)     INCLUDE_EAT="nil"; shift ;;
+        --no-term)    INCLUDE_TERM="nil"; shift ;;
         --ghostty)    GHOSTTY=true; shift ;;
         --output)     OUTPUT="$2"; shift 2 ;;
         --size)       SIZE="$2"; shift 2 ;;
@@ -124,6 +127,7 @@ EVAL="(progn"
 [ -n "$ITERS" ] && EVAL="$EVAL (setq ghostel-bench-iterations $ITERS)"
 EVAL="$EVAL (setq ghostel-bench-include-vterm $INCLUDE_VTERM)"
 EVAL="$EVAL (setq ghostel-bench-include-eat $INCLUDE_EAT)"
+EVAL="$EVAL (setq ghostel-bench-include-term $INCLUDE_TERM)"
 if [ "$MODE" = "quick" ]; then
     EVAL="$EVAL (ghostel-bench-run-quick))"
 else
