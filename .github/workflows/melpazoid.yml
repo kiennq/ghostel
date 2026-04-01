@@ -21,4 +21,5 @@ jobs:
           LOCAL_REPO: ${{ github.workspace }}
           RECIPE: (ghostel :fetcher github :repo "dakra/ghostel")
           EXIST_OK: false
+          WARN_IS_ERROR: true
         run: make -C ~/melpazoid
