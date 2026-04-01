@@ -136,9 +136,9 @@ echo ""
 CMD="$EMACS --batch -Q $LOAD_PATH -l $SCRIPT_DIR/ghostel-bench.el --eval '$EVAL'"
 
 if [ -n "$OUTPUT" ]; then
-    eval "$CMD" 2>&1 | tee "$OUTPUT"
+    eval "$CMD" 2>&1 | grep -v '^info(' | tee "$OUTPUT"
 else
-    eval "$CMD" 2>&1
+    eval "$CMD" 2>&1 | grep -v '^info('
 fi
 
 # Ghostty comparison
