@@ -492,6 +492,8 @@ const RowContent = struct {
     /// Number of leading characters that are semantic prompt content.
     /// Zero if the row has no prompt cells.
     prompt_char_len: usize,
+    /// True when the row contains at least one wide (2-cell) character.
+    has_wide: bool,
 };
 
 /// Build text content and style runs for the current row in the iterator.
@@ -506,6 +508,7 @@ fn buildRowContent(
     var char_len: usize = 0; // character (codepoint) offset
     var prompt_char_len: usize = 0; // chars that are semantic prompt
     var in_prompt: bool = true; // track contiguous leading prompt cells
+    var has_wide: bool = false;
     run_count.* = 0;
     var current_style: CellStyle = .{};
     var run_start_char: usize = 0;
@@ -558,6 +561,7 @@ fn buildRowContent(
                 _ = gt.c.ghostty_cell_get(raw_cell_wide, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
             }
             if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
+                has_wide = true;
                 continue;
             }
             if (text_len < text_buf.len) {
@@ -596,7 +600,7 @@ fn buildRowContent(
         run_count.* += 1;
     }
 
-    return .{ .byte_len = text_len, .char_len = char_len, .prompt_char_len = prompt_char_len };
+    return .{ .byte_len = text_len, .char_len = char_len, .prompt_char_len = prompt_char_len, .has_wide = has_wide };
 }
 
 /// Insert row text and apply style runs.
@@ -638,6 +642,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     var dirty: c_int = gt.DIRTY_FALSE;
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty));
     var has_hyperlinks: bool = false;
+    var has_wide_chars: bool = false;
 
     if (dirty != gt.DIRTY_FALSE) {
         // Get default colors
@@ -732,6 +737,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
             // Build row content
             var run_count: usize = 0;
             const content = buildRowContent(term, &text_buf, &runs, &run_count);
+            if (content.has_wide) has_wide_chars = true;
 
             // Insert text and apply styles
             const row_start = env.extractInteger(env.point());
@@ -791,7 +797,9 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     // Auto-detect plain-text URLs
     if (dirty != gt.DIRTY_FALSE) {
         _ = env.call0(emacs.sym.@"ghostel--detect-urls");
-        _ = env.call0(emacs.sym.@"ghostel--compensate-wide-chars");
+        if (has_wide_chars) {
+            _ = env.call0(emacs.sym.@"ghostel--compensate-wide-chars");
+        }
     }
 
     // Position cursor

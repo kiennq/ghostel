@@ -1278,7 +1278,8 @@ Skips regions that already have a `help-echo' property (e.g. from OSC 8)."
 Emoji glyphs often render wider than `char-width' times `frame-char-width'
 pixels, making the display engine treat the line as wider than the window
 even though `string-width' equals the terminal column count.  For each
-overflowing line, hide the minimal trailing spaces via `display' properties."
+overflowing line, hide the minimal trailing spaces via `display' properties.
+Only called by the native renderer when wide characters are present."
   (when (and (display-graphic-p)
              (fboundp 'string-pixel-width))
     (let ((char-w (frame-char-width))
@@ -1288,19 +1289,25 @@ overflowing line, hide the minimal trailing spaces via `display' properties."
         (while (not (eobp))
           (let* ((bol (line-beginning-position))
                  (eol (line-end-position))
-                 (line (buffer-substring bol eol))
-                 (pw (string-pixel-width line))
-                 (overshoot (- pw win-w)))
-            (when (> overshoot 0)
-              (let* ((spaces-start (save-excursion
-                                     (goto-char eol)
-                                     (skip-chars-backward " " bol)
-                                     (point)))
-                     (avail (- eol spaces-start))
-                     (hide (min (ceiling (/ (float overshoot) char-w))
-                                avail)))
-                (when (> hide 0)
-                  (put-text-property (- eol hide) eol 'display "")))))
+                 (len (- eol bol)))
+            ;; Only measure pixel width when the line has wide characters.
+            ;; string-width > length means at least one char has char-width > 1.
+            (when (and (> len 0)
+                       (> (string-width (buffer-substring bol eol)) len))
+              (let* ((line (buffer-substring bol eol))
+                     (pw (string-pixel-width line))
+                     (overshoot (- pw win-w)))
+                (when (> overshoot 0)
+                  (let* ((spaces-start (save-excursion
+                                         (goto-char eol)
+                                         (skip-chars-backward " " bol)
+                                         (point)))
+                         (avail (- eol spaces-start))
+                         (hide (min (ceiling (/ (float overshoot) char-w))
+                                    avail)))
+                    (when (> hide 0)
+                      (put-text-property (- eol hide) eol
+                                         'display "")))))))
           (forward-line 1))))))
 
 
