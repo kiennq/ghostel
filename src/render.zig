@@ -549,6 +549,17 @@ fn buildRowContent(
         }
 
         if (graphemes_len == 0) {
+            // Wide-character spacer tails occupy a terminal cell but must
+            // not produce output — the preceding wide cell already accounts
+            // for 2 visual columns in Emacs.
+            var raw_cell_wide: gt.c.GhosttyCell = undefined;
+            var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
+            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell_wide)) == gt.SUCCESS) {
+                _ = gt.c.ghostty_cell_get(raw_cell_wide, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            }
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
+                continue;
+            }
             if (text_len < text_buf.len) {
                 text_buf[text_len] = ' ';
                 text_len += 1;
