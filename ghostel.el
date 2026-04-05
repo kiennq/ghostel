@@ -2,7 +2,7 @@
 
 ;; Copyright (c) 2026 Daniel Kraus <daniel@kraus.my>
 
-;; Author: Daniel Kraus
+;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
 ;; Version: 0.7.0
 ;; Keywords: terminals
@@ -339,9 +339,6 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--set-palette "ghostel-module")
 (declare-function ghostel--set-size "ghostel-module")
 (declare-function ghostel--write-input "ghostel-module")
-(declare-function package-desc-version "package" (pkg-desc))
-(declare-function package-version-join "package" (vlist))
-(declare-function global-hl-line-unhighlight "hl-line")
 
 
 ;;; Automatic download and compilation of native module
@@ -444,7 +441,9 @@ Choice: " url)
   "Return ghostel package version string, or nil.
 Returns nil without error when `package.el' is unavailable."
   (when (and (require 'package nil t)
-             (boundp 'package-alist))
+             (boundp 'package-alist)
+             (fboundp 'package-desc-version)
+             (fboundp 'package-version-join))
     (let ((pkg (car (alist-get 'ghostel package-alist))))
       (when pkg
         (package-version-join (package-desc-version pkg))))))
@@ -1207,7 +1206,7 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (when ghostel--saved-hl-line-mode
       (hl-line-mode 1))
     (setq buffer-read-only t)
-    (setq mode-name "Ghostel:Copy")
+    (setq mode-line-process ":Copy")
     (force-mode-line-update)
     (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit")))
 
@@ -1222,7 +1221,7 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (when ghostel--saved-hl-line-mode
       (hl-line-mode -1))
     (setq buffer-read-only nil)
-    (setq mode-name "Ghostel")
+    (setq mode-line-process nil)
     (force-mode-line-update)
     (when ghostel--term
       (ghostel--scroll-bottom ghostel--term))
@@ -1942,7 +1941,8 @@ and buffer-local `hl-line-mode'."
   (when (bound-and-true-p global-hl-line-mode)
     (setq ghostel--saved-hl-line-mode t)
     (setq-local global-hl-line-mode nil)
-    (global-hl-line-unhighlight))
+    (when (fboundp 'global-hl-line-unhighlight)
+      (global-hl-line-unhighlight)))
   ;; Buffer-local hl-line-mode
   (when (bound-and-true-p hl-line-mode)
     (setq ghostel--saved-hl-line-mode t)
