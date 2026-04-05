@@ -3,16 +3,12 @@
 /// Provides type-safe access to emacs_env functions, cached symbol
 /// interning, and helper methods for common operations.
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const c = @cImport({
-    // Detect musl from Zig's target ABI and tell the wrapper header.
-    // We cannot rely on __GLIBC__ because Zig's translate-c does not
-    // implicitly include glibc's <features.h>.
-    if (builtin.abi == .musl or builtin.abi == .musleabi or builtin.abi == .musleabihf) {
-        @cDefine("GHOSTEL_MUSL", "1");
-    }
-    @cInclude("emacs-module-wrapper.h");
+    // Ensure struct timespec is fully defined on Linux (glibc gates it
+    // behind _POSIX_C_SOURCE).  Harmless on macOS/BSDs.
+    @cDefine("_POSIX_C_SOURCE", "199309L");
+    @cInclude("emacs-module.h");
 });
 
 /// Emacs value type alias for convenience.
