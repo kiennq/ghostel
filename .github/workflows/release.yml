@@ -41,15 +41,14 @@ jobs:
           should_release=true
           latest_tag=$([[ "${{ steps.cur_release.outcome }}" == "failure" ]] && echo "" || echo "${{ steps.cur_release.outputs.release }}")
 
-          if [[ -n "$latest_tag" ]] && git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null; then
-            if git diff --quiet "$latest_tag"...HEAD -- \
-              ghostel.el \
-              build.zig \
-              build.zig.zon \
-              build.sh \
-              include \
-              src \
-              vendor/ghostty
+            if [[ -n "$latest_tag" ]] && git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null; then
+              if git diff --quiet "$latest_tag"...HEAD -- \
+                ghostel.el \
+                build.zig \
+                build.zig.zon \
+                include \
+                src \
+                vendor/ghostty
             then
               should_release=false
             fi
@@ -87,12 +86,15 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
           - os: windows-latest
             platform: x86_64-windows
+            target: x86_64-windows-gnu
             suffix: .dll
           - os: macos-latest
             platform: aarch64-macos
+            target: aarch64-macos
             suffix: .dylib
     runs-on: ${{ matrix.os }}
     env:
@@ -121,7 +123,7 @@ jobs:
             ${{ env.ZIG_GLOBAL_CACHE_DIR }}
             ${{ env.ZIG_LOCAL_CACHE_DIR }}
             vendor/ghostty/.zig-cache
-          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'build.sh', 'src/**', 'include/**', '.github/workflows/release.yml') }}
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'include/**', '.github/workflows/release.yml') }}
           restore-keys: |
             release-${{ runner.os }}-${{ matrix.platform }}-
 
@@ -130,9 +132,62 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Build vendored libghostty-vt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd vendor/ghostty && zig build -Dtarget=${{ matrix.target }} -Demit-lib-vt=true -Doptimize=ReleaseFast)
+
+      - name: Stage static dependency libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.os }}" in
+            windows-latest) static_lib_ext=".lib" ;;
+            *) static_lib_ext=".a" ;;
+          esac
+
+          search_dirs=("vendor/ghostty/.zig-cache")
+          [ -n "${ZIG_LOCAL_CACHE_DIR:-}" ] && search_dirs+=("${ZIG_LOCAL_CACHE_DIR}")
+          [ -n "${ZIG_GLOBAL_CACHE_DIR:-}" ] && search_dirs+=("${ZIG_GLOBAL_CACHE_DIR}")
+
+          find_static_lib() {
+            local base="$1"
+            local dir
+            local matches=()
+            for dir in "${search_dirs[@]}"; do
+              [ -d "$dir" ] || continue
+              while IFS= read -r match; do
+                matches+=("$match")
+              done < <(find "$dir" \( -name "${base}${static_lib_ext}" -o -name "lib${base}.a" \) -print 2>/dev/null)
+            done
+
+            if [ "${#matches[@]}" -eq 0 ]; then
+              return 1
+            fi
+
+            ls -1t -- "${matches[@]}" | head -n 1
+          }
+
+          copy_static_lib() {
+            local source="$1"
+            local dest_base="$2"
+            local dest="vendor/ghostty/zig-out/lib/${dest_base}${static_lib_ext}"
+            cp "$source" "$dest"
+            echo "  ${dest_base}${static_lib_ext} <- $source"
+          }
+
+          simdutf="$(find_static_lib simdutf)"
+          highway="$(find_static_lib highway)"
+          copy_static_lib "$simdutf" "simdutf"
+          copy_static_lib "$highway" "highway"
+
       - name: Build native module
         shell: bash
-        run: ./build.sh
+        run: |
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
       - name: Rename artifact for release
         shell: bash

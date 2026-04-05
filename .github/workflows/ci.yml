@@ -62,12 +62,15 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
           - os: windows-latest
             platform: x86_64-windows
+            target: x86_64-windows-gnu
             suffix: .dll
           - os: macos-latest
             platform: aarch64-macos
+            target: aarch64-macos
             suffix: .dylib
     runs-on: ${{ matrix.os }}
     steps:
@@ -83,62 +86,67 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - uses: purcell/setup-emacs@master
-        with:
-          version: '29.4'
-
-      - name: Find Emacs module header
-        shell: bash
-        run: |
-          set -e
-          EMACS_BIN="$(command -v emacs || true)"
-          HEADER=""
-
-          if [ -n "$EMACS_BIN" ]; then
-            EMACS_BIN_DIR="$(dirname "$EMACS_BIN")"
-            for dir in "$EMACS_BIN_DIR/../include" "$EMACS_BIN_DIR/../share/emacs/include"; do
-              if [ -f "$dir/emacs-module.h" ]; then
-                HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                break
-              fi
-            done
-
-            if [ -z "$HEADER" ] && [ -L "$EMACS_BIN" ]; then
-              REAL_DIR="$(dirname "$(readlink -f "$EMACS_BIN")")"
-              for dir in "$REAL_DIR/../include" "$REAL_DIR/../../include"; do
-                if [ -f "$dir/emacs-module.h" ]; then
-                  HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                  break
-                fi
-              done
-            fi
-          fi
-
-          if [ -z "$HEADER" ]; then
-            for dir in /usr/include /usr/local/include /opt/homebrew/include /c/hostedtoolcache/windows/Emacs; do
-              FOUND="$(find "$dir" -maxdepth 5 -name emacs-module.h -print -quit 2>/dev/null || true)"
-              if [ -n "$FOUND" ]; then
-                HEADER="$FOUND"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$HEADER" ]; then
-            echo "::error::emacs-module.h not found"
-            exit 1
-          fi
-          echo "EMACS_INCLUDE_DIR=$(dirname "$HEADER")" >> "$GITHUB_ENV"
-          echo "Found emacs-module.h at: $HEADER"
-
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
+      - name: Build vendored libghostty-vt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd vendor/ghostty && zig build -Dtarget=${{ matrix.target }} -Demit-lib-vt=true -Doptimize=ReleaseFast)
+
+      - name: Stage static dependency libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.os }}" in
+            windows-latest) static_lib_ext=".lib" ;;
+            *) static_lib_ext=".a" ;;
+          esac
+
+          search_dirs=("vendor/ghostty/.zig-cache")
+          [ -n "${ZIG_LOCAL_CACHE_DIR:-}" ] && search_dirs+=("${ZIG_LOCAL_CACHE_DIR}")
+          [ -n "${ZIG_GLOBAL_CACHE_DIR:-}" ] && search_dirs+=("${ZIG_GLOBAL_CACHE_DIR}")
+
+          find_static_lib() {
+            local base="$1"
+            local dir
+            local matches=()
+            for dir in "${search_dirs[@]}"; do
+              [ -d "$dir" ] || continue
+              while IFS= read -r match; do
+                matches+=("$match")
+              done < <(find "$dir" \( -name "${base}${static_lib_ext}" -o -name "lib${base}.a" \) -print 2>/dev/null)
+            done
+
+            if [ "${#matches[@]}" -eq 0 ]; then
+              return 1
+            fi
+
+            ls -1t -- "${matches[@]}" | head -n 1
+          }
+
+          copy_static_lib() {
+            local source="$1"
+            local dest_base="$2"
+            local dest="vendor/ghostty/zig-out/lib/${dest_base}${static_lib_ext}"
+            cp "$source" "$dest"
+            echo "  ${dest_base}${static_lib_ext} <- $source"
+          }
+
+          simdutf="$(find_static_lib simdutf)"
+          highway="$(find_static_lib highway)"
+          copy_static_lib "$simdutf" "simdutf"
+          copy_static_lib "$highway" "highway"
+
       - name: Build native module
         shell: bash
-        run: ./build.sh
+        run: |
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
