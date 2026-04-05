@@ -368,8 +368,6 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--set-palette "ghostel-module")
 (declare-function ghostel--set-size "ghostel-module")
 (declare-function ghostel--write-input "ghostel-module")
-(declare-function package-desc-version "package" (pkg-desc))
-(declare-function package-version-join "package" (vlist))
 (declare-function global-hl-line-unhighlight "hl-line")
 
 
@@ -442,23 +440,25 @@ Returns nil if the platform is not recognized."
     (when tag
       (format "ghostel-module-%s%s" tag module-file-suffix))))
 
-(defun ghostel--module-download-url ()
-  "Return the download URL for the current platform's pre-built module."
+(defun ghostel--module-download-url (&optional version)
+  "Return the download URL for the current platform's pre-built module.
+When VERSION is nil, use the latest release download URL."
   (let ((asset-name (ghostel--module-asset-name)))
     (when asset-name
-      (let ((version (ghostel--package-version)))
-        (if version
-            (format "%s/download/v%s/%s"
-                    ghostel-github-release-url version asset-name)
-          (format "%s/latest/download/%s"
-                  ghostel-github-release-url asset-name))))))
+      (if version
+          (format "%s/download/v%s/%s"
+                  ghostel-github-release-url version asset-name)
+        (format "%s/latest/download/%s"
+                ghostel-github-release-url asset-name)))))
 
-(defun ghostel--download-module (dir)
+(defun ghostel--download-module (dir &optional version latest-release)
   "Download a pre-built module into DIR.
 Returns non-nil on success."
   (condition-case err
       (let* ((dir (ghostel--effective-module-dir dir))
-             (url (ghostel--module-download-url)))
+             (requested-version (unless latest-release
+                                  (or version ghostel--minimum-module-version)))
+             (url (ghostel--module-download-url requested-version)))
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
@@ -472,6 +472,17 @@ Returns non-nil on success."
     (error
      (message "ghostel: download failed: %s" (error-message-string err))
      nil)))
+
+(defun ghostel--read-module-download-version ()
+  "Prompt for a release tag to download, or nil for the latest release."
+  (let ((version (read-string
+                  (format "Ghostel module version (>= %s, empty for latest): "
+                          ghostel--minimum-module-version))))
+    (unless (string= version "")
+      (when (version< version ghostel--minimum-module-version)
+        (user-error "Version %s is older than minimum supported version %s"
+                    version ghostel--minimum-module-version))
+      version)))
 
 (defun ghostel--compile-module (dir)
   "Compile the native module from source in DIR.
@@ -515,7 +526,8 @@ Behavior is controlled by `ghostel-module-auto-install'."
 (defun ghostel--ask-install-action (_dir)
   "Prompt the user to choose how to install the missing native module.
 Returns \\='download, \\='compile, or nil."
-  (let* ((url (or (ghostel--module-download-url) "GitHub releases"))
+  (let* ((url (or (ghostel--module-download-url ghostel--minimum-module-version)
+                  "GitHub releases"))
          (choice (read-char-choice
                   (format "Ghostel native module not found.
 
@@ -530,15 +542,6 @@ Choice: " url)
       (?d 'download)
       (?c 'compile)
       (?s nil))))
-
-(defun ghostel--package-version ()
-  "Return ghostel package version string, or nil.
-Returns nil without error when `package.el' is unavailable."
-  (when (and (require 'package nil t)
-             (boundp 'package-alist))
-    (let ((pkg (car (alist-get 'ghostel package-alist))))
-      (when pkg
-        (package-version-join (package-desc-version pkg))))))
 
 (defun ghostel--download-file (url dest)
   "Download URL to DEST.  Return non-nil on success."
@@ -563,15 +566,20 @@ Returns nil without error when `package.el' is unavailable."
                 (kill-buffer buf))))))
     (error nil)))
 
-(defun ghostel-download-module ()
-  "Interactively download the pre-built native module for this platform."
-  (interactive)
+(defun ghostel-download-module (&optional prompt-for-version)
+  "Interactively download the pre-built native module for this platform.
+With PROMPT-FOR-VERSION, prompt for a release version to download.
+Leaving the prompt empty downloads the latest release."
+  (interactive "P")
   (let* ((dir (ghostel--effective-module-dir))
-         (mod (ghostel--module-file-path dir)))
+         (mod (ghostel--module-file-path dir))
+         (version (when prompt-for-version
+                    (ghostel--read-module-download-version)))
+         (latest-release (and prompt-for-version (null version))))
     (when (and (file-exists-p mod)
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
-    (if (ghostel--download-module dir)
+    (if (ghostel--download-module dir version latest-release)
         (progn
           (module-load mod)
           (message "ghostel: module loaded successfully"))
@@ -583,23 +591,6 @@ Build output is written to the *ghostel-build* buffer."
   (interactive)
   (unless (ghostel--compile-module (ghostel--package-dir))
     (user-error "Ghostel module compilation failed")))
-
-(defun ghostel--elisp-version ()
-  "Return the ghostel Elisp version from the package header."
-  (or (ghostel--package-version)
-      ;; Fall back to parsing the header from the source file.
-      (let ((file (or load-file-name
-                      (locate-library "ghostel")
-                      buffer-file-name)))
-        (when file
-          ;; Ensure we read the .el source, not a .elc byte-compiled file.
-          (when (string-suffix-p ".elc" file)
-            (setq file (substring file 0 -1)))
-          (when (file-exists-p file)
-            (with-temp-buffer
-              (insert-file-contents file nil 0 512)
-              (when (re-search-forward "^;; Version: \\([0-9.]+\\)" nil t)
-                (match-string 1))))))))
 
 (defun ghostel--check-module-version (dir)
   "Check if the loaded module is older than required.
