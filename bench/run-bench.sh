@@ -91,7 +91,7 @@ for ext in dylib so; do
     fi
 done
 if [ -z "$MODULE" ]; then
-    echo "ERROR: ghostel native module not found. Run ./build.sh first."
+    echo "ERROR: ghostel native module not found. Run zig build -Doptimize=ReleaseFast first."
     exit 1
 fi
 echo "ghostel module: $MODULE"

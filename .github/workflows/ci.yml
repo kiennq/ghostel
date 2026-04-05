@@ -91,57 +91,6 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build vendored libghostty-vt
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd vendor/ghostty && zig build -Dtarget=${{ matrix.target }} -Demit-lib-vt=true -Doptimize=ReleaseFast)
-
-      - name: Stage static dependency libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          case "${{ matrix.os }}" in
-            windows-latest) static_lib_ext=".lib" ;;
-            *) static_lib_ext=".a" ;;
-          esac
-
-          search_dirs=("vendor/ghostty/.zig-cache")
-          [ -n "${ZIG_LOCAL_CACHE_DIR:-}" ] && search_dirs+=("${ZIG_LOCAL_CACHE_DIR}")
-          [ -n "${ZIG_GLOBAL_CACHE_DIR:-}" ] && search_dirs+=("${ZIG_GLOBAL_CACHE_DIR}")
-
-          find_static_lib() {
-            local base="$1"
-            local dir
-            local matches=()
-            for dir in "${search_dirs[@]}"; do
-              [ -d "$dir" ] || continue
-              while IFS= read -r match; do
-                matches+=("$match")
-              done < <(find "$dir" \( -name "${base}${static_lib_ext}" -o -name "lib${base}.a" \) -print 2>/dev/null)
-            done
-
-            if [ "${#matches[@]}" -eq 0 ]; then
-              return 1
-            fi
-
-            ls -1t -- "${matches[@]}" | head -n 1
-          }
-
-          copy_static_lib() {
-            local source="$1"
-            local dest_base="$2"
-            local dest="vendor/ghostty/zig-out/lib/${dest_base}${static_lib_ext}"
-            cp "$source" "$dest"
-            echo "  ${dest_base}${static_lib_ext} <- $source"
-          }
-
-          simdutf="$(find_static_lib simdutf)"
-          highway="$(find_static_lib highway)"
-          copy_static_lib "$simdutf" "simdutf"
-          copy_static_lib "$highway" "highway"
-
       - name: Build native module
         shell: bash
         run: |
