@@ -9,6 +9,7 @@ const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
 const render = @import("render.zig");
 const input = @import("input.zig");
+const Conpty = @import("conpty.zig");
 
 const c = emacs.c;
 
@@ -47,6 +48,12 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
     env.bindFunction("ghostel--module-version", 0, 0, &fnModuleVersion, "Return the native module version string.\n\n(ghostel--module-version)");
+    env.bindFunction("ghostel--conpty-init", 7, 7, &fnConptyInit, "Start a Windows ConPTY backend.\n\n(ghostel--conpty-init TERM PROCESS COMMAND ROWS COLS CWD ENV)");
+    env.bindFunction("ghostel--conpty-read-pending", 1, 1, &fnConptyReadPending, "Read pending Windows ConPTY output.\n\n(ghostel--conpty-read-pending TERM)");
+    env.bindFunction("ghostel--conpty-write", 2, 2, &fnConptyWrite, "Write raw bytes to the Windows ConPTY backend.\n\n(ghostel--conpty-write TERM DATA)");
+    env.bindFunction("ghostel--conpty-resize", 3, 3, &fnConptyResize, "Resize the Windows ConPTY backend.\n\n(ghostel--conpty-resize TERM ROWS COLS)");
+    env.bindFunction("ghostel--conpty-is-alive", 1, 1, &fnConptyIsAlive, "Return t if the Windows ConPTY child is alive.\n\n(ghostel--conpty-is-alive TERM)");
+    env.bindFunction("ghostel--conpty-kill", 1, 1, &fnConptyKill, "Terminate the Windows ConPTY child.\n\n(ghostel--conpty-kill TERM)");
 
     emacs.initSymbols(env);
     env.provide("ghostel-module");
@@ -117,14 +124,14 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         return env.nil();
     };
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     // Extract string data — try stack buffer first, fall back to alloc
     var stack_buf: [65536]u8 = undefined;
-    var heap_buf: ?[]const u8 = null;
-    defer if (heap_buf) |hb| std.heap.c_allocator.free(hb);
-
     const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
-        break :blk heap_buf;
+        break :blk env.extractStringAlloc(args[1], allocator);
     };
 
     if (data == null) {
@@ -139,46 +146,11 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // without \r.  Insert \r before every bare \n.
     // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
     const raw = data.?;
-
-    // Count bare \n to determine output size.
-    var extra_cr: usize = 0;
-    for (0..raw.len) |i| {
-        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-            extra_cr += 1;
-        }
-    }
-
-    if (extra_cr == 0) {
-        // No normalization needed — feed raw data directly.
-        term.vtWrite(raw);
-    } else {
-        // Need to insert \r before bare \n.
-        const out_len = raw.len + extra_cr;
-        var norm_stack: [131072]u8 = undefined;
-        var norm_heap: ?[]u8 = null;
-        defer if (norm_heap) |nh| std.heap.c_allocator.free(nh);
-
-        const norm_buf: []u8 = if (out_len <= norm_stack.len)
-            &norm_stack
-        else blk: {
-            norm_heap = std.heap.c_allocator.alloc(u8, out_len) catch {
-                // Fall back to stack buffer, truncating if needed.
-                break :blk &norm_stack;
-            };
-            break :blk norm_heap.?;
-        };
-
-        var npos: usize = 0;
-        for (0..raw.len) |i| {
-            if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-                norm_buf[npos] = '\r';
-                npos += 1;
-            }
-            norm_buf[npos] = raw[i];
-            npos += 1;
-        }
-        term.vtWrite(norm_buf[0..npos]);
-    }
+    const normalized = normalizeBareLfAlloc(allocator, raw) catch {
+        env.signalError("ghostel: failed to normalize terminal input");
+        return env.nil();
+    };
+    term.vtWrite(normalized);
 
     // Scan for OSC sequences that libghostty-vt discards.
     extractAndSetPwd(term, raw);
@@ -336,6 +308,104 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
     return env.nil();
 }
 
+fn fnConptyInit(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse {
+        env.signalError("ghostel: invalid terminal handle");
+        return env.nil();
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var command_stack: [512]u8 = undefined;
+    var cwd_stack: [512]u8 = undefined;
+    const command = env.extractString(args[2], &command_stack) orelse blk: {
+        break :blk env.extractStringAlloc(args[2], allocator);
+    };
+    const cwd = env.extractString(args[5], &cwd_stack) orelse blk: {
+        break :blk env.extractStringAlloc(args[5], allocator);
+    };
+
+    if (command == null or cwd == null) {
+        env.signalError("ghostel: invalid ConPTY arguments");
+        return env.nil();
+    }
+
+    Conpty.deinit(term.conpty);
+    term.conpty = null;
+    term.conpty = Conpty.init(
+        env,
+        args[1],
+        command.?,
+        @intCast(env.extractInteger(args[3])),
+        @intCast(env.extractInteger(args[4])),
+        cwd.?,
+        args[6],
+        allocator,
+    ) catch {
+        env.signalError("ghostel: failed to initialize Windows ConPTY backend");
+        return env.nil();
+    };
+
+    return env.t();
+}
+
+fn fnConptyReadPending(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return Conpty.readPending(env, state);
+}
+
+fn fnConptyWrite(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var stack_buf: [65536]u8 = undefined;
+    const data = env.extractString(args[1], &stack_buf) orelse blk: {
+        break :blk env.extractStringAlloc(args[1], allocator);
+    };
+    if (data == null) return env.nil();
+
+    Conpty.write(state, data.?) catch {
+        env.signalError("ghostel: failed to write to Windows ConPTY backend");
+        return env.nil();
+    };
+    return env.t();
+}
+
+fn fnConptyResize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return if (Conpty.resize(
+        state,
+        @intCast(env.extractInteger(args[1])),
+        @intCast(env.extractInteger(args[2])),
+    )) env.t() else env.nil();
+}
+
+fn fnConptyIsAlive(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return if (Conpty.isAlive(state)) env.t() else env.nil();
+}
+
+fn fnConptyKill(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return if (Conpty.kill(state)) env.t() else env.nil();
+}
+
 /// (ghostel--get-title TERM)
 fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
@@ -365,7 +435,9 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const force_full = nargs > 1 and env.isNotNil(args[1]);
-    render.redraw(env, term, force_full);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    render.redraw(env, term, force_full, arena.allocator());
     return env.nil();
 }
 
@@ -705,7 +777,10 @@ fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*a
                 var gl: u32 = 0;
                 if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&gl)) != gt.SUCCESS) continue;
                 if (gl == 0) {
-                    if (pos < buf.len) { buf[pos] = ' '; pos += 1; }
+                    if (pos < buf.len) {
+                        buf[pos] = ' ';
+                        pos += 1;
+                    }
                     continue;
                 }
                 var cp: [4]u32 = undefined;
@@ -778,4 +853,44 @@ fn titleChangedCallback(_: gt.Terminal, userdata: ?*anyopaque) callconv(.c) void
     if (term.getTitle()) |title| {
         _ = env.call1(emacs.sym.@"ghostel--set-title", env.makeString(title));
     }
+}
+
+fn normalizeBareLfAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var extra_cr: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            extra_cr += 1;
+        }
+    }
+    if (extra_cr == 0) return raw;
+
+    const normalized = try allocator.alloc(u8, raw.len + extra_cr);
+    var pos: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            normalized[pos] = '\r';
+            pos += 1;
+        }
+        normalized[pos] = raw[i];
+        pos += 1;
+    }
+    return normalized[0..pos];
+}
+
+test "normalizeBareLfAlloc inserts carriage returns before bare line feeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const normalized = try normalizeBareLfAlloc(arena.allocator(), "alpha\nbeta\r\ngamma\n");
+    try std.testing.expectEqualStrings("alpha\r\nbeta\r\ngamma\r\n", normalized);
+}
+
+test "normalizeBareLfAlloc reuses the original slice when no normalization is needed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw = "alpha\r\nbeta";
+    const normalized = try normalizeBareLfAlloc(arena.allocator(), raw);
+    try std.testing.expectEqualStrings(raw, normalized);
+    try std.testing.expectEqual(@intFromPtr(raw.ptr), @intFromPtr(normalized.ptr));
 }
