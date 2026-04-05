@@ -7,14 +7,17 @@ on:
 
 jobs:
   byte-compile:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        emacs_version:
-          - '28.2'
-          - '29.4'
-          - 'snapshot'
+        include:
+          - os: ubuntu-latest
+            emacs_version: '27.2'
+          - os: ubuntu-latest
+            emacs_version: '29.4'
+          - os: ubuntu-latest
+            emacs_version: 'snapshot'
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: purcell/setup-emacs@master
@@ -34,7 +37,7 @@ jobs:
       fail-fast: false
       matrix:
         emacs_version:
-          - '28.2'
+          - '27.2'
           - '29.4'
           - 'snapshot'
     steps:
@@ -57,18 +60,16 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
+          - os: windows-latest
+            platform: x86_64-windows
+            target: x86_64-windows-gnu
+            suffix: .dll
           - os: macos-latest
             platform: aarch64-macos
+            target: aarch64-macos
             suffix: .dylib
-          - os: macos-latest
-            platform: x86_64-macos
-            suffix: .dylib
-            target: x86_64-macos
-          - os: ubuntu-latest
-            platform: aarch64-linux
-            suffix: .so
-            target: aarch64-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -77,57 +78,11 @@ jobs:
           persist-credentials: true
 
       - name: Rewrite SSH to HTTPS for submodules
+        shell: bash
         run: |
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule sync --recursive
           git submodule update --init --recursive
-
-      - uses: purcell/setup-emacs@master
-        with:
-          version: '29.4'
-
-      - name: Find Emacs module header
-        run: |
-          set -e
-          EMACS_BIN="$(command -v emacs || true)"
-          HEADER=""
-
-          if [ -n "$EMACS_BIN" ]; then
-            EMACS_BIN_DIR="$(dirname "$EMACS_BIN")"
-            for dir in "$EMACS_BIN_DIR/../include" "$EMACS_BIN_DIR/../share/emacs/include"; do
-              if [ -f "$dir/emacs-module.h" ]; then
-                HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                break
-              fi
-            done
-
-            if [ -z "$HEADER" ] && [ -L "$EMACS_BIN" ]; then
-              REAL_DIR="$(dirname "$(readlink -f "$EMACS_BIN")")"
-              for dir in "$REAL_DIR/../include" "$REAL_DIR/../../include"; do
-                if [ -f "$dir/emacs-module.h" ]; then
-                  HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                  break
-                fi
-              done
-            fi
-          fi
-
-          if [ -z "$HEADER" ]; then
-            for dir in /usr/include /usr/local/include /opt/homebrew/include; do
-              FOUND="$(find "$dir" -maxdepth 5 -name emacs-module.h -print -quit 2>/dev/null || true)"
-              if [ -n "$FOUND" ]; then
-                HEADER="$FOUND"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$HEADER" ]; then
-            echo "::error::emacs-module.h not found"
-            exit 1
-          fi
-          echo "EMACS_INCLUDE_DIR=$(dirname "$HEADER")" >> "$GITHUB_ENV"
-          echo "Found emacs-module.h at: $HEADER"
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -135,15 +90,28 @@ jobs:
           version: 0.15.2
 
       - name: Build native module
+        shell: bash
         run: |
-          if [ -n "${{ matrix.target }}" ]; then
-            ./build.sh -t "${{ matrix.target }}"
-          else
-            ./build.sh
-          fi
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
-      - name: Upload module artifact
+      - name: Upload Windows module artifact
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module${{ matrix.suffix }}
+          path: |
+            zig-out/bin/dyn-loader-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/conpty-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module.json
+
+      - name: Upload module artifact
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostel-module-${{ matrix.platform }}
+          path: |
+            zig-out/bin/dyn-loader-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module.json

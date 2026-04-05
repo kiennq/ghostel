@@ -2,7 +2,7 @@
 
 ;; Copyright (c) 2026 Daniel Kraus <daniel@kraus.my>
 
-;; Author: Daniel Kraus <daniel@kraus.my>
+;; Author: Daniel Kraus
 ;; URL: https://github.com/dakra/ghostel
 ;; Version: 0.2.50
 ;; SPDX-License-Identifier: GPL-3.0-or-later
