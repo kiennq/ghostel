@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "27.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -317,7 +317,7 @@ These keys pass through to Emacs instead."
   "https://github.com/dakra/ghostel/releases"
   "Base URL for ghostel GitHub releases.")
 
-(defconst ghostel--minimum-module-version "0.6.0"
+(defconst ghostel--minimum-module-version "0.7.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
