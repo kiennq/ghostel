@@ -124,14 +124,14 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         return env.nil();
     };
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     // Extract string data — try stack buffer first, fall back to alloc
     var stack_buf: [65536]u8 = undefined;
-    var heap_buf: ?[]const u8 = null;
-    defer if (heap_buf) |hb| std.heap.c_allocator.free(hb);
-
     const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
-        break :blk heap_buf;
+        break :blk env.extractStringAlloc(args[1], allocator);
     };
 
     if (data == null) {
@@ -146,46 +146,11 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // without \r.  Insert \r before every bare \n.
     // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
     const raw = data.?;
-
-    // Count bare \n to determine output size.
-    var extra_cr: usize = 0;
-    for (0..raw.len) |i| {
-        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-            extra_cr += 1;
-        }
-    }
-
-    if (extra_cr == 0) {
-        // No normalization needed — feed raw data directly.
-        term.vtWrite(raw);
-    } else {
-        // Need to insert \r before bare \n.
-        const out_len = raw.len + extra_cr;
-        var norm_stack: [131072]u8 = undefined;
-        var norm_heap: ?[]u8 = null;
-        defer if (norm_heap) |nh| std.heap.c_allocator.free(nh);
-
-        const norm_buf: []u8 = if (out_len <= norm_stack.len)
-            &norm_stack
-        else blk: {
-            norm_heap = std.heap.c_allocator.alloc(u8, out_len) catch {
-                // Fall back to stack buffer, truncating if needed.
-                break :blk &norm_stack;
-            };
-            break :blk norm_heap.?;
-        };
-
-        var npos: usize = 0;
-        for (0..raw.len) |i| {
-            if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-                norm_buf[npos] = '\r';
-                npos += 1;
-            }
-            norm_buf[npos] = raw[i];
-            npos += 1;
-        }
-        term.vtWrite(norm_buf[0..npos]);
-    }
+    const normalized = normalizeBareLfAlloc(allocator, raw) catch {
+        env.signalError("ghostel: failed to normalize terminal input");
+        return env.nil();
+    };
+    term.vtWrite(normalized);
 
     // Scan for OSC sequences that libghostty-vt discards.
     extractAndSetPwd(term, raw);
@@ -350,20 +315,17 @@ fn fnConptyInit(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         return env.nil();
     };
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var command_stack: [512]u8 = undefined;
     var cwd_stack: [512]u8 = undefined;
-    var command_heap: ?[]const u8 = null;
-    var cwd_heap: ?[]const u8 = null;
-    defer if (command_heap) |buf| std.heap.c_allocator.free(buf);
-    defer if (cwd_heap) |buf| std.heap.c_allocator.free(buf);
-
     const command = env.extractString(args[2], &command_stack) orelse blk: {
-        command_heap = env.extractStringAlloc(args[2], std.heap.c_allocator);
-        break :blk command_heap;
+        break :blk env.extractStringAlloc(args[2], allocator);
     };
     const cwd = env.extractString(args[5], &cwd_stack) orelse blk: {
-        cwd_heap = env.extractStringAlloc(args[5], std.heap.c_allocator);
-        break :blk cwd_heap;
+        break :blk env.extractStringAlloc(args[5], allocator);
     };
 
     if (command == null or cwd == null) {
@@ -381,6 +343,7 @@ fn fnConptyInit(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         @intCast(env.extractInteger(args[4])),
         cwd.?,
         args[6],
+        allocator,
     ) catch {
         env.signalError("ghostel: failed to initialize Windows ConPTY backend");
         return env.nil();
@@ -401,13 +364,13 @@ fn fnConptyWrite(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const state = term.conpty orelse return env.nil();
 
-    var stack_buf: [65536]u8 = undefined;
-    var heap_buf: ?[]const u8 = null;
-    defer if (heap_buf) |buf| std.heap.c_allocator.free(buf);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
+    var stack_buf: [65536]u8 = undefined;
     const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
-        break :blk heap_buf;
+        break :blk env.extractStringAlloc(args[1], allocator);
     };
     if (data == null) return env.nil();
 
@@ -472,7 +435,9 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const force_full = nargs > 1 and env.isNotNil(args[1]);
-    render.redraw(env, term, force_full);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    render.redraw(env, term, force_full, arena.allocator());
     return env.nil();
 }
 
@@ -888,4 +853,44 @@ fn titleChangedCallback(_: gt.Terminal, userdata: ?*anyopaque) callconv(.c) void
     if (term.getTitle()) |title| {
         _ = env.call1(emacs.sym.@"ghostel--set-title", env.makeString(title));
     }
+}
+
+fn normalizeBareLfAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var extra_cr: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            extra_cr += 1;
+        }
+    }
+    if (extra_cr == 0) return raw;
+
+    const normalized = try allocator.alloc(u8, raw.len + extra_cr);
+    var pos: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            normalized[pos] = '\r';
+            pos += 1;
+        }
+        normalized[pos] = raw[i];
+        pos += 1;
+    }
+    return normalized[0..pos];
+}
+
+test "normalizeBareLfAlloc inserts carriage returns before bare line feeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const normalized = try normalizeBareLfAlloc(arena.allocator(), "alpha\nbeta\r\ngamma\n");
+    try std.testing.expectEqualStrings("alpha\r\nbeta\r\ngamma\r\n", normalized);
+}
+
+test "normalizeBareLfAlloc reuses the original slice when no normalization is needed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw = "alpha\r\nbeta";
+    const normalized = try normalizeBareLfAlloc(arena.allocator(), raw);
+    try std.testing.expectEqualStrings(raw, normalized);
+    try std.testing.expectEqual(@intFromPtr(raw.ptr), @intFromPtr(normalized.ptr));
 }
