@@ -17,8 +17,6 @@ jobs:
             emacs_version: '29.4'
           - os: ubuntu-latest
             emacs_version: 'snapshot'
-          - os: windows-latest
-            emacs_version: '29.4'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -62,12 +60,15 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
           - os: windows-latest
             platform: x86_64-windows
+            target: x86_64-windows-gnu
             suffix: .dll
           - os: macos-latest
             platform: aarch64-macos
+            target: aarch64-macos
             suffix: .dylib
     runs-on: ${{ matrix.os }}
     steps:
@@ -83,54 +84,6 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - uses: purcell/setup-emacs@master
-        with:
-          version: '29.4'
-
-      - name: Find Emacs module header
-        shell: bash
-        run: |
-          set -e
-          EMACS_BIN="$(command -v emacs || true)"
-          HEADER=""
-
-          if [ -n "$EMACS_BIN" ]; then
-            EMACS_BIN_DIR="$(dirname "$EMACS_BIN")"
-            for dir in "$EMACS_BIN_DIR/../include" "$EMACS_BIN_DIR/../share/emacs/include"; do
-              if [ -f "$dir/emacs-module.h" ]; then
-                HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                break
-              fi
-            done
-
-            if [ -z "$HEADER" ] && [ -L "$EMACS_BIN" ]; then
-              REAL_DIR="$(dirname "$(readlink -f "$EMACS_BIN")")"
-              for dir in "$REAL_DIR/../include" "$REAL_DIR/../../include"; do
-                if [ -f "$dir/emacs-module.h" ]; then
-                  HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                  break
-                fi
-              done
-            fi
-          fi
-
-          if [ -z "$HEADER" ]; then
-            for dir in /usr/include /usr/local/include /opt/homebrew/include /c/hostedtoolcache/windows/Emacs; do
-              FOUND="$(find "$dir" -maxdepth 5 -name emacs-module.h -print -quit 2>/dev/null || true)"
-              if [ -n "$FOUND" ]; then
-                HEADER="$FOUND"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$HEADER" ]; then
-            echo "::error::emacs-module.h not found"
-            exit 1
-          fi
-          echo "EMACS_INCLUDE_DIR=$(dirname "$HEADER")" >> "$GITHUB_ENV"
-          echo "Found emacs-module.h at: $HEADER"
-
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -138,7 +91,9 @@ jobs:
 
       - name: Build native module
         shell: bash
-        run: ./build.sh
+        run: |
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
       - name: Upload Windows module artifact
         if: matrix.os == 'windows-latest'
