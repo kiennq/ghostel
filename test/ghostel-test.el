@@ -1233,6 +1233,49 @@ cell, so the visual line width must equal the terminal column count."
     (should (equal "ghostel-module-x86_64-windows.dll"
                    (ghostel--module-asset-name)))))
 
+(ert-deftest ghostel-test-compile-module-invokes-zig-build ()
+  "Source compilation runs zig build directly."
+  (let ((default-directory nil)
+        (messages nil)
+        (warnings nil)
+        (process-invocation nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) messages)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args)
+                   (push args warnings)))
+                ((symbol-function 'process-file)
+                 (lambda (program infile buffer display &rest args)
+                   (setq process-invocation
+                         (list program infile buffer display args default-directory))
+                   0)))
+        (should (ghostel--compile-module "C:/ghostel/"))
+        (should (equal
+                 '("zig" nil "*ghostel-build*" nil ("build" "-Doptimize=ReleaseFast") "C:/ghostel/")
+                 process-invocation))
+        (should-not warnings)))))
+
+(ert-deftest ghostel-test-module-compile-command-uses-zig-build ()
+  "Interactive compilation uses zig build directly."
+  (let ((compile-invocation nil)
+        (default-directory nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'locate-library)
+                 (lambda (_) "C:/ghostel/ghostel.el"))
+                ((symbol-function 'compile)
+                 (lambda (command &optional comint)
+                   (setq compile-invocation (list command comint default-directory)))))
+        (ghostel-module-compile)
+        (should (equal "zig build -Doptimize=ReleaseFast"
+                       (nth 0 compile-invocation)))
+        (should (eq t (nth 1 compile-invocation)))
+        (should (equal (downcase "C:/ghostel/")
+                       (downcase (nth 2 compile-invocation))))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: cursor follow toggle
 ;; -----------------------------------------------------------------------
@@ -1536,11 +1579,13 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
     ghostel-test-elisp-version
-    ghostel-test-module-platform-tag-windows
-    ghostel-test-module-asset-name-windows
-    ghostel-test-module-version-match
-    ghostel-test-module-version-mismatch
-    ghostel-test-module-version-newer-than-minimum
+     ghostel-test-module-platform-tag-windows
+     ghostel-test-module-asset-name-windows
+     ghostel-test-compile-module-invokes-zig-build
+     ghostel-test-module-compile-command-uses-zig-build
+     ghostel-test-module-version-match
+     ghostel-test-module-version-mismatch
+     ghostel-test-module-version-newer-than-minimum
     ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output

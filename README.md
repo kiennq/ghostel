@@ -67,7 +67,7 @@ pre-built binary** or **compile from source** (controlled by
 manually:
 
 - `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
-- `M-x ghostel-module-compile` — build from source via `build.sh` (use a Bash shell on Windows)
+- `M-x ghostel-module-compile` — build from source via `zig build`
 
 ## Building from source
 
@@ -92,14 +92,14 @@ cd ghostel
 # export EMACS_SOURCE_DIR=/path/to/emacs
 
 # Build everything (libghostty-vt + ghostel module)
-./build.sh
+zig build -Doptimize=ReleaseFast
 ```
 
 If you already have the repo, initialize the submodule and build:
 
 ```sh
 git submodule update --init vendor/ghostty
-./build.sh
+zig build -Doptimize=ReleaseFast
 ```
 
 ## Shell Integration

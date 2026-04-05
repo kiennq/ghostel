@@ -23,6 +23,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target_os = target.result.os.tag;
     const emacs_include = resolveEmacsIncludePath(b);
+    const ghostty_dep = b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"emit-lib-vt" = true,
+    }) orelse std.debug.panic(
+        "ghostty dependency unavailable; initialize the vendor/ghostty submodule",
+        .{},
+    );
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/module.zig"),
@@ -31,16 +39,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addModuleIncludes(b, mod, emacs_include);
+    mod.linkLibrary(ghostty_dep.artifact("ghostty-vt-static"));
 
     const lib = b.addLibrary(.{
         .name = "ghostel-module",
         .linkage = .dynamic,
         .root_module = mod,
     });
-    addGhosttyLibraries(b, lib);
-    if (target.result.abi != .msvc) {
-        lib.linkLibCpp();
-    }
     if (target_os == .windows) {
         addWindowsRuntimeLibraries(b, lib, target.result);
     }
@@ -77,7 +82,6 @@ fn addModuleIncludes(
 ) void {
     mod.addSystemIncludePath(emacs_include);
     mod.addIncludePath(b.path("vendor/ghostty/include"));
-    mod.addIncludePath(b.path("vendor/ghostty/zig-out/include"));
 }
 
 fn resolveEmacsIncludePath(b: *std.Build) std.Build.LazyPath {
@@ -187,22 +191,6 @@ fn pathExistsAbsolute(path: []const u8) bool {
     return true;
 }
 
-fn addGhosttyLibraries(b: *std.Build, step: *std.Build.Step.Compile) void {
-    addFirstExistingObjectFile(b, step, &.{
-        "vendor/ghostty/zig-out/lib/ghostty-vt-static.lib",
-        "vendor/ghostty/zig-out/lib/ghostty-vt.lib",
-        "vendor/ghostty/zig-out/lib/libghostty-vt.a",
-    });
-    addFirstExistingObjectFile(b, step, &.{
-        "vendor/ghostty/zig-out/lib/simdutf.lib",
-        "vendor/ghostty/zig-out/lib/libsimdutf.a",
-    });
-    addFirstExistingObjectFile(b, step, &.{
-        "vendor/ghostty/zig-out/lib/highway.lib",
-        "vendor/ghostty/zig-out/lib/libhighway.a",
-    });
-}
-
 fn addWindowsRuntimeLibraries(
     b: *std.Build,
     lib: *std.Build.Step.Compile,
@@ -237,24 +225,6 @@ fn addWindowsRuntimeLibraries(
 
     lib.linkSystemLibrary("libucrt");
 }
-
-fn addFirstExistingObjectFile(
-    b: *std.Build,
-    step: *std.Build.Step.Compile,
-    candidates: []const []const u8,
-) void {
-    const path = firstExistingPath(candidates) orelse candidates[0];
-    step.addObjectFile(b.path(path));
-}
-
-fn firstExistingPath(candidates: []const []const u8) ?[]const u8 {
-    for (candidates) |candidate| {
-        std.fs.cwd().access(candidate, .{}) catch continue;
-        return candidate;
-    }
-    return null;
-}
-
 test "emacs include resolution prefers include dir override" {
     const source = resolveEmacsIncludeSource("C:/headers", "Q:/repos/emacs-build/git/master");
     try std.testing.expect(source == .include_dir);
