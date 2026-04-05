@@ -32,8 +32,6 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--new", 2, 3, &fnNew, "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK)");
     env.bindFunction("ghostel--write-input", 2, 2, &fnWriteInput, "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)");
     env.bindFunction("ghostel--set-size", 3, 3, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)");
-    env.bindFunction("ghostel--get-title", 1, 1, &fnGetTitle, "Get the terminal title.\n\n(ghostel--get-title TERM)");
-    env.bindFunction("ghostel--get-pwd", 1, 1, &fnGetPwd, "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)");
     env.bindFunction("ghostel--redraw", 1, 2, &fnRedraw, "Redraw the terminal into the current buffer.\n\n(ghostel--redraw TERM &optional FULL)");
     env.bindFunction("ghostel--scroll", 2, 2, &fnScroll, "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)");
     env.bindFunction("ghostel--scroll-top", 1, 1, &fnScrollTop, "Scroll the terminal viewport to the top of scrollback.\n\n(ghostel--scroll-top TERM)");
@@ -118,14 +116,14 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         return env.nil();
     };
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     // Extract string data — try stack buffer first, fall back to alloc
     var stack_buf: [65536]u8 = undefined;
-    var heap_buf: ?[]const u8 = null;
-    defer if (heap_buf) |hb| std.heap.c_allocator.free(hb);
-
     const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
-        break :blk heap_buf;
+        break :blk env.extractStringAlloc(args[1], allocator);
     };
 
     if (data == null) {
@@ -140,46 +138,11 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // without \r.  Insert \r before every bare \n.
     // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
     const raw = data.?;
-
-    // Count bare \n to determine output size.
-    var extra_cr: usize = 0;
-    for (0..raw.len) |i| {
-        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-            extra_cr += 1;
-        }
-    }
-
-    if (extra_cr == 0) {
-        // No normalization needed — feed raw data directly.
-        term.vtWrite(raw);
-    } else {
-        // Need to insert \r before bare \n.
-        const out_len = raw.len + extra_cr;
-        var norm_stack: [131072]u8 = undefined;
-        var norm_heap: ?[]u8 = null;
-        defer if (norm_heap) |nh| std.heap.c_allocator.free(nh);
-
-        const norm_buf: []u8 = if (out_len <= norm_stack.len)
-            &norm_stack
-        else blk: {
-            norm_heap = std.heap.c_allocator.alloc(u8, out_len) catch {
-                // Fall back to stack buffer, truncating if needed.
-                break :blk &norm_stack;
-            };
-            break :blk norm_heap.?;
-        };
-
-        var npos: usize = 0;
-        for (0..raw.len) |i| {
-            if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-                norm_buf[npos] = '\r';
-                npos += 1;
-            }
-            norm_buf[npos] = raw[i];
-            npos += 1;
-        }
-        term.vtWrite(norm_buf[0..npos]);
-    }
+    const normalized = normalizeBareLfAlloc(allocator, raw) catch {
+        env.signalError("ghostel: failed to normalize terminal input");
+        return env.nil();
+    };
+    term.vtWrite(normalized);
 
     // Scan for OSC sequences that libghostty-vt discards.
     extractAndSetPwd(term, raw);
@@ -337,28 +300,6 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
     return env.nil();
 }
 
-/// (ghostel--get-title TERM)
-fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-
-    if (term.getTitle()) |title| {
-        return env.makeString(title);
-    }
-    return env.nil();
-}
-
-/// (ghostel--get-pwd TERM)
-fn fnGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-
-    if (term.getPwd()) |pwd| {
-        return env.makeString(pwd);
-    }
-    return env.nil();
-}
-
 /// (ghostel--redraw TERM &optional FULL)
 /// Reads the render state and updates the current Emacs buffer with styled text.
 /// When FULL is non-nil, always perform a full redraw instead of incremental.
@@ -366,7 +307,9 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const force_full = nargs > 1 and env.isNotNil(args[1]);
-    render.redraw(env, term, force_full);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    render.redraw(env, term, force_full, arena.allocator());
     return env.nil();
 }
 
@@ -745,11 +688,77 @@ fn fnCursorPosition(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _
 
     return env.call2(emacs.sym.cons, env.makeInteger(@as(i64, cx)), env.makeInteger(@as(i64, cy)));
 }
-
 /// (ghostel--module-version)
 fn fnModuleVersion(raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     return env.makeString(version);
+}
+
+const ExportId = enum(u32) {
+    new_term = 1,
+    write_input = 2,
+    set_size = 3,
+    redraw = 6,
+    scroll = 8,
+    scroll_top = 9,
+    scroll_bottom = 10,
+    encode_key = 11,
+    mouse_event = 12,
+    focus_event = 13,
+    set_palette = 14,
+    set_default_colors = 15,
+    mode_enabled = 16,
+    module_version = 19,
+};
+
+pub const ghostel_export_descriptors = [_]loader.ExportDescriptor{
+    .{ .export_id = @intFromEnum(ExportId.new_term), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--new", .min_arity = 2, .max_arity = 3, .docstring = "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.write_input), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--write-input", .min_arity = 2, .max_arity = 2, .docstring = "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.set_size), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--set-size", .min_arity = 3, .max_arity = 3, .docstring = "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.redraw), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--redraw", .min_arity = 1, .max_arity = 2, .docstring = "Redraw the terminal into the current buffer.\n\n(ghostel--redraw TERM &optional FULL)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.scroll), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--scroll", .min_arity = 2, .max_arity = 2, .docstring = "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.scroll_top), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--scroll-top", .min_arity = 1, .max_arity = 1, .docstring = "Scroll the terminal viewport to the top of scrollback.\n\n(ghostel--scroll-top TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.scroll_bottom), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--scroll-bottom", .min_arity = 1, .max_arity = 1, .docstring = "Scroll the terminal viewport to the bottom.\n\n(ghostel--scroll-bottom TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.encode_key), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--encode-key", .min_arity = 3, .max_arity = 4, .docstring = "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.mouse_event), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--mouse-event", .min_arity = 6, .max_arity = 6, .docstring = "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.focus_event), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--focus-event", .min_arity = 2, .max_arity = 2, .docstring = "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.set_palette), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--set-palette", .min_arity = 2, .max_arity = 2, .docstring = "Set the ANSI color palette.\n\n(ghostel--set-palette TERM COLORS-STRING)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.set_default_colors), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--set-default-colors", .min_arity = 3, .max_arity = 3, .docstring = "Set default foreground and background colors.\n\n(ghostel--set-default-colors TERM FG-HEX BG-HEX)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.mode_enabled), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--mode-enabled", .min_arity = 2, .max_arity = 2, .docstring = "Return t if terminal DEC private MODE is enabled.\n\n(ghostel--mode-enabled TERM MODE)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.module_version), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--module-version", .min_arity = 0, .max_arity = 0, .docstring = "Return the native module version string.\n\n(ghostel--module-version)", .flags = 0 },
+};
+
+pub fn invokeExport(export_id: u32, raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, data: ?*anyopaque) callconv(.c) c.emacs_value {
+    return switch (@as(ExportId, @enumFromInt(export_id))) {
+        .new_term => fnNew(raw_env, nargs, args, data),
+        .write_input => fnWriteInput(raw_env, nargs, args, data),
+        .set_size => fnSetSize(raw_env, nargs, args, data),
+        .redraw => fnRedraw(raw_env, nargs, args, data),
+        .scroll => fnScroll(raw_env, nargs, args, data),
+        .scroll_top => fnScrollTop(raw_env, nargs, args, data),
+        .scroll_bottom => fnScrollBottom(raw_env, nargs, args, data),
+        .encode_key => fnEncodeKey(raw_env, nargs, args, data),
+        .mouse_event => fnMouseEvent(raw_env, nargs, args, data),
+        .focus_event => fnFocusEvent(raw_env, nargs, args, data),
+        .set_palette => fnSetPalette(raw_env, nargs, args, data),
+        .set_default_colors => fnSetDefaultColors(raw_env, nargs, args, data),
+        .mode_enabled => fnModeEnabled(raw_env, nargs, args, data),
+        .module_version => fnModuleVersion(raw_env, nargs, args, data),
+    };
+}
+
+pub fn getVariable(export_id: u32, raw_env: ?*c.emacs_env, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    _ = export_id;
+    const env = emacs.Env.init(raw_env.?);
+    env.signalError("ghostel: variable export not supported");
+    return env.nil();
+}
+
+pub fn setVariable(export_id: u32, raw_env: ?*c.emacs_env, _: c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    _ = export_id;
+    const env = emacs.Env.init(raw_env.?);
+    env.signalError("ghostel: variable export not supported");
+    return env.nil();
 }
 
 // ---------------------------------------------------------------------------
@@ -801,4 +810,44 @@ fn titleChangedCallback(_: gt.Terminal, userdata: ?*anyopaque) callconv(.c) void
     if (term.getTitle()) |title| {
         _ = env.call1(emacs.sym.@"ghostel--set-title", env.makeString(title));
     }
+}
+
+fn normalizeBareLfAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var extra_cr: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            extra_cr += 1;
+        }
+    }
+    if (extra_cr == 0) return raw;
+
+    const normalized = try allocator.alloc(u8, raw.len + extra_cr);
+    var pos: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            normalized[pos] = '\r';
+            pos += 1;
+        }
+        normalized[pos] = raw[i];
+        pos += 1;
+    }
+    return normalized[0..pos];
+}
+
+test "normalizeBareLfAlloc inserts carriage returns before bare line feeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const normalized = try normalizeBareLfAlloc(arena.allocator(), "alpha\nbeta\r\ngamma\n");
+    try std.testing.expectEqualStrings("alpha\r\nbeta\r\ngamma\r\n", normalized);
+}
+
+test "normalizeBareLfAlloc reuses the original slice when no normalization is needed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw = "alpha\r\nbeta";
+    const normalized = try normalizeBareLfAlloc(arena.allocator(), raw);
+    try std.testing.expectEqualStrings(raw, normalized);
+    try std.testing.expectEqual(@intFromPtr(raw.ptr), @intFromPtr(normalized.ptr));
 }

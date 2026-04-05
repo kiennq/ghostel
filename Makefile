@@ -8,7 +8,7 @@ MELPAZOID_DIR  ?= $(XDG_CACHE_HOME)/melpazoid
 all: build test lint
 
 build:
-	./build.sh
+	zig build
 
 check:
 	zig build check
@@ -60,6 +60,8 @@ bench-quick:
 	bash bench/run-bench.sh --quick
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f dyn-loader-module.dll dyn-loader-module.dylib dyn-loader-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f conpty-module.dll ghostel-module.json
 	rm -f ghostel.elc ghostel-debug.elc
 	rm -rf zig-out .zig-cache

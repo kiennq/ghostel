@@ -27,19 +27,12 @@ process, keymap, and buffer.
 ## Requirements
 
 - Emacs 27.1+ with dynamic module support
-- macOS or Linux
+- macOS, Linux, or Windows 10/11 with ConPTY support
 
-The native module is **automatically downloaded** on first use.  Pre-built
-binaries are available for:
-
-- `aarch64-macos` (Apple Silicon)
-- `x86_64-macos` (Intel Mac)
-- `x86_64-linux`
-- `aarch64-linux`
-
-If you prefer to build from source or need a different platform, you'll also
-need [Zig](https://ziglang.org/) 0.14+ and the ghostty submodule (see
-[Building from source](#building-from-source)).
+The native module is **automatically downloaded** on first use (pre-built
+binaries are available for macOS, Linux, and Windows).  If you prefer to build from
+source, you'll also need [Zig](https://ziglang.org/) 0.14+ and the ghostty
+submodule (see [Building from source](#building-from-source)).
 
 ## Installation
 
@@ -75,55 +68,70 @@ Then `M-x ghostel` to open a terminal.
 
 ### Native module
 
-When the native module is missing, Ghostel will offer to **download a
-pre-built binary** or **compile from source** (controlled by
+Ghostel now uses a **stable dyn-loader module** plus a **stable target module**
+described by `ghostel-module.json`. Bootstrap always loads `dyn-loader-module`
+first, reads the metadata, and then activates the matching `ghostel-module`
+binary.
+
+The loader stays generic: it exposes `dyn-loader-load-manifest`,
+`dyn-loader-reload`, and the `dyn-loader-loaded-modules` variable so the
+same loader can manage multiple manifest-described target modules by
+`module_id`.
+
+When the native module payload is missing, Ghostel will offer to **download a
+pre-built package** or **compile from source** (controlled by
 `ghostel-module-auto-install`, default `ask`).  You can also trigger these
 manually:
 
-- `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
-- `M-x ghostel-module-compile` — build from source via `build.sh`
+- `M-x ghostel-download-module` — download and publish the `.tar.xz` loader + target-module package from GitHub releases
+- `M-x ghostel-module-compile` — build and publish the loader + target-module layout via `zig build`
+- `M-x ghostel-reload-module` — manually reload the current target module from metadata (refuses while Ghostel terminals are still live)
+
+Set `ghostel-module-dir` to keep downloaded modules in a custom
+directory, similar to vterm's configurable module directory.  When this
+option is set, Ghostel publishes the stable loader, stable target module,
+and metadata there and does not fall back to the package directory; source
+builds still run in the package checkout and then publish the finished
+artifacts into the custom directory.
+
+Set `ghostel-module-dir` to keep downloaded modules in a custom
+directory, similar to vterm's configurable module directory.  When this
+option is set, Ghostel loads and downloads `ghostel-module` there and
+does not fall back to the package directory; source builds still run in
+the package checkout and then copy the finished module into the custom
+directory.
 
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
+On Windows, run the build from Git Bash or another Bash-compatible shell.
+Windows builds target the GNU/UCRT runtime so the resulting module matches the
+runtime family used by Windows Emacs distributions such as emacs-libvterm's
+MinGW/UCRT builds.
+Ghostel vendors a generated `include/emacs-module.h`, so normal builds do not
+require local Emacs headers or an Emacs source checkout.
+If you want to override the vendored header, set `EMACS_INCLUDE_DIR` to a
+directory containing `emacs-module.h`, or set `EMACS_SOURCE_DIR` to an Emacs
+source checkout and Ghostel will generate the header from the upstream module
+fragments.
 
 ```sh
 # Clone with submodule
 git clone --recurse-submodules https://github.com/dakra/ghostel.git
 cd ghostel
 
-# Build everything (libghostty-vt + ghostel module)
-./build.sh
+# Optional: override the vendored header with an Emacs source checkout
+# export EMACS_SOURCE_DIR=/path/to/emacs
+
+# Build everything (libghostty-vt + dyn-loader-module + ghostel-module)
+zig build -Doptimize=ReleaseFast
 ```
 
 If you already have the repo, initialize the submodule and build:
 
 ```sh
 git submodule update --init vendor/ghostty
-./build.sh
-```
-
-### Building from source (MELPA install)
-
-MELPA packages only include `.el` files — the build script, Zig sources, and
-ghostty submodule are not included.  This means `M-x ghostel-module-compile`
-is not available when installed from MELPA.
-
-The recommended approach is to download a **pre-built binary** via
-`M-x ghostel-download-module` (this works regardless of install method).
-
-If you prefer to compile from source, clone the repository, build, and copy
-the resulting module into your MELPA package directory:
-
-```sh
-git clone --recurse-submodules https://github.com/dakra/ghostel.git
-cd ghostel
-./build.sh
-
-# Copy the module into your MELPA package directory
-# (adjust the path to match your Emacs package directory and ghostel version)
-cp ghostel-module.dylib ~/.emacs.d/elpa/ghostel-*/    # macOS
-cp ghostel-module.so    ~/.emacs.d/elpa/ghostel-*/    # Linux
+zig build -Doptimize=ReleaseFast
 ```
 
 ## Shell Integration
@@ -312,6 +320,8 @@ individual faces with `M-x customize-face`.
 | `ghostel-input-coalesce-delay`   | `0.003`              | Seconds to buffer rapid keystrokes before sending (0 to disable) |
 | `ghostel-full-redraw`            | `nil`                | Always do full redraws instead of incremental updates    |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
+| `ghostel-cursor-follow`          | `t`                  | Keep point following terminal cursor on redraw           |
+| `ghostel-ignore-cursor-change`   | `nil`                | Ignore terminal cursor shape/visibility changes (useful with Evil mode) |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
@@ -319,12 +329,35 @@ individual faces with `M-x customize-face`.
 | `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
 | `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
 
+### Editor-owned cursor (Evil mode and similar)
+
+Terminal programs communicate cursor shape and visibility through escape
+sequences (e.g. switching to a bar cursor in insert mode).  By default
+Ghostel applies these requests so the cursor reflects what the running
+program expects.
+
+If you use **Evil mode** or another editor extension that manages cursor
+appearance itself, the terminal's cursor-shape requests will fight with
+Evil's own cursor styling, causing flickering or unexpected cursor shapes.
+Setting `ghostel-ignore-cursor-change` to `t` tells Ghostel to suppress
+all terminal-driven cursor mutations and leave cursor appearance entirely
+under editor control:
+
+```elisp
+(setq ghostel-ignore-cursor-change t)
+```
+
+**Copy mode is unaffected**: when you enter Ghostel's copy mode
+(`ghostel-copy-mode`) the cursor is always made visible regardless of this
+setting, so you can navigate scrollback comfortably even with the option
+enabled.
+
 ## Commands
+<!-- Some commands are missing from the previous commits -->
 
 | Command                        | Description                                  |
 |--------------------------------|----------------------------------------------|
-| `M-x ghostel`                  | Open a new terminal (create new buffer with prefix arg) |
-| `M-x ghostel-project`          | Open a terminal in the current project root (create new buffer with prefix arg)  |
+| `M-x ghostel`                  | Open a new terminal                          |
 | `M-x ghostel-other`            | Switch to next terminal or create one        |
 | `M-x ghostel-clear`            | Clear screen and scrollback                  |
 | `M-x ghostel-clear-scrollback` | Clear scrollback only                        |
@@ -336,18 +369,9 @@ individual faces with `M-x customize-face`.
 | `M-x ghostel-force-redraw`     | Force a full terminal redraw                 |
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
-| `M-x ghostel-download-module`  | Download pre-built native module             |
-| `M-x ghostel-module-compile`   | Compile native module from source            |
-
-### Project integration
-
-`ghostel-project` opens a terminal in the current project's root directory
-with a project-prefixed buffer name.  To make it available from
-`project-switch-project` (`C-x p p`):
-
-```elisp
-(add-to-list 'project-switch-commands '(ghostel-project "Ghostel") t)
-```
+| `M-x ghostel-download-module`  | Download and publish the native loader package |
+| `M-x ghostel-module-compile`   | Compile and publish the native loader package  |
+| `M-x ghostel-reload-module`    | Manually reload the versioned real module      |
 
 ## Running Tests
 
