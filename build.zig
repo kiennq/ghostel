@@ -76,6 +76,26 @@ pub fn build(b: *std.Build) void {
 
     const check = b.step("check", "Check that the module compiles (no linking)");
     check.dependOn(&check_obj.step);
+
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/module.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addModuleIncludes(b, test_mod, emacs_include);
+    test_mod.linkLibrary(ghostty_dep.artifact("ghostty-vt-static"));
+
+    const unit_tests = b.addTest(.{
+        .root_module = test_mod,
+    });
+    if (target_os == .windows) {
+        addWindowsRuntimeLibraries(b, unit_tests, target.result);
+    }
+
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run Zig unit tests");
+    test_step.dependOn(&run_unit_tests.step);
 }
 
 fn addModuleIncludes(
