@@ -153,6 +153,13 @@ When nil, redraw updates terminal content while leaving the current Emacs
 point and window position unchanged."
   :type 'boolean)
 
+(defcustom ghostel-ignore-cursor-change nil
+  "When non-nil, ignore terminal requests to change cursor shape or visibility.
+Useful when editor-owned cursor behavior (e.g. Evil mode) should take
+precedence over terminal-driven cursor changes.  Copy mode always forces
+a visible cursor regardless of this setting."
+  :type 'boolean)
+
 (defcustom ghostel-kill-buffer-on-exit t
   "Kill the buffer when the shell process exits."
   :type 'boolean)
@@ -1651,15 +1658,16 @@ This ensures terminal text is visible regardless of the Emacs theme."
   "Set the cursor style based on terminal state.
 STYLE is one of: 0=bar, 1=block, 2=underline, 3=hollow-block.
 VISIBLE is t or nil."
-  (setq cursor-type
-        (if visible
-            (pcase style
-              (0 '(bar . 2))       ; bar
-              (1 'box)             ; block
-              (2 '(hbar . 2))      ; underline
-              (3 'hollow)          ; hollow block
-              (_ 'box))
-          nil)))
+  (unless ghostel-ignore-cursor-change
+    (setq cursor-type
+          (if visible
+              (pcase style
+                (0 '(bar . 2))       ; bar
+                (1 'box)             ; block
+                (2 '(hbar . 2))      ; underline
+                (3 'hollow)          ; hollow block
+                (_ 'box))
+            nil))))
 
 (defun ghostel--update-directory (dir)
   "Update `default-directory' from terminal's OSC 7 report.

@@ -1133,6 +1133,46 @@ cell, so the visual line width must equal the terminal column count."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ghostel-ignore-cursor-change option
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-set-cursor-style-ignored-when-configured ()
+  "Test that ghostel-ignore-cursor-change prevents cursor-type mutations."
+  (with-temp-buffer
+    (let ((ghostel-ignore-cursor-change t)
+          (cursor-type 'box))
+      (ghostel--set-cursor-style 0 nil)
+      (should (eq cursor-type 'box)))))
+
+(ert-deftest ghostel-test-set-cursor-style-applies-when-not-ignored ()
+  "Test that cursor changes still apply when ghostel-ignore-cursor-change is nil."
+  (with-temp-buffer
+    (let ((ghostel-ignore-cursor-change nil)
+          (cursor-type 'box))
+      (ghostel--set-cursor-style 0 nil)
+      (should (null cursor-type)))))
+
+(ert-deftest ghostel-test-copy-mode-cursor-overrides-ignored-terminal-cursor ()
+  "Test that copy mode still forces a visible cursor even with ignore enabled."
+  (let ((buf (generate-new-buffer " *ghostel-test-copy-ignore*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel-ignore-cursor-change t))
+            (setq cursor-type 'box)
+            (ghostel--set-cursor-style 2 nil)
+            (should (eq cursor-type 'box))           ; ignore: still box
+            (let ((ghostel--copy-mode-active nil)
+                  (ghostel--redraw-timer nil))
+              (ghostel-copy-mode)
+              (should cursor-type)                   ; copy mode: visible
+              (should (equal cursor-type (default-value 'cursor-type))) ; uses user default
+              (ghostel-copy-mode-exit)
+              (should (eq cursor-type 'box)))))      ; restored to box
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+;; -----------------------------------------------------------------------
 ;; Test: copy-mode hl-line-mode management
 ;; -----------------------------------------------------------------------
 
@@ -1701,6 +1741,9 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
     ghostel-test-copy-mode-cursor
+    ghostel-test-set-cursor-style-ignored-when-configured
+    ghostel-test-set-cursor-style-applies-when-not-ignored
+    ghostel-test-copy-mode-cursor-overrides-ignored-terminal-cursor
     ghostel-test-copy-mode-hl-line
     ghostel-test-module-platform-tag-windows
     ghostel-test-module-asset-name-windows
