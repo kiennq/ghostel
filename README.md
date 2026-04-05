@@ -294,12 +294,37 @@ individual faces with `M-x customize-face`.
 | `ghostel-input-coalesce-delay`   | `0.003`              | Seconds to buffer rapid keystrokes before sending (0 to disable) |
 | `ghostel-full-redraw`            | `nil`                | Always do full redraws instead of incremental updates    |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
+| `ghostel-cursor-follow`          | `t`                  | Keep point following terminal cursor on redraw           |
+| `ghostel-ignore-cursor-change`   | `nil`                | Ignore terminal cursor shape/visibility changes (useful with Evil mode) |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
 | `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
 | `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
+
+### Editor-owned cursor (Evil mode and similar)
+
+Terminal programs communicate cursor shape and visibility through escape
+sequences (e.g. switching to a bar cursor in insert mode).  By default
+Ghostel applies these requests so the cursor reflects what the running
+program expects.
+
+If you use **Evil mode** or another editor extension that manages cursor
+appearance itself, the terminal's cursor-shape requests will fight with
+Evil's own cursor styling, causing flickering or unexpected cursor shapes.
+Setting `ghostel-ignore-cursor-change` to `t` tells Ghostel to suppress
+all terminal-driven cursor mutations and leave cursor appearance entirely
+under editor control:
+
+```elisp
+(setq ghostel-ignore-cursor-change t)
+```
+
+**Copy mode is unaffected**: when you enter Ghostel's copy mode
+(`ghostel-copy-mode`) the cursor is always made visible regardless of this
+setting, so you can navigate scrollback comfortably even with the option
+enabled.
 
 ## Commands
 
