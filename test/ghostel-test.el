@@ -1174,12 +1174,6 @@ cell, so the visual line width must equal the terminal column count."
 ;; Test: module version check
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-elisp-version ()
-  "Test that `ghostel--elisp-version' returns a version string."
-  (let ((ver (ghostel--elisp-version)))
-    (should (stringp ver))
-    (should (string-match-p "^[0-9]+\\.[0-9]+" ver))))
-
 (ert-deftest ghostel-test-module-version-match ()
   "Test that version check does nothing when module meets minimum."
   (let ((warned nil)
@@ -1232,6 +1226,53 @@ cell, so the visual line width must equal the terminal column count."
         (module-file-suffix ".dll"))
     (should (equal "ghostel-module-x86_64-windows.dll"
                    (ghostel--module-asset-name)))))
+
+(ert-deftest ghostel-test-module-download-url-uses-minimum-version ()
+  "Module downloads pin to the minimum supported native module version."
+  (let ((ghostel-github-release-url "https://example.invalid/releases")
+        (ghostel--minimum-module-version "0.5"))
+    (cl-letf (((symbol-function 'ghostel--module-asset-name)
+               (lambda () "ghostel-module-x86_64-windows.dll")))
+      (should (equal "https://example.invalid/releases/download/v0.5/ghostel-module-x86_64-windows.dll"
+                     (ghostel--module-download-url ghostel--minimum-module-version))))))
+
+(ert-deftest ghostel-test-download-module-prefix-empty-uses-latest ()
+  "Prefix download prompts for a version and treats blank input as latest."
+  (let ((captured-version :unset)
+        (captured-latest nil)
+        (loaded nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) ""))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (_dir &optional version latest-release)
+                   (setq captured-version version)
+                   (setq captured-latest latest-release)
+                   t))
+                ((symbol-function 'module-load)
+                 (lambda (path)
+                   (setq loaded path)))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (ghostel-download-module '(4))
+        (should (null captured-version))
+        (should captured-latest)
+        (should loaded)))))
+
+(ert-deftest ghostel-test-download-module-prefix-rejects-too-old-version ()
+  "Prefix download rejects versions below the minimum supported module version."
+  (let ((ghostel--minimum-module-version "0.5"))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) "0.4")))
+        (should-error (ghostel-download-module '(4))
+                      :type 'user-error)))))
 
 (ert-deftest ghostel-test-module-file-path-uses-custom-dir ()
   "Custom module directories override the default module load path."
@@ -1661,12 +1702,14 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-osc51-eval-unknown
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
-    ghostel-test-elisp-version
-     ghostel-test-module-platform-tag-windows
-     ghostel-test-module-asset-name-windows
-     ghostel-test-compile-module-invokes-zig-build
-     ghostel-test-module-compile-command-uses-helper-with-package-dir
-     ghostel-test-module-version-match
+    ghostel-test-module-platform-tag-windows
+    ghostel-test-module-asset-name-windows
+    ghostel-test-module-download-url-uses-minimum-version
+    ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-module-prefix-rejects-too-old-version
+    ghostel-test-compile-module-invokes-zig-build
+    ghostel-test-module-compile-command-uses-helper-with-package-dir
+    ghostel-test-module-version-match
      ghostel-test-module-version-mismatch
      ghostel-test-module-version-newer-than-minimum
     ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled
