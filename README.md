@@ -27,10 +27,10 @@ process, keymap, and buffer.
 ## Requirements
 
 - Emacs 27.1+ with dynamic module support
-- macOS or Linux
+- macOS, Linux, or Windows 10/11 with ConPTY support
 
 The native module is **automatically downloaded** on first use (pre-built
-binaries are available for macOS and Linux).  If you prefer to build from
+binaries are available for macOS, Linux, and Windows).  If you prefer to build from
 source, you'll also need [Zig](https://ziglang.org/) 0.14+ and the ghostty
 submodule (see [Building from source](#building-from-source)).
 
@@ -67,16 +67,29 @@ pre-built binary** or **compile from source** (controlled by
 manually:
 
 - `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
-- `M-x ghostel-module-compile` — build from source via `build.sh`
+- `M-x ghostel-module-compile` — build from source via `build.sh` (use a Bash shell on Windows)
 
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
+On Windows, run the build from Git Bash or another Bash-compatible shell.
+Windows builds target the GNU/UCRT runtime so the resulting module matches the
+runtime family used by Windows Emacs distributions such as emacs-libvterm's
+MinGW/UCRT builds.
+Ghostel vendors a generated `include/emacs-module.h`, so normal builds do not
+require local Emacs headers or an Emacs source checkout.
+If you want to override the vendored header, set `EMACS_INCLUDE_DIR` to a
+directory containing `emacs-module.h`, or set `EMACS_SOURCE_DIR` to an Emacs
+source checkout and Ghostel will generate the header from the upstream module
+fragments.
 
 ```sh
 # Clone with submodule
 git clone --recurse-submodules https://github.com/dakra/ghostel.git
 cd ghostel
+
+# Optional: override the vendored header with an Emacs source checkout
+# export EMACS_SOURCE_DIR=/path/to/emacs
 
 # Build everything (libghostty-vt + ghostel module)
 ./build.sh

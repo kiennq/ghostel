@@ -9,6 +9,7 @@ const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
 const render = @import("render.zig");
 const input = @import("input.zig");
+const Conpty = @import("conpty.zig");
 
 const c = emacs.c;
 
@@ -47,6 +48,12 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
     env.bindFunction("ghostel--module-version", 0, 0, &fnModuleVersion, "Return the native module version string.\n\n(ghostel--module-version)");
+    env.bindFunction("ghostel--conpty-init", 7, 7, &fnConptyInit, "Start a Windows ConPTY backend.\n\n(ghostel--conpty-init TERM PROCESS COMMAND ROWS COLS CWD ENV)");
+    env.bindFunction("ghostel--conpty-read-pending", 1, 1, &fnConptyReadPending, "Read pending Windows ConPTY output.\n\n(ghostel--conpty-read-pending TERM)");
+    env.bindFunction("ghostel--conpty-write", 2, 2, &fnConptyWrite, "Write raw bytes to the Windows ConPTY backend.\n\n(ghostel--conpty-write TERM DATA)");
+    env.bindFunction("ghostel--conpty-resize", 3, 3, &fnConptyResize, "Resize the Windows ConPTY backend.\n\n(ghostel--conpty-resize TERM ROWS COLS)");
+    env.bindFunction("ghostel--conpty-is-alive", 1, 1, &fnConptyIsAlive, "Return t if the Windows ConPTY child is alive.\n\n(ghostel--conpty-is-alive TERM)");
+    env.bindFunction("ghostel--conpty-kill", 1, 1, &fnConptyKill, "Terminate the Windows ConPTY child.\n\n(ghostel--conpty-kill TERM)");
 
     emacs.initSymbols(env);
     env.provide("ghostel-module");
@@ -334,6 +341,106 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
     };
 
     return env.nil();
+}
+
+fn fnConptyInit(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse {
+        env.signalError("ghostel: invalid terminal handle");
+        return env.nil();
+    };
+
+    var command_stack: [512]u8 = undefined;
+    var cwd_stack: [512]u8 = undefined;
+    var command_heap: ?[]const u8 = null;
+    var cwd_heap: ?[]const u8 = null;
+    defer if (command_heap) |buf| std.heap.c_allocator.free(buf);
+    defer if (cwd_heap) |buf| std.heap.c_allocator.free(buf);
+
+    const command = env.extractString(args[2], &command_stack) orelse blk: {
+        command_heap = env.extractStringAlloc(args[2], std.heap.c_allocator);
+        break :blk command_heap;
+    };
+    const cwd = env.extractString(args[5], &cwd_stack) orelse blk: {
+        cwd_heap = env.extractStringAlloc(args[5], std.heap.c_allocator);
+        break :blk cwd_heap;
+    };
+
+    if (command == null or cwd == null) {
+        env.signalError("ghostel: invalid ConPTY arguments");
+        return env.nil();
+    }
+
+    Conpty.deinit(term.conpty);
+    term.conpty = null;
+    term.conpty = Conpty.init(
+        env,
+        args[1],
+        command.?,
+        @intCast(env.extractInteger(args[3])),
+        @intCast(env.extractInteger(args[4])),
+        cwd.?,
+        args[6],
+    ) catch {
+        env.signalError("ghostel: failed to initialize Windows ConPTY backend");
+        return env.nil();
+    };
+
+    return env.t();
+}
+
+fn fnConptyReadPending(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return Conpty.readPending(env, state);
+}
+
+fn fnConptyWrite(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+
+    var stack_buf: [65536]u8 = undefined;
+    var heap_buf: ?[]const u8 = null;
+    defer if (heap_buf) |buf| std.heap.c_allocator.free(buf);
+
+    const data = env.extractString(args[1], &stack_buf) orelse blk: {
+        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
+        break :blk heap_buf;
+    };
+    if (data == null) return env.nil();
+
+    Conpty.write(state, data.?) catch {
+        env.signalError("ghostel: failed to write to Windows ConPTY backend");
+        return env.nil();
+    };
+    return env.t();
+}
+
+fn fnConptyResize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return if (Conpty.resize(
+        state,
+        @intCast(env.extractInteger(args[1])),
+        @intCast(env.extractInteger(args[2])),
+    )) env.t() else env.nil();
+}
+
+fn fnConptyIsAlive(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return if (Conpty.isAlive(state)) env.t() else env.nil();
+}
+
+fn fnConptyKill(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const state = term.conpty orelse return env.nil();
+    return if (Conpty.kill(state)) env.t() else env.nil();
 }
 
 /// (ghostel--get-title TERM)
@@ -705,7 +812,10 @@ fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*a
                 var gl: u32 = 0;
                 if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&gl)) != gt.SUCCESS) continue;
                 if (gl == 0) {
-                    if (pos < buf.len) { buf[pos] = ' '; pos += 1; }
+                    if (pos < buf.len) {
+                        buf[pos] = ' ';
+                        pos += 1;
+                    }
                     continue;
                 }
                 var cp: [4]u32 = undefined;

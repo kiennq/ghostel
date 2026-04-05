@@ -5,6 +5,7 @@
 const std = @import("std");
 const gt = @import("ghostty.zig");
 const emacs = @import("emacs.zig");
+const Conpty = @import("conpty.zig");
 
 const Self = @This();
 
@@ -32,6 +33,9 @@ rows: u16,
 
 /// Cached Emacs env pointer — only valid during a callback from Emacs.
 env: ?emacs.Env = null,
+
+/// Windows ConPTY transport state, if active.
+conpty: ?*Conpty.State = null,
 
 /// Create a new terminal with the given dimensions and scrollback.
 pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
@@ -86,11 +90,13 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
         .mouse_encoder = mouse_encoder,
         .cols = cols,
         .rows = rows,
+        .conpty = null,
     };
 }
 
 /// Free all ghostty resources.
 pub fn deinit(self: *Self) void {
+    Conpty.deinit(self.conpty);
     gt.c.ghostty_mouse_encoder_free(self.mouse_encoder);
     gt.c.ghostty_key_encoder_free(self.key_encoder);
     gt.c.ghostty_render_state_row_cells_free(self.row_cells);
