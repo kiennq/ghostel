@@ -4,86 +4,124 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest release
+        continue-on-error: true
+        id: cur_release
+        uses: pozetroninc/github-action-get-latest-release@master
+        with:
+          repository: ${{ github.repository }}
+          excludes: draft
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_ver="$(grep -Po '^;; Version: \K[\d.]+' ghostel.el)"
+          sha="${GITHUB_SHA::6}"
+          should_release=true
+          latest_tag=$([[ "${{ steps.cur_release.outcome }}" == "failure" ]] && echo "" || echo "${{ steps.cur_release.outputs.release }}")
+
+            if [[ -n "$latest_tag" ]] && git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null; then
+              if git diff --quiet "$latest_tag"...HEAD -- \
+                ghostel.el \
+                build.zig \
+                build.zig.zon \
+                .github/workflows/release.yml \
+                .github/workflows/ci.yml \
+                include \
+                src \
+                vendor/dyn-loader \
+                vendor/ghostty
+            then
+              should_release=false
+            fi
+          fi
+
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            version="${base_ver}.${GITHUB_RUN_NUMBER}.${sha}"
+            tag="v${version}"
+          fi
+
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.version.outputs.should_release == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
+          - os: windows-latest
+            platform: x86_64-windows
+            target: x86_64-windows-gnu
+            suffix: .dll
           - os: macos-latest
             platform: aarch64-macos
+            target: aarch64-macos
             suffix: .dylib
-          - os: macos-latest
-            platform: x86_64-macos
-            suffix: .dylib
-            target: x86_64-macos
-          - os: ubuntu-latest
-            platform: aarch64-linux
-            suffix: .so
-            target: aarch64-linux-gnu
     runs-on: ${{ matrix.os }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           submodules: recursive
-          persist-credentials: true
+          persist-credentials: false
 
-      - name: Rewrite SSH to HTTPS for submodules
-        run: |
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git submodule sync --recursive
-          git submodule update --init --recursive
-
-      - uses: purcell/setup-emacs@master
+      - name: Cache Zig build state
+        uses: actions/cache@v4
         with:
-          version: '29.4'
-
-      - name: Find Emacs module header
-        run: |
-          set -e
-          EMACS_BIN="$(command -v emacs || true)"
-          HEADER=""
-
-          if [ -n "$EMACS_BIN" ]; then
-            EMACS_BIN_DIR="$(dirname "$EMACS_BIN")"
-            for dir in "$EMACS_BIN_DIR/../include" "$EMACS_BIN_DIR/../share/emacs/include"; do
-              if [ -f "$dir/emacs-module.h" ]; then
-                HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                break
-              fi
-            done
-
-            if [ -z "$HEADER" ] && [ -L "$EMACS_BIN" ]; then
-              REAL_DIR="$(dirname "$(readlink -f "$EMACS_BIN")")"
-              for dir in "$REAL_DIR/../include" "$REAL_DIR/../../include"; do
-                if [ -f "$dir/emacs-module.h" ]; then
-                  HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                  break
-                fi
-              done
-            fi
-          fi
-
-          if [ -z "$HEADER" ]; then
-            for dir in /usr/include /usr/local/include /opt/homebrew/include; do
-              FOUND="$(find "$dir" -maxdepth 5 -name emacs-module.h -print -quit 2>/dev/null || true)"
-              if [ -n "$FOUND" ]; then
-                HEADER="$FOUND"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$HEADER" ]; then
-            echo "::error::emacs-module.h not found"
-            exit 1
-          fi
-          echo "EMACS_INCLUDE_DIR=$(dirname "$HEADER")" >> "$GITHUB_ENV"
-          echo "Found emacs-module.h at: $HEADER"
+          path: |
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+            ${{ env.ZIG_LOCAL_CACHE_DIR }}
+            vendor/ghostty/.zig-cache
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/dyn-loader/**', 'include/**', '.github/workflows/release.yml') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ matrix.platform }}-
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -91,41 +129,32 @@ jobs:
           version: 0.15.2
 
       - name: Build native module
+        shell: bash
         run: |
-          if [ -n "${{ matrix.target }}" ]; then
-            ./build.sh -t "${{ matrix.target }}"
-          else
-            ./build.sh
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          files=(
+            dyn-loader-module${{ matrix.suffix }}
+            ghostel-module${{ matrix.suffix }}
+            ghostel-module.json
+          )
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            files+=(conpty-module${{ matrix.suffix }})
           fi
+          tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
-      - name: Strip non-exported symbols (macOS)
-        if: runner.os == 'macOS'
-        run: strip -x ghostel-module${{ matrix.suffix }}
-
-      - name: Rename artifact for release
-        run: |
-          mv ghostel-module${{ matrix.suffix }} \
-             ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload artifact to release
+        uses: ncipollo/release-action@v1
         with:
-          name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: artifacts/**/*
+          tag: ${{ needs.prepare-release.outputs.tag }}
+          allowUpdates: true
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          omitDraftDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
+          artifacts: ghostel-module-${{ matrix.platform }}.tar.xz
+          token: ${{ secrets.GITHUB_TOKEN }}
