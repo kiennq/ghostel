@@ -202,11 +202,23 @@ opening the file at the given line in another window."
 \\=`ask'      — prompt with a choice to download, compile, or skip (default).
 \\=`download' — download a pre-built binary from GitHub releases.
 \\=`compile'  — build from source via `ghostel-module-compile'.
-nil         — do nothing; the user must install the module manually."
+nil         — do nothing; the user must install the module manually.
+
+When `ghostel-module-dir' is non-nil, compile actions copy the built
+module into that directory after a successful build."
   :type '(choice (const :tag "Ask interactively" ask)
                  (const :tag "Download pre-built binary" download)
                  (const :tag "Compile from source" compile)
                  (const :tag "Do nothing" nil)))
+
+(defcustom ghostel-module-dir nil
+  "If non-nil, load and download `ghostel-module' from this directory.
+
+When nil, Ghostel uses the package directory.  Source builds from
+`ghostel-module-compile' still build in the package directory first,
+then copy the finished module here."
+  :type '(choice (const :tag "Use package directory" nil)
+                 directory))
 
 (defcustom ghostel-github-release-url
   "https://github.com/dakra/ghostel/releases"
@@ -363,6 +375,51 @@ Bump this only when the Elisp code requires a newer native module
 
 ;;; Automatic download and compilation of native module
 
+(defun ghostel--package-dir ()
+  "Return the Ghostel package directory."
+  (file-name-directory (or load-file-name
+                           (locate-library "ghostel")
+                           buffer-file-name)))
+
+(defun ghostel--effective-module-dir (&optional dir)
+  "Return the directory Ghostel should use for native module lookup.
+DIR is the fallback when no custom directory is configured."
+  (file-name-as-directory
+   (expand-file-name (or ghostel-module-dir dir (ghostel--package-dir)))))
+
+(defun ghostel--module-file-path (&optional dir)
+  "Return the full path to the native module in DIR."
+  (expand-file-name
+   (concat "ghostel-module" module-file-suffix)
+   (ghostel--effective-module-dir dir)))
+
+(defun ghostel--load-module-if-available (&optional dir)
+  "Load the native module from DIR when it exists."
+  (let* ((module-dir (ghostel--effective-module-dir dir))
+         (mod (ghostel--module-file-path module-dir)))
+    (when (file-exists-p mod)
+      (module-load mod)
+      (ghostel--check-module-version module-dir)
+      t)))
+
+(defun ghostel--download-failure-message ()
+  "Return the user-facing message for failed module downloads."
+  "Download failed.  Try M-x ghostel-module-compile to build from source")
+
+(defun ghostel--copy-built-module (dir)
+  "Copy the built native module from DIR into `ghostel-module-dir'."
+  (when ghostel-module-dir
+    (let* ((src (expand-file-name
+                 (concat "ghostel-module" module-file-suffix)
+                 dir))
+           (dest-dir (ghostel--effective-module-dir))
+           (dest (ghostel--module-file-path dest-dir)))
+      (unless (file-directory-p dest-dir)
+        (make-directory dest-dir t))
+      (unless (equal (downcase (expand-file-name src))
+                     (downcase (expand-file-name dest)))
+        (copy-file src dest t)))))
+
 (defun ghostel--module-platform-tag ()
   "Return platform tag for the current system, e.g. \"x86_64-linux\".
 Returns nil if the platform is not recognized."
@@ -400,12 +457,14 @@ Returns nil if the platform is not recognized."
   "Download a pre-built module into DIR.
 Returns non-nil on success."
   (condition-case err
-      (let ((url (ghostel--module-download-url)))
+      (let* ((dir (ghostel--effective-module-dir dir))
+             (url (ghostel--module-download-url)))
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
-          (let ((dest (expand-file-name
-                       (concat "ghostel-module" module-file-suffix) dir)))
+          (unless (file-directory-p dir)
+            (make-directory dir t))
+          (let ((dest (ghostel--module-file-path dir)))
             (message "ghostel: downloading native module from %s..." url)
             (when (ghostel--download-file url dest)
               (message "ghostel: native module downloaded successfully")
@@ -418,12 +477,19 @@ Returns non-nil on success."
   "Compile the native module from source in DIR.
 Runs synchronously and returns non-nil on success."
   (let ((default-directory dir))
-    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (message "ghostel: compiling native module with zig build%s..."
+             (if ghostel-module-dir
+                 (format " (will copy to %s)"
+                         (ghostel--effective-module-dir))
+               " (this may take a moment)"))
     (condition-case err
         (let ((ret (process-file "zig" nil "*ghostel-build*" nil
                                  "build" "-Doptimize=ReleaseFast")))
           (if (eq ret 0)
-              (progn (message "ghostel: native module compiled successfully") t)
+              (progn
+                (ghostel--copy-built-module dir)
+                (message "ghostel: native module compiled successfully")
+                t)
             (display-warning 'ghostel
                              "Module compilation failed.  See *ghostel-build* buffer for details.")
             nil))
@@ -500,11 +566,8 @@ Returns nil without error when `package.el' is unavailable."
 (defun ghostel-download-module ()
   "Interactively download the pre-built native module for this platform."
   (interactive)
-  (let* ((dir (file-name-directory (or load-file-name
-                                       (locate-library "ghostel")
-                                       buffer-file-name)))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir)))
+  (let* ((dir (ghostel--effective-module-dir))
+         (mod (ghostel--module-file-path dir)))
     (when (and (file-exists-p mod)
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
@@ -512,15 +575,14 @@ Returns nil without error when `package.el' is unavailable."
         (progn
           (module-load mod)
           (message "ghostel: module loaded successfully"))
-      (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
+      (user-error "%s" (ghostel--download-failure-message)))))
 
 (defun ghostel-module-compile ()
   "Compile the ghostel native module by running zig build.
-The output is shown in a *ghostel-build* compilation buffer."
+Build output is written to the *ghostel-build* buffer."
   (interactive)
-  (let ((default-directory (file-name-directory (or (locate-library "ghostel")
-                                                    default-directory))))
-    (compile "zig build -Doptimize=ReleaseFast" t)))
+  (unless (ghostel--compile-module (ghostel--package-dir))
+    (user-error "Ghostel module compilation failed")))
 
 (defun ghostel--elisp-version ()
   "Return the ghostel Elisp version from the package header."
@@ -557,23 +619,27 @@ DIR is the module directory."
 
 ;; Load the native module
 (unless (featurep 'ghostel-module)
-  (let* ((dir (file-name-directory (or load-file-name buffer-file-name)))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir)))
+  (let* ((dir (ghostel--effective-module-dir))
+         (mod (ghostel--module-file-path dir)))
     (unless (or (file-exists-p mod) noninteractive)
       (ghostel--ensure-module dir))
     (if (file-exists-p mod)
         (condition-case err
-            (progn
-              (module-load mod)
-              (ghostel--check-module-version dir))
+            (ghostel--load-module-if-available dir)
           (error
-           (display-warning 'ghostel
-                            (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
-                                    (error-message-string err)))))
+            (display-warning 'ghostel
+                             (if ghostel-module-dir
+                                 (format "Failed to load native module: %s\nCheck or replace the module in %s"
+                                         (error-message-string err)
+                                         dir)
+                               (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
+                                       (error-message-string err))))))
       (display-warning 'ghostel
-                       (concat "Native module not found: " mod
-                               "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
+                       (if ghostel-module-dir
+                           (concat "Native module not found: " mod
+                                   "\nRun M-x ghostel-download-module or install/copy the module there")
+                         (concat "Native module not found: " mod
+                                 "\nRun M-x ghostel-download-module or M-x ghostel-module-compile"))))))
 
 
 ;;; Internal variables
@@ -2062,13 +2128,10 @@ and buffer-local `hl-line-mode'."
   "Create a new Ghostel terminal buffer."
   (interactive)
   (unless (fboundp 'ghostel--new)
-    (let ((dir (file-name-directory (locate-library "ghostel"))))
+    (let ((dir (ghostel--effective-module-dir)))
       (ghostel--ensure-module dir)
-      (let ((mod (expand-file-name
-                  (concat "ghostel-module" module-file-suffix) dir)))
-        (if (file-exists-p mod)
-            (module-load mod)
-          (user-error "Ghostel native module not available")))))
+      (unless (ghostel--load-module-if-available dir)
+        (user-error "Ghostel native module not available"))))
   (let* ((index (cl-incf ghostel--buffer-counter))
          (buf-name (if (= index 1)
                        ghostel-buffer-name

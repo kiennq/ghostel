@@ -1233,6 +1233,63 @@ cell, so the visual line width must equal the terminal column count."
     (should (equal "ghostel-module-x86_64-windows.dll"
                    (ghostel--module-asset-name)))))
 
+(ert-deftest ghostel-test-module-file-path-uses-custom-dir ()
+  "Custom module directories override the default module load path."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll"))
+    (should (equal (downcase "C:/modules/ghostel-module.dll")
+                   (downcase (ghostel--module-file-path))))))
+
+(ert-deftest ghostel-test-download-module-targets-custom-dir ()
+  "Module downloads write into `ghostel-module-dir' when configured."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (download-dest nil))
+    (cl-letf (((symbol-function 'ghostel--module-download-url)
+               (lambda () "https://example.invalid/ghostel-module.dll"))
+              ((symbol-function 'ghostel--download-file)
+               (lambda (_url dest)
+                 (setq download-dest dest)
+                 t)))
+      (should (ghostel--download-module "C:/ghostel/"))
+      (should (equal (downcase "C:/modules/ghostel-module.dll")
+                     (downcase download-dest))))))
+
+(ert-deftest ghostel-test-ask-install-action-includes-compile-for-custom-dir ()
+  "Missing-module prompts still offer compile for custom module dirs."
+  (let ((ghostel-module-dir "C:/modules/")
+        (choice nil))
+    (cl-letf (((symbol-function 'read-char-choice)
+               (lambda (_prompt chars)
+                 (setq choice chars)
+                 ?c)))
+      (should (eq 'compile (ghostel--ask-install-action "C:/modules/")))
+      (should (equal '(?d ?c ?s) choice)))))
+
+(ert-deftest ghostel-test-load-module-if-available-uses-custom-dir ()
+  "Module loading resolves the configured module directory."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (loaded nil)
+        (checked nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (path)
+                   (equal (downcase path)
+                          (downcase "C:/modules/ghostel-module.dll"))))
+                ((symbol-function 'module-load)
+                 (lambda (path)
+                   (setq loaded path)))
+                ((symbol-function 'ghostel--check-module-version)
+                 (lambda (dir)
+                   (setq checked dir))))
+        (should (ghostel--load-module-if-available))
+        (should (equal (downcase "C:/modules/ghostel-module.dll")
+                       (downcase loaded)))
+        (should (equal (downcase "C:/modules/")
+                       (downcase checked)))))))
+
 (ert-deftest ghostel-test-compile-module-invokes-zig-build ()
   "Source compilation runs zig build directly."
   (let ((default-directory nil)
@@ -1255,26 +1312,52 @@ cell, so the visual line width must equal the terminal column count."
         (should (ghostel--compile-module "C:/ghostel/"))
         (should (equal
                  '("zig" nil "*ghostel-build*" nil ("build" "-Doptimize=ReleaseFast") "C:/ghostel/")
-                 process-invocation))
+                  process-invocation))
         (should-not warnings)))))
 
-(ert-deftest ghostel-test-module-compile-command-uses-zig-build ()
-  "Interactive compilation uses zig build directly."
-  (let ((compile-invocation nil)
-        (default-directory nil))
+(ert-deftest ghostel-test-compile-module-copies-built-module-to-custom-dir ()
+  "Synchronous module compilation copies the built module into `ghostel-module-dir'."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (copied nil)
+        (created nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'process-file)
+                 (lambda (&rest _) 0))
+                ((symbol-function 'file-directory-p)
+                 (lambda (dir)
+                   (equal (downcase dir) (downcase "C:/modules/"))))
+                ((symbol-function 'make-directory)
+                 (lambda (dir parents)
+                   (setq created (list dir parents))))
+                ((symbol-function 'copy-file)
+                 (lambda (src dest &optional ok-if-already-exists)
+                   (setq copied (list src dest ok-if-already-exists)))))
+        (should (ghostel--compile-module "C:/ghostel/"))
+        (should-not created)
+        (should (equal
+                 (list (downcase "C:/ghostel/ghostel-module.dll")
+                       (downcase "C:/modules/ghostel-module.dll")
+                       t)
+                 (list (downcase (nth 0 copied))
+                       (downcase (nth 1 copied))
+                       (nth 2 copied))))))))
+
+(ert-deftest ghostel-test-module-compile-command-uses-helper-with-package-dir ()
+  "Interactive compilation delegates to the shared compile helper."
+  (let ((compiled-dir nil))
     (let ((comp-enable-subr-trampolines nil)
           (native-comp-enable-subr-trampolines nil))
       (cl-letf (((symbol-function 'locate-library)
                  (lambda (_) "C:/ghostel/ghostel.el"))
-                ((symbol-function 'compile)
-                 (lambda (command &optional comint)
-                   (setq compile-invocation (list command comint default-directory)))))
+                ((symbol-function 'ghostel--compile-module)
+                 (lambda (dir)
+                   (setq compiled-dir dir)
+                   t)))
         (ghostel-module-compile)
-        (should (equal "zig build -Doptimize=ReleaseFast"
-                       (nth 0 compile-invocation)))
-        (should (eq t (nth 1 compile-invocation)))
         (should (equal (downcase "C:/ghostel/")
-                       (downcase (nth 2 compile-invocation))))))))
+                       (downcase compiled-dir)))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: cursor follow toggle
@@ -1582,7 +1665,7 @@ cell, so the visual line width must equal the terminal column count."
      ghostel-test-module-platform-tag-windows
      ghostel-test-module-asset-name-windows
      ghostel-test-compile-module-invokes-zig-build
-     ghostel-test-module-compile-command-uses-zig-build
+     ghostel-test-module-compile-command-uses-helper-with-package-dir
      ghostel-test-module-version-match
      ghostel-test-module-version-mismatch
      ghostel-test-module-version-newer-than-minimum
