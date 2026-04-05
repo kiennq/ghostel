@@ -69,6 +69,13 @@ manually:
 - `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
 - `M-x ghostel-module-compile` — build from source via `zig build`
 
+Set `ghostel-module-dir` to keep downloaded modules in a custom
+directory, similar to vterm's configurable module directory.  When this
+option is set, Ghostel loads and downloads `ghostel-module` there and
+does not fall back to the package directory; source builds still run in
+the package checkout and then copy the finished module into the custom
+directory.
+
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
