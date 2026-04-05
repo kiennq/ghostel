@@ -1,58 +1,88 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Build ghostel and its vendored dependencies.
-#
-# This script:
-# 1. Builds libghostty-vt from the vendored ghostty submodule
-# 2. Copies bundled dependency libraries (simdutf, highway) to stable paths
-# 3. Builds the ghostel Emacs dynamic module
-set -e
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Check submodule
 if [ ! -f vendor/ghostty/build.zig ]; then
     echo "Initializing ghostty submodule..."
-    git submodule update --init vendor/ghostty
+    git -c url."https://github.com/".insteadOf=git@github.com: \
+        submodule update --init vendor/ghostty
 fi
 
-# Build libghostty-vt
+case "${OS:-$(uname -s)}" in
+    Windows_NT|MINGW*|MSYS*|CYGWIN*)
+        STATIC_LIB_EXT=".lib"
+        MODULE_EXT=".dll"
+        TARGET_ARGS=(-Dtarget=x86_64-windows-gnu)
+        ;;
+    Darwin)
+        STATIC_LIB_EXT=".a"
+        MODULE_EXT=".dylib"
+        TARGET_ARGS=()
+        ;;
+    *)
+        STATIC_LIB_EXT=".a"
+        MODULE_EXT=".so"
+        TARGET_ARGS=()
+        ;;
+esac
+
+ZIG_CMD="${ZIG:-zig}"
+
 echo "Building libghostty-vt..."
-(cd vendor/ghostty && zig build -Demit-lib-vt=true -Doptimize=ReleaseFast)
+(cd vendor/ghostty && "$ZIG_CMD" build "${TARGET_ARGS[@]}" -Demit-lib-vt=true -Doptimize=ReleaseFast)
 
-# Copy bundled C++ dependencies to stable paths.
-# These are built by ghostty's zig build into a cache directory with
-# hash-based names.  Search the local .zig-cache first, then fall back
-# to the global/local cache dirs (which CI tools like setup-zig may override).
 echo "Copying dependency libraries..."
-SEARCH_DIRS="vendor/ghostty/.zig-cache"
-[ -n "$ZIG_LOCAL_CACHE_DIR" ] && SEARCH_DIRS="$SEARCH_DIRS $ZIG_LOCAL_CACHE_DIR"
-[ -n "$ZIG_GLOBAL_CACHE_DIR" ] && SEARCH_DIRS="$SEARCH_DIRS $ZIG_GLOBAL_CACHE_DIR"
+SEARCH_DIRS=(
+    "vendor/ghostty/.zig-cache"
+)
+[ -n "${ZIG_LOCAL_CACHE_DIR:-}" ] && SEARCH_DIRS+=("${ZIG_LOCAL_CACHE_DIR}")
+[ -n "${ZIG_GLOBAL_CACHE_DIR:-}" ] && SEARCH_DIRS+=("${ZIG_GLOBAL_CACHE_DIR}")
 
-SIMDUTF=""
-HIGHWAY=""
-for dir in $SEARCH_DIRS; do
-    [ -d "$dir" ] || continue
-    [ -z "$SIMDUTF" ] && SIMDUTF=$(find "$dir" -name "libsimdutf.a" -print -quit 2>/dev/null)
-    [ -z "$HIGHWAY" ] && HIGHWAY=$(find "$dir" -name "libhighway.a" -print -quit 2>/dev/null)
-done
+find_static_lib() {
+    local base="$1"
+    local dir
+    local matches=()
+    for dir in "${SEARCH_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r match; do
+            matches+=("$match")
+        done < <(find "$dir" \( -name "${base}${STATIC_LIB_EXT}" -o -name "lib${base}.a" \) -print 2>/dev/null)
+    done
+
+    if [ "${#matches[@]}" -eq 0 ]; then
+        return 1
+    fi
+
+    ls -1t -- "${matches[@]}" | head -n 1
+}
+
+copy_static_lib() {
+    local source="$1"
+    local dest_base="$2"
+    local dest="vendor/ghostty/zig-out/lib/${dest_base}${STATIC_LIB_EXT}"
+    cp "$source" "$dest"
+    echo "  ${dest_base}${STATIC_LIB_EXT} <- $source"
+}
+
+SIMDUTF="$(find_static_lib simdutf || true)"
+HIGHWAY="$(find_static_lib highway || true)"
 
 if [ -z "$SIMDUTF" ]; then
-    echo "Error: could not find libsimdutf.a in vendor/ghostty/.zig-cache"
+    echo "Error: could not find simdutf static library"
     exit 1
 fi
 if [ -z "$HIGHWAY" ]; then
-    echo "Error: could not find libhighway.a in vendor/ghostty/.zig-cache"
+    echo "Error: could not find highway static library"
     exit 1
 fi
 
-cp "$SIMDUTF" vendor/ghostty/zig-out/lib/libsimdutf.a
-cp "$HIGHWAY" vendor/ghostty/zig-out/lib/libhighway.a
-echo "  libsimdutf.a <- $SIMDUTF"
-echo "  libhighway.a <- $HIGHWAY"
+copy_static_lib "$SIMDUTF" "simdutf"
+copy_static_lib "$HIGHWAY" "highway"
 
-# Build ghostel module
 echo "Building ghostel module..."
-zig build -Doptimize=ReleaseFast
+"$ZIG_CMD" build "${TARGET_ARGS[@]}" -Doptimize=ReleaseFast
 
-echo "Done! ghostel-module$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or ".so")' 2>/dev/null || echo '.dylib') is ready."
+echo "Done! ghostel-module${MODULE_EXT} is ready."
 echo "Load in Emacs with: (require 'ghostel)"

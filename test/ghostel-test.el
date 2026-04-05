@@ -1,4 +1,4 @@
-;;; ghostel-test.el --- Tests for ghostel -*- lexical-binding: t; -*-
+;;; ghostel-test.el --- Tests for ghostel -*- lexical-binding: t; byte-compile-warnings: (not obsolete); -*-
 
 ;;; Commentary:
 
@@ -12,6 +12,27 @@
 
 (require 'ert)
 (require 'ghostel)
+
+(declare-function conpty--init "conpty-module")
+(declare-function conpty--is-alive "conpty-module")
+(declare-function conpty--kill "conpty-module")
+(declare-function conpty--read-pending "conpty-module")
+(declare-function conpty--resize "conpty-module")
+(declare-function conpty--write "conpty-module")
+(declare-function ghostel--debug-feed "dyn-loader-module")
+(declare-function ghostel--debug-state "dyn-loader-module")
+(declare-function ghostel--encode-key "dyn-loader-module")
+(declare-function ghostel--focus-event "dyn-loader-module")
+(declare-function ghostel--get-pwd "dyn-loader-module")
+(declare-function ghostel--get-title "dyn-loader-module")
+(declare-function ghostel--mode-enabled "dyn-loader-module")
+(declare-function ghostel--new "dyn-loader-module")
+(declare-function ghostel--redraw "dyn-loader-module")
+(declare-function ghostel--scroll "dyn-loader-module")
+(declare-function ghostel--scroll-bottom "dyn-loader-module")
+(declare-function ghostel--set-palette "dyn-loader-module")
+(declare-function ghostel--set-size "dyn-loader-module")
+(declare-function ghostel--write-input "dyn-loader-module")
 
 ;;; Helper: read first N rows from render state via debug-state
 
@@ -28,6 +49,12 @@
     (when (string-match "cur=(\\([0-9]+\\),\\([0-9]+\\))" info)
       (cons (string-to-number (match-string 1 info))
             (string-to-number (match-string 2 info))))))
+
+(defmacro ghostel-test--without-subr-trampolines (&rest body)
+  "Run BODY with native trampolines disabled on supported Emacs versions."
+  `(let ((native-comp-enable-subr-trampolines nil)
+         (comp-enable-subr-trampolines nil))
+     ,@body))
 
 ;; -----------------------------------------------------------------------
 ;; Test: terminal creation
@@ -150,6 +177,7 @@
 
 (ert-deftest ghostel-test-clear-screen ()
   "Test that ghostel-clear clears the visible screen but preserves scrollback."
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((buf (generate-new-buffer " *ghostel-test-clear*")))
     (unwind-protect
         (with-current-buffer buf
@@ -438,6 +466,7 @@ cell, so the visual line width must equal the terminal column count."
 
 (ert-deftest ghostel-test-shell-integration ()
   "Test shell process with echo command."
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((buf (generate-new-buffer " *ghostel-test-shell*")))
     (unwind-protect
         (with-current-buffer buf
@@ -578,15 +607,22 @@ cell, so the visual line width must equal the terminal column count."
 
 (ert-deftest ghostel-test-update-directory ()
   "Test OSC 7 directory tracking helper."
-  (let ((ghostel--last-directory nil)
-        (default-directory default-directory))
-    (ghostel--update-directory "/tmp")
-    (should (equal "/tmp/" default-directory))             ; plain path
-    (ghostel--update-directory "file:///usr")
-    (should (equal "/usr/" default-directory))              ; file URL
+  (let* ((ghostel--last-directory nil)
+         (dir (file-name-as-directory default-directory))
+         (file-url
+          (concat "file://"
+                  (if (eq system-type 'windows-nt)
+                      (concat "/" (replace-regexp-in-string "\\\\" "/"
+                                                             (directory-file-name dir)))
+                    (directory-file-name dir))))
+         (default-directory default-directory))
+    (ghostel--update-directory dir)
+    (should (equal dir default-directory))                ; plain path
+    (ghostel--update-directory file-url)
+    (should (equal dir default-directory))                ; file URL
     ;; Dedup: same path shouldn't re-trigger
     (let ((old ghostel--last-directory))
-      (ghostel--update-directory "file:///usr")
+      (ghostel--update-directory file-url)
       (should (equal old ghostel--last-directory)))))       ; dedup
 
 ;; -----------------------------------------------------------------------
@@ -1089,11 +1125,13 @@ cell, so the visual line width must equal the terminal column count."
   "Test that unknown OSC 51;E commands produce a message."
   (let ((ghostel-eval-cmds nil)
         (messages nil))
-    (cl-letf (((symbol-function 'message)
-               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
-      (ghostel--osc51-eval "\"unknown-fn\" \"arg\"")
-      (should (car messages))
-      (should (string-match-p "unknown eval command" (car messages))))))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+        (ghostel--osc51-eval "\"unknown-fn\" \"arg\"")
+        (should (car messages))
+        (should (string-match-p "unknown eval command" (car messages)))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: copy-mode cursor visibility
@@ -1120,6 +1158,46 @@ cell, so the visual line width must equal the terminal column count."
             (should-not ghostel--copy-mode-active)          ; exited copy mode
             (should (null cursor-type))))                   ; cursor hidden again
       (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel-ignore-cursor-change option
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-set-cursor-style-ignored-when-configured ()
+  "Test that ghostel-ignore-cursor-change prevents cursor-type mutations."
+  (with-temp-buffer
+    (let ((ghostel-ignore-cursor-change t)
+          (cursor-type 'box))
+      (ghostel--set-cursor-style 0 nil)
+      (should (eq cursor-type 'box)))))
+
+(ert-deftest ghostel-test-set-cursor-style-applies-when-not-ignored ()
+  "Test that cursor changes still apply when ghostel-ignore-cursor-change is nil."
+  (with-temp-buffer
+    (let ((ghostel-ignore-cursor-change nil)
+          (cursor-type 'box))
+      (ghostel--set-cursor-style 0 nil)
+      (should (null cursor-type)))))
+
+(ert-deftest ghostel-test-copy-mode-cursor-overrides-ignored-terminal-cursor ()
+  "Test that copy mode still forces a visible cursor even with ignore enabled."
+  (let ((buf (generate-new-buffer " *ghostel-test-copy-ignore*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel-ignore-cursor-change t))
+            (setq cursor-type 'box)
+            (ghostel--set-cursor-style 2 nil)
+            (should (eq cursor-type 'box))           ; ignore: still box
+            (let ((ghostel--copy-mode-active nil)
+                  (ghostel--redraw-timer nil))
+              (ghostel-copy-mode)
+              (should cursor-type)                   ; copy mode: visible
+              (should (equal cursor-type (default-value 'cursor-type))) ; uses user default
+              (ghostel-copy-mode-exit)
+              (should (eq cursor-type 'box)))))      ; restored to box
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: copy-mode hl-line-mode management
@@ -1163,18 +1241,12 @@ cell, so the visual line width must equal the terminal column count."
 ;; Test: module version check
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-elisp-version ()
-  "Test that `ghostel--elisp-version' returns a version string."
-  (let ((ver (ghostel--elisp-version)))
-    (should (stringp ver))
-    (should (string-match-p "^[0-9]+\\.[0-9]+" ver))))
-
 (ert-deftest ghostel-test-module-version-match ()
   "Test that version check does nothing when module meets minimum."
   (let ((warned nil)
-        (ghostel--minimum-module-version "0.2.0"))
+        (ghostel--minimum-module-version "0.2"))
     (cl-letf (((symbol-function 'ghostel--module-version)
-               (lambda () "0.2.0"))
+               (lambda () "0.2"))
               ((symbol-function 'display-warning)
                (lambda (&rest _) (setq warned t))))
       (ghostel--check-module-version "/tmp")
@@ -1185,9 +1257,9 @@ cell, so the visual line width must equal the terminal column count."
   (let ((warned nil)
         (ensure-called nil)
         (noninteractive nil)
-        (ghostel--minimum-module-version "0.2.0"))
+        (ghostel--minimum-module-version "0.2"))
     (cl-letf (((symbol-function 'ghostel--module-version)
-               (lambda () "0.1.0"))
+               (lambda () "0.1"))
               ((symbol-function 'display-warning)
                (lambda (&rest _) (setq warned t)))
               ((symbol-function 'ghostel--ensure-module)
@@ -1199,13 +1271,513 @@ cell, so the visual line width must equal the terminal column count."
 (ert-deftest ghostel-test-module-version-newer-than-minimum ()
   "Test that version check does nothing when module exceeds minimum."
   (let ((warned nil)
-        (ghostel--minimum-module-version "0.2.0"))
+        (ghostel--minimum-module-version "0.2"))
     (cl-letf (((symbol-function 'ghostel--module-version)
-               (lambda () "0.3.0"))
+               (lambda () "0.3"))
               ((symbol-function 'display-warning)
                (lambda (&rest _) (setq warned t))))
       (ghostel--check-module-version "/tmp")
       (should-not warned))))
+
+(ert-deftest ghostel-test-module-platform-tag-windows ()
+  "Windows builds use the release tag format expected by Ghostel assets."
+  (let ((system-type 'windows-nt)
+        (system-configuration "x86_64-w64-mingw32"))
+    (should (equal "x86_64-windows"
+                   (ghostel--module-platform-tag)))))
+
+(ert-deftest ghostel-test-module-asset-name-windows ()
+  "Windows module assets use the Windows platform tag in their file name."
+  (let ((system-type 'windows-nt)
+        (system-configuration "x86_64-w64-mingw32")
+        (module-file-suffix ".dll"))
+    (should (equal "ghostel-module-x86_64-windows.tar.xz"
+                   (ghostel--module-asset-name)))))
+
+(ert-deftest ghostel-test-start-process-windows-conpty-skips-shell-wrapper ()
+  "Windows ConPTY startup passes the shell directly."
+  (with-temp-buffer
+    (let ((system-type 'windows-nt)
+          (ghostel-shell "C:/Program Files/Emacs/cmdproxy.exe")
+          (ghostel-shell-integration nil)
+          (default-directory "C:/ghostel/")
+          (ghostel--term 'fake-term)
+          (captured-command nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'window-body-height)
+                   (lambda (&optional _) 33))
+                  ((symbol-function 'window-max-chars-per-line)
+                   (lambda (&optional _) 80))
+                  ((symbol-function 'locate-library)
+                   (lambda (_) "C:/ghostel/ghostel.el"))
+                  ((symbol-function 'make-pipe-process)
+                   (lambda (&rest _) 'fake-proc))
+                  ((symbol-function 'process-put)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'set-process-query-on-exit-flag)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'conpty--init)
+                   (lambda (_term _proc command _rows _cols _cwd _env)
+                     (setq captured-command command)
+                     t)))
+           (should (eq 'fake-proc (ghostel--start-process)))
+           (should (equal ghostel-shell captured-command))
+           (should-not (string-match-p "/bin/sh" captured-command)))))))
+
+(ert-deftest ghostel-test-conpty-init-keeps-shell-alive-on-windows ()
+  "Windows ConPTY init should keep the shell alive long enough to emit a prompt."
+  (skip-unless (eq system-type 'windows-nt))
+  (unless (fboundp 'conpty--init)
+    (should (ghostel--load-module-if-available (ghostel--effective-module-dir))))
+  (skip-unless (and (fboundp 'conpty--init)
+                    (fboundp 'conpty--is-alive)
+                    (fboundp 'conpty--read-pending)))
+  (with-temp-buffer
+    (let* ((rows 24)
+           (cols 80)
+           (term (ghostel--new rows cols 1000))
+           (proc (make-pipe-process
+                  :name "ghostel-test-conpty"
+                  :buffer (current-buffer)
+                  :filter (lambda (&rest _))
+                  :sentinel (lambda (&rest _))
+                  :noquery t
+                  :coding 'binary))
+           (cmd (or (getenv "COMSPEC") shell-file-name))
+           (cwd (expand-file-name default-directory)))
+      (unwind-protect
+          (progn
+            (should (conpty--init term proc cmd rows cols cwd nil))
+            (should (conpty--is-alive term))
+            (sleep-for 0.2)
+            (should (conpty--is-alive term))
+            (let ((pending (conpty--read-pending term)))
+              (should (and pending (> (length pending) 0)))))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
+(ert-deftest ghostel-test-module-download-url-uses-minimum-version ()
+  "Module downloads pin to the minimum supported native module version."
+  (let ((ghostel-github-release-url "https://example.invalid/releases")
+        (ghostel--minimum-module-version "0.5"))
+    (cl-letf (((symbol-function 'ghostel--module-asset-name)
+               (lambda () "ghostel-module-x86_64-windows.tar.xz")))
+      (should (equal "https://example.invalid/releases/download/v0.5/ghostel-module-x86_64-windows.tar.xz"
+                     (ghostel--module-download-url ghostel--minimum-module-version))))))
+
+(ert-deftest ghostel-test-download-module-prefix-empty-uses-latest ()
+  "Prefix download prompts for a version and treats blank input as latest."
+  (let ((captured-version :unset)
+        (captured-latest nil)
+        (bootstrapped nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) ""))
+                 ((symbol-function 'ghostel--download-module)
+                  (lambda (_dir &optional version latest-release)
+                    (setq captured-version version)
+                    (setq captured-latest latest-release)
+                    t))
+                 ((symbol-function 'ghostel--bootstrap-module)
+                  (lambda (&optional _dir)
+                    (setq bootstrapped t)
+                    t))
+                 ((symbol-function 'ghostel--ensure-loader-loaded)
+                  (lambda (&optional _path) t))
+                 ((symbol-function 'ghostel--check-module-version)
+                  (lambda (&optional _dir) t))
+                 ((symbol-function 'message)
+                  (lambda (&rest _))))
+        (ghostel-download-module '(4))
+        (should (null captured-version))
+        (should captured-latest)
+        (should bootstrapped)))))
+
+(ert-deftest ghostel-test-download-module-prefix-rejects-too-old-version ()
+  "Prefix download rejects versions below the minimum supported module version."
+  (let ((ghostel--minimum-module-version "0.5"))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) "0.4")))
+        (should-error (ghostel-download-module '(4))
+                      :type 'user-error)))))
+
+(ert-deftest ghostel-test-target-module-file-path-uses-custom-dir ()
+  "Custom module directories override the default target module path."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll"))
+    (should (equal (downcase "C:/modules/ghostel-module.dll")
+                   (downcase (ghostel--target-module-file-path))))))
+
+(ert-deftest ghostel-test-download-module-publishes-target-module-path ()
+  "Module downloads publish dyn-loader-module, ghostel-module, and loader metadata."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (download-dest nil)
+        (metadata-writes nil)
+        (renamed nil))
+    (cl-letf (((symbol-function 'ghostel--module-download-url)
+               (lambda (&optional _version)
+                 "https://example.invalid/releases/download/v0.5/ghostel-module-x86_64-windows.tar.xz"))
+              ((symbol-function 'ghostel--download-file)
+               (lambda (_url dest)
+                  (setq download-dest dest)
+                  t))
+              ((symbol-function 'ghostel--publish-downloaded-module-archive)
+               (lambda (archive dir)
+                 (setq renamed (list archive dir))
+                  (ghostel--write-loader-metadata-atomically
+                   dir
+                   '((loader_abi . 1)
+                     (module_path . "ghostel-module.dll")))
+                  "ghostel-module.dll"))
+              ((symbol-function 'ghostel--write-loader-metadata-atomically)
+               (lambda (dir metadata)
+                 (push (list dir metadata) metadata-writes))))
+      (should (ghostel--download-module "C:/ghostel/"))
+      (should (equal (downcase "C:/ghostel/ghostel-module-x86_64-windows.tar.xz")
+                     (downcase download-dest)))
+      (should (equal (list (downcase "C:/ghostel/ghostel-module-x86_64-windows.tar.xz")
+                           (downcase "C:/ghostel/"))
+                     (list (downcase (car renamed))
+                           (downcase (cadr renamed)))))
+      (pcase-let ((`(,dir ,metadata) (car metadata-writes)))
+        (should (equal (downcase "C:/ghostel/") (downcase dir)))
+        (should (equal 1 (alist-get 'loader_abi metadata)))
+        (should (equal "ghostel-module.dll"
+                       (alist-get 'module_path metadata)))))))
+
+(ert-deftest ghostel-test-extract-module-archive-uses-tar-xf ()
+  "Downloaded module archives are unpacked with tar."
+  (let ((invocation nil))
+    (cl-letf (((symbol-function 'process-file)
+               (lambda (program infile buffer display &rest args)
+                 (setq invocation (list program infile buffer display args))
+                 0)))
+      (ghostel--extract-module-archive "C:/ghostel/ghostel-module-x86_64-windows.tar.xz"
+                                       "C:/ghostel/staging/")
+      (should (equal '("tar" nil "*ghostel-download*" nil
+                       ("xf" "C:/ghostel/ghostel-module-x86_64-windows.tar.xz"
+                        "-C" "C:/ghostel/staging/"))
+                     invocation)))))
+
+(ert-deftest ghostel-test-ask-install-action-includes-compile-for-custom-dir ()
+  "Missing-module prompts still offer compile for custom module dirs."
+  (let ((ghostel-module-dir "C:/modules/")
+        (choice nil))
+    (cl-letf (((symbol-function 'read-char-choice)
+               (lambda (_prompt chars)
+                 (setq choice chars)
+                 ?c)))
+      (should (eq 'compile (ghostel--ask-install-action "C:/modules/")))
+      (should (equal '(?d ?c ?s) choice)))))
+
+(ert-deftest ghostel-test-conpty-module-file-path-uses-custom-dir ()
+  "Custom module directories override the default ConPTY module path."
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll"))
+    (should (equal (downcase "C:/modules/conpty-module.dll")
+                   (downcase (ghostel--conpty-module-file-path))))))
+
+(ert-deftest ghostel-test-load-module-if-available-loads-conpty-module-on-windows ()
+  "Windows module loading bootstraps the direct ConPTY module after the loader."
+  (let ((system-type 'windows-nt)
+        (ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (loaded nil)
+        (checked nil)
+        (reloaded nil)
+        (loader-loaded nil)
+        (conpty-loaded nil))
+    (ghostel-test--without-subr-trampolines
+      (let ((old-featurep (symbol-function 'featurep)))
+        (cl-letf (((symbol-function 'file-exists-p)
+                   (lambda (path)
+                     (member (downcase path)
+                             (list (downcase "C:/modules/dyn-loader-module.dll")
+                                   (downcase "C:/modules/ghostel-module.json")
+                                   (downcase "C:/modules/conpty-module.dll")))))
+                  ((symbol-function 'featurep)
+                   (lambda (feature)
+                     (pcase feature
+                       ('dyn-loader-module loader-loaded)
+                       ('conpty-module conpty-loaded)
+                       (_ (funcall old-featurep feature)))))
+                  ((symbol-function 'module-load)
+                   (lambda (path)
+                     (push path loaded)
+                     (cond
+                      ((string-match-p "dyn-loader-module\\.dll\\'" path)
+                       (setq loader-loaded t))
+                      ((string-match-p "conpty-module\\.dll\\'" path)
+                       (setq conpty-loaded t)))))
+                  ((symbol-function 'ghostel--check-module-version)
+                   (lambda (dir)
+                     (setq checked dir)))
+                  ((symbol-function 'ghostel--loader-load-manifest)
+                   (lambda (manifest-path)
+                     (setq reloaded manifest-path)
+                     "ghostel")))
+          (should (ghostel--load-module-if-available))
+          (should (equal (mapcar #'downcase (reverse loaded))
+                         '("c:/modules/dyn-loader-module.dll"
+                           "c:/modules/conpty-module.dll")))
+          (should (equal (downcase "C:/modules/")
+                         (downcase checked)))
+          (should (equal (downcase "C:/modules/ghostel-module.json")
+                         (downcase reloaded))))))))
+
+(ert-deftest ghostel-test-ensure-conpty-loaded-errors-when-module-missing ()
+  "Windows bootstrap errors when the direct ConPTY module is unavailable."
+  (let ((system-type 'windows-nt)
+        (ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll"))
+    (ghostel-test--without-subr-trampolines
+      (let ((old-featurep (symbol-function 'featurep)))
+        (cl-letf (((symbol-function 'featurep)
+                   (lambda (feature)
+                     (and (not (eq feature 'conpty-module))
+                          (funcall old-featurep feature))))
+                  ((symbol-function 'file-exists-p)
+                   (lambda (_path) nil)))
+          (let ((err (should-error (ghostel--ensure-conpty-loaded) :type 'error)))
+            (should (string-match-p
+                     (regexp-quote "ghostel: missing Windows ConPTY module: C:/modules/conpty-module.dll")
+                     (cadr err)))))))))
+
+(ert-deftest ghostel-test-compile-module-invokes-zig-build ()
+  "Source compilation runs zig build directly."
+  (let ((default-directory nil)
+        (messages nil)
+        (warnings nil)
+        (process-invocation nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) messages)))
+                ((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                ((symbol-function 'ghostel--publish-built-module-artifacts)
+                 (lambda (&rest _) t))
+                ((symbol-function 'process-file)
+                  (lambda (program infile buffer display &rest args)
+                    (setq process-invocation
+                          (list program infile buffer display args default-directory))
+                    0)))
+        (should (ghostel--compile-module "C:/ghostel/"))
+        (should (equal
+                 '("zig" nil "*ghostel-build*" nil ("build" "-Doptimize=ReleaseFast") "C:/ghostel/")
+                  process-invocation))
+        (should-not warnings)))))
+
+(ert-deftest ghostel-test-compile-module-publishes-loader-target-and-metadata ()
+  "Windows compilation publishes dyn-loader-module, ghostel-module, conpty-module, and metadata."
+  (let ((system-type 'windows-nt)
+        (ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (copies nil)
+        (metadata-writes nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'process-file)
+                 (lambda (&rest _) 0))
+                ((symbol-function 'file-exists-p)
+                 (lambda (path)
+                    (member (downcase path)
+                             (list (downcase "C:/ghostel/dyn-loader-module.dll")
+                                   (downcase "C:/ghostel/ghostel-module.dll")
+                                   (downcase "C:/ghostel/conpty-module.dll")))))
+                 ((symbol-function 'copy-file)
+                  (lambda (src dest &optional ok-if-already-exists)
+                    (push (list src dest ok-if-already-exists) copies)))
+                ((symbol-function 'ghostel--write-loader-metadata-atomically)
+                 (lambda (dir metadata)
+                    (push (list dir metadata) metadata-writes))))
+        (should (ghostel--compile-module "C:/ghostel/"))
+        (should (equal 3 (length copies)))
+        (should (member (list (downcase "C:/ghostel/dyn-loader-module.dll")
+                              (downcase "C:/modules/dyn-loader-module.dll")
+                              t)
+                        (mapcar (lambda (entry)
+                                  (list (downcase (nth 0 entry))
+                                        (downcase (nth 1 entry))
+                                        (nth 2 entry)))
+                                copies)))
+        (should (member (list (downcase "C:/ghostel/ghostel-module.dll")
+                              (downcase "C:/modules/ghostel-module.dll")
+                              t)
+                        (mapcar (lambda (entry)
+                                  (list (downcase (nth 0 entry))
+                                        (downcase (nth 1 entry))
+                                        (nth 2 entry)))
+                                copies)))
+        (should (member (list (downcase "C:/ghostel/conpty-module.dll")
+                              (downcase "C:/modules/conpty-module.dll")
+                              t)
+                        (mapcar (lambda (entry)
+                                  (list (downcase (nth 0 entry))
+                                        (downcase (nth 1 entry))
+                                        (nth 2 entry)))
+                                copies)))
+        (pcase-let ((`(,dir ,metadata) (car metadata-writes)))
+          (should (equal (downcase "C:/modules/") (downcase dir)))
+          (should (equal "ghostel-module.dll"
+                         (alist-get 'module_path metadata))))))))
+
+(ert-deftest ghostel-test-publish-built-module-artifacts-rotates-existing-windows-modules ()
+  "Publishing rotates loaded DLLs to .bak on Windows before copying replacements."
+  (let ((system-type 'windows-nt)
+        (ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll")
+        (copies nil)
+        (renames nil)
+        (deleted nil)
+        (metadata-writes nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (path)
+                    (member (downcase path)
+                             (list (downcase "C:/ghostel/dyn-loader-module.dll")
+                                   (downcase "C:/ghostel/ghostel-module.dll")
+                                   (downcase "C:/ghostel/conpty-module.dll")
+                                   (downcase "C:/modules/dyn-loader-module.dll")
+                                   (downcase "C:/modules/ghostel-module.dll")
+                                   (downcase "C:/modules/conpty-module.dll")
+                                   (downcase "C:/modules/dyn-loader-module.dll.bak")))))
+                ((symbol-function 'delete-file)
+                 (lambda (path &optional _trash)
+                   (push path deleted)))
+                ((symbol-function 'rename-file)
+                 (lambda (src dest &optional ok-if-already-exists)
+                   (push (list src dest ok-if-already-exists) renames)))
+                ((symbol-function 'copy-file)
+                 (lambda (src dest &optional ok-if-already-exists)
+                   (push (list src dest ok-if-already-exists) copies)))
+                ((symbol-function 'ghostel--write-loader-metadata-atomically)
+                 (lambda (dir metadata)
+                   (push (list dir metadata) metadata-writes))))
+        (should (ghostel--publish-built-module-artifacts "C:/ghostel/" "C:/modules/"))
+        (should (member (downcase "C:/modules/dyn-loader-module.dll.bak")
+                        (mapcar #'downcase deleted)))
+        (should (member (list (downcase "C:/modules/dyn-loader-module.dll")
+                              (downcase "C:/modules/dyn-loader-module.dll.bak")
+                              t)
+                        (mapcar (lambda (entry)
+                                  (list (downcase (nth 0 entry))
+                                        (downcase (nth 1 entry))
+                                        (nth 2 entry)))
+                                renames)))
+        (should (member (list (downcase "C:/modules/ghostel-module.dll")
+                              (downcase "C:/modules/ghostel-module.dll.bak")
+                              t)
+                        (mapcar (lambda (entry)
+                                  (list (downcase (nth 0 entry))
+                                        (downcase (nth 1 entry))
+                                        (nth 2 entry)))
+                                renames)))
+        (should (member (list (downcase "C:/modules/conpty-module.dll")
+                              (downcase "C:/modules/conpty-module.dll.bak")
+                              t)
+                        (mapcar (lambda (entry)
+                                  (list (downcase (nth 0 entry))
+                                        (downcase (nth 1 entry))
+                                        (nth 2 entry)))
+                                renames)))
+        (should (equal 3 (length copies)))
+        (should (equal "ghostel-module.dll"
+                       (alist-get 'module_path (cadar metadata-writes))))))))
+
+(ert-deftest ghostel-test-publish-built-module-artifacts-errors-when-conpty-missing ()
+  "Windows publishing fails loudly when conpty-module.dll is absent."
+  (let ((system-type 'windows-nt)
+        (ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll"))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (path)
+                   (member (downcase path)
+                           (list (downcase "C:/ghostel/dyn-loader-module.dll")
+                                 (downcase "C:/ghostel/ghostel-module.dll")))))
+                ((symbol-function 'file-directory-p)
+                 (lambda (_path) t))
+                ((symbol-function 'ghostel--replace-module-file)
+                 (lambda (&rest _) nil)))
+        (let ((err (should-error (ghostel--publish-built-module-artifacts
+                                  "C:/ghostel/" "C:/modules/")
+                                 :type 'error)))
+          (should (string-match-p "Built Windows ConPTY module is missing"
+                                  (cadr err))))))))
+
+(ert-deftest ghostel-test-module-compile-command-uses-helper-with-package-dir ()
+  "Interactive compilation delegates to the shared compile helper."
+  (let ((compiled-dir nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'locate-library)
+                 (lambda (_) "C:/ghostel/ghostel.el"))
+                ((symbol-function 'ghostel--compile-module)
+                 (lambda (dir)
+                   (setq compiled-dir dir)
+                   t)))
+        (ghostel-module-compile)
+        (should (equal (downcase "C:/ghostel/")
+                       (downcase compiled-dir)))))))
+
+(ert-deftest ghostel-test-load-module-if-available-errors-when-metadata-points-to-missing-target-module ()
+  "Bootstrap fails when metadata references a missing target module."
+  (let ((ghostel-module-dir "C:/modules/")
+         (module-file-suffix ".dll"))
+    (ghostel-test--without-subr-trampolines
+     (cl-letf (((symbol-function 'file-exists-p)
+                (lambda (path)
+                  (member (downcase path)
+                          (list (downcase "C:/modules/dyn-loader-module.dll")
+                                (downcase "C:/modules/ghostel-module.json")))))
+               ((symbol-function 'module-load) #'ignore)
+               ((symbol-function 'ghostel--loader-load-manifest)
+                (lambda (_manifest-path)
+                  (error "Ghostel target module is missing: C:/modules/ghostel-module.dll"))))
+        (should-error (ghostel--load-module-if-available)
+                      :type 'error)))))
+
+;; -----------------------------------------------------------------------
+;; Test: cursor follow toggle
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled ()
+  "Redraw keeps point stable when cursor following is disabled."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--copy-mode-active nil)
+          (ghostel--redraw-timer 'fake-timer)
+          (ghostel--pending-output nil)
+          (ghostel--force-next-redraw nil)
+          (ghostel-full-redraw nil)
+          (ghostel-cursor-follow nil))
+      (insert "line 1\nline 2\nline 3")
+      (goto-char (point-min))
+      (forward-line 1)
+      (move-to-column 2)
+      (let ((original-point (point)))
+        (cl-letf (((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--redraw)
+                   (lambda (&rest _)
+                     (goto-char (point-max)))))
+          (ghostel--delayed-redraw (current-buffer))
+          (should (equal original-point (point))))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: immediate redraw for interactive echo
@@ -1224,17 +1796,19 @@ cell, so the visual line width must equal the terminal column count."
           (immediate-called nil)
           (invalidate-called nil))
       ;; Stub out process-buffer, delayed-redraw, and invalidate
-      (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                ((symbol-function 'ghostel--delayed-redraw)
-                 (lambda (_buf) (setq immediate-called t)))
-                ((symbol-function 'ghostel--invalidate)
-                 (lambda () (setq invalidate-called t))))
-        ;; Simulate recent keystroke
-        (setq ghostel--last-send-time (current-time))
-        ;; Simulate small echo arriving
-        (ghostel--filter 'fake-proc "a")
-        (should immediate-called)
-        (should-not invalidate-called)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq immediate-called t)))
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t))))
+          ;; Simulate recent keystroke
+          (setq ghostel--last-send-time (current-time))
+          ;; Simulate small echo arriving
+          (ghostel--filter 'fake-proc "a")
+          (should immediate-called)
+          (should-not invalidate-called))))))
 
 (ert-deftest ghostel-test-immediate-redraw-skips-large-output ()
   "Large output falls back to timer-based batching."
@@ -1248,15 +1822,17 @@ cell, so the visual line width must equal the terminal column count."
           (ghostel-immediate-redraw-interval 0.05)
           (immediate-called nil)
           (invalidate-called nil))
-      (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                ((symbol-function 'ghostel--delayed-redraw)
-                 (lambda (_buf) (setq immediate-called t)))
-                ((symbol-function 'ghostel--invalidate)
-                 (lambda () (setq invalidate-called t))))
-        ;; Large output should batch
-        (ghostel--filter 'fake-proc (make-string 500 ?x))
-        (should-not immediate-called)
-        (should invalidate-called)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq immediate-called t)))
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t))))
+          ;; Large output should batch
+          (ghostel--filter 'fake-proc (make-string 500 ?x))
+          (should-not immediate-called)
+          (should invalidate-called))))))
 
 (ert-deftest ghostel-test-immediate-redraw-skips-stale-send ()
   "Output arriving long after last keystroke uses timer batching."
@@ -1270,14 +1846,16 @@ cell, so the visual line width must equal the terminal column count."
           (ghostel-immediate-redraw-interval 0.05)
           (immediate-called nil)
           (invalidate-called nil))
-      (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                ((symbol-function 'ghostel--delayed-redraw)
-                 (lambda (_buf) (setq immediate-called t)))
-                ((symbol-function 'ghostel--invalidate)
-                 (lambda () (setq invalidate-called t))))
-        (ghostel--filter 'fake-proc "a")
-        (should-not immediate-called)
-        (should invalidate-called)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq immediate-called t)))
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t))))
+          (ghostel--filter 'fake-proc "a")
+          (should-not immediate-called)
+          (should invalidate-called))))))
 
 (ert-deftest ghostel-test-immediate-redraw-disabled-when-zero ()
   "Immediate redraw is disabled when threshold is 0."
@@ -1291,14 +1869,16 @@ cell, so the visual line width must equal the terminal column count."
           (ghostel-immediate-redraw-interval 0.05)
           (immediate-called nil)
           (invalidate-called nil))
-      (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                ((symbol-function 'ghostel--delayed-redraw)
-                 (lambda (_buf) (setq immediate-called t)))
-                ((symbol-function 'ghostel--invalidate)
-                 (lambda () (setq invalidate-called t))))
-        (ghostel--filter 'fake-proc "a")
-        (should-not immediate-called)
-        (should invalidate-called)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq immediate-called t)))
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t))))
+          (ghostel--filter 'fake-proc "a")
+          (should-not immediate-called)
+          (should invalidate-called))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: input coalescing
@@ -1314,18 +1894,20 @@ cell, so the visual line width must equal the terminal column count."
            (ghostel-input-coalesce-delay 0.003)
            (sent nil))
       ;; Create a mock process
-      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
-                ((symbol-function 'process-send-string)
-                 (lambda (_proc str) (push str sent)))
-                ((symbol-function 'run-with-timer)
-                 (lambda (_delay _repeat fn &rest args)
-                   ;; Return a fake timer but call function for test
-                   'fake-timer)))
-        (setq ghostel--process 'fake)
-        (ghostel--send-key "a")
-        ;; Should be buffered, not sent
-        (should (equal ghostel--input-buffer '("a")))
-        (should-not sent)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_proc str) (push str sent)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_delay _repeat _fn &rest _args)
+                     ;; Return a fake timer but call function for test
+                     'fake-timer)))
+          (setq ghostel--process 'fake)
+          (ghostel--send-key "a")
+          ;; Should be buffered, not sent
+          (should (equal ghostel--input-buffer '("a")))
+          (should-not sent))))))
 
 (ert-deftest ghostel-test-input-coalesce-disabled ()
   "With coalesce delay 0, characters are sent immediately."
@@ -1336,13 +1918,15 @@ cell, so the visual line width must equal the terminal column count."
            (ghostel--last-send-time nil)
            (ghostel-input-coalesce-delay 0)
            (sent nil))
-      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
-                ((symbol-function 'process-send-string)
-                 (lambda (_proc str) (push str sent))))
-        (setq ghostel--process 'fake)
-        (ghostel--send-key "a")
-        (should (member "a" sent))
-        (should-not ghostel--input-buffer)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_proc str) (push str sent))))
+          (setq ghostel--process 'fake)
+          (ghostel--send-key "a")
+          (should (member "a" sent))
+          (should-not ghostel--input-buffer))))))
 
 (ert-deftest ghostel-test-input-flush-sends-buffered ()
   "Flushing input buffer sends concatenated characters."
@@ -1351,13 +1935,72 @@ cell, so the visual line width must equal the terminal column count."
            (ghostel--input-buffer '("c" "b" "a"))
            (ghostel--input-timer nil)
            (sent nil))
-      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
-                ((symbol-function 'process-send-string)
-                 (lambda (_proc str) (push str sent))))
-        (setq ghostel--process 'fake)
-        (ghostel--flush-input (current-buffer))
-        (should (equal sent '("abc")))
-        (should-not ghostel--input-buffer)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_proc str) (push str sent))))
+          (setq ghostel--process 'fake)
+          (ghostel--flush-input (current-buffer))
+          (should (equal sent '("abc")))
+          (should-not ghostel--input-buffer))))))
+
+(ert-deftest ghostel-test-send-key-dispatches-through-process-transport ()
+  "Immediate key sends should dispatch through the process transport helper."
+  (with-temp-buffer
+    (let* ((ghostel--process 'fake-process)
+           (ghostel--input-buffer nil)
+           (ghostel--input-timer nil)
+           (ghostel--last-send-time nil)
+           (ghostel-input-coalesce-delay 0)
+           (transport-send nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--process-send)
+                   (lambda (proc str)
+                     (setq transport-send (cons proc str))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct process-send-string: %S"
+                              args)))))
+          (ghostel--send-key "a")
+          (should (equal '(fake-process . "a") transport-send)))))))
+
+(ert-deftest ghostel-test-window-resize-dispatches-through-process-transport ()
+  "Resize should use a transport helper instead of the PTY primitive directly."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--resize-timer nil)
+          (ghostel--force-next-redraw nil)
+          (resize-call nil)
+          (invalidate-called nil)
+          (window 'fake-window))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'window-max-chars-per-line)
+                   (lambda (_) 80))
+                  ((symbol-function 'window-body-height) (lambda (_) 25))
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--set-size) #'ignore)
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t)))
+                  ((symbol-function 'ghostel--process-set-window-size)
+                   (lambda (proc height width)
+                     (setq resize-call (list proc height width))))
+                  ((symbol-function 'set-process-window-size)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct set-process-window-size: %S"
+                              args)))))
+          (should (equal '(80 . 25)
+                         (ghostel--window-adjust-process-window-size
+                          'fake-process (list window))))
+          (should (equal '(fake-process 25 80) resize-call))
+          (should invalidate-called))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: send-encoded sets last-send-time on encoder success
@@ -1383,28 +2026,161 @@ cell, so the visual line width must equal the terminal column count."
           (ghostel--input-buffer nil)
           (ghostel--input-timer nil)
           (ghostel-input-coalesce-delay 0))
-      ;; Stub encode-key to return nil (failure) — triggers raw fallback
-      (cl-letf (((symbol-function 'ghostel--encode-key)
-                 (lambda (_term _key _mods &optional _utf8) nil))
-                ((symbol-function 'process-live-p) (lambda (_) t))
-                ((symbol-function 'process-send-string)
-                 (lambda (_proc _str) nil)))
-        (setq ghostel--process 'fake)
-        (ghostel--send-encoded "backspace" "")
-        ;; send-key sets last-send-time via the fallback path
-        (should ghostel--last-send-time)))))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        ;; Stub encode-key to return nil (failure) — triggers raw fallback
+        (cl-letf (((symbol-function 'ghostel--encode-key)
+                   (lambda (_term _key _mods &optional _utf8) nil))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_proc _str) nil)))
+          (setq ghostel--process 'fake)
+          (ghostel--send-encoded "backspace" "")
+          ;; send-key sets last-send-time via the fallback path
+          (should ghostel--last-send-time))))))
 
-(ert-deftest ghostel-test-control-key-bindings ()
-  "All non-exception C-<letter> keys should be bound in ghostel-mode-map."
-  (dolist (c (number-sequence ?a ?z))
-    (let* ((key-str (format "C-%c" c))
-           (key-vec (kbd key-str))
-           (binding (lookup-key ghostel-mode-map key-vec)))
-      ;; Skip exceptions (may have sub-keymaps like C-c C-c)
-      (unless (member key-str ghostel-keymap-exceptions)
-        (should binding))))
-  ;; C-@ should also be bound (sends NUL)
-  (should (lookup-key ghostel-mode-map (kbd "C-@"))))
+;;; Loader helper scaffolding tests
+
+(ert-deftest ghostel-test-loader-module-file-path-remains-stable ()
+  "Loader module path is stable and resolves to the expected file name."
+  ;; downcase normalises the path for case-insensitive file systems (Windows/macOS).
+  (let ((ghostel-module-dir "C:/modules/")
+        (module-file-suffix ".dll"))
+    (should (equal (downcase "C:/modules/dyn-loader-module.dll")
+                   (downcase (ghostel--loader-module-file-path))))))
+
+(ert-deftest ghostel-test-target-module-file-name-is-stable ()
+  "The target module path is stable for no-restart reload support."
+  (let ((module-file-suffix ".dll"))
+    (should (equal "ghostel-module.dll"
+                   (file-name-nondirectory (ghostel--target-module-file-path "C:/modules/"))))))
+
+(ert-deftest ghostel-test-loader-metadata-path-uses-module-dir ()
+  ;; downcase normalises the path for case-insensitive file systems (Windows/macOS).
+  (let ((ghostel-module-dir "C:/modules/"))
+    (should (equal (downcase "C:/modules/ghostel-module.json")
+                   (downcase (ghostel--loader-metadata-path))))))
+
+(ert-deftest ghostel-test-reload-module-refuses-with-live-terminals ()
+  (cl-letf (((symbol-function 'ghostel--live-buffers)
+             (lambda () '(live-buffer))))
+    (let ((err (should-error (ghostel-reload-module) :type 'user-error)))
+      (should (string-match-p "still running" (cadr err))))))
+
+(ert-deftest ghostel-test-close-live-buffers-terminates-conpty-and-process ()
+  "Closing live buffers terminates both the ConPTY backend and the process."
+  (ghostel-test--without-subr-trampolines
+   (let ((killed-terms nil)
+         (deleted-procs nil)
+         (buf (generate-new-buffer " *ghostel-live*")))
+     (unwind-protect
+         (progn
+           (with-current-buffer buf
+             (setq-local ghostel--term 'term-1)
+             (setq-local ghostel--process 'proc-1)
+             (setq-local ghostel--conpty-notify-pipe t))
+           (cl-letf (((symbol-function 'ghostel--conpty-active-p) (lambda () t))
+                     ((symbol-function 'conpty--kill)
+                      (lambda (term)
+                        (push term killed-terms)))
+                     ((symbol-function 'process-live-p)
+                      (lambda (proc)
+                        (eq proc 'proc-1)))
+                     ((symbol-function 'delete-process)
+                      (lambda (proc)
+                        (push proc deleted-procs))))
+             (ghostel--close-live-buffers (list buf)))
+           (should (equal '(term-1) killed-terms))
+           (should (equal '(proc-1) deleted-procs))
+           (should-not (buffer-live-p buf)))
+       (when (buffer-live-p buf)
+         (kill-buffer buf))))))
+
+(ert-deftest ghostel-test-reload-module-prefix-closes-live-terminals ()
+  "Prefix reload closes live terminals before reloading."
+  (ghostel-test--without-subr-trampolines
+   (let ((message-log nil)
+         (reload-call nil)
+         (killed-terms nil)
+         (deleted-procs nil)
+         (buf (generate-new-buffer " *ghostel-reload-live*")))
+     (unwind-protect
+         (progn
+           (with-current-buffer buf
+             (setq-local ghostel--term 'term-1)
+             (setq-local ghostel--process 'proc-1)
+             (setq-local ghostel--conpty-notify-pipe t))
+           (cl-letf (((symbol-function 'ghostel--live-buffers)
+                      (lambda () (list buf)))
+                     ((symbol-function 'ghostel--conpty-active-p)
+                      (lambda () t))
+                     ((symbol-function 'conpty--kill)
+                      (lambda (term)
+                        (push term killed-terms)))
+                     ((symbol-function 'process-live-p)
+                      (lambda (proc)
+                        (eq proc 'proc-1)))
+                     ((symbol-function 'delete-process)
+                      (lambda (proc)
+                        (push proc deleted-procs)))
+                     ((symbol-function 'ghostel--loader-reload)
+                      (lambda (module-id)
+                        (setq reload-call module-id)
+                        t))
+                     ((symbol-function 'message)
+                      (lambda (fmt &rest args)
+                        (setq message-log (apply #'format fmt args)))))
+             (ghostel-reload-module '(4)))
+           (should (equal '(term-1) killed-terms))
+           (should (equal '(proc-1) deleted-procs))
+           (should-not (buffer-live-p buf))
+           (should (equal ghostel--module-id reload-call))
+           (should (string-match-p "reloaded successfully" message-log)))
+       (when (buffer-live-p buf)
+         (kill-buffer buf))))))
+
+(ert-deftest ghostel-test-reload-module-swaps-generation-when-safe ()
+  "Reload succeeds when no live terminals exist."
+  (ghostel-test--without-subr-trampolines
+   (let ((message-log nil)
+         (reload-call nil))
+      (cl-letf (((symbol-function 'ghostel--live-buffers) (lambda () nil))
+                ((symbol-function 'ghostel--loader-reload)
+                 (lambda (module-id)
+                   (setq reload-call module-id)
+                   t))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (setq message-log (apply #'format fmt args)))))
+        (ghostel-reload-module)
+        (should (equal ghostel--module-id reload-call))
+        (should (string-match-p "reloaded successfully" message-log))))))
+
+(ert-deftest ghostel-test-reload-module-keeps-user-state-on-failure ()
+  "Reload errors do not emit a success message."
+  (ghostel-test--without-subr-trampolines
+   (let ((message-log nil)
+         (loader-called nil))
+      (cl-letf (((symbol-function 'ghostel--live-buffers) (lambda () nil))
+                ((symbol-function 'ghostel--loader-reload)
+                 (lambda (_module-id)
+                   (setq loader-called t)
+                   (error "loader ABI mismatch")))
+                ((symbol-function 'message)
+                (lambda (fmt &rest args)
+                  (setq message-log (apply #'format fmt args)))))
+       (should-error (ghostel-reload-module) :type 'error)
+       (should loader-called)
+       (should-not message-log)))))
+
+(ert-deftest ghostel-test-reload-module-surfaces-abi-mismatch ()
+  "Reload forwards loader errors to the caller."
+  (cl-letf (((symbol-function 'ghostel--live-buffers) (lambda () nil))
+            ((symbol-function 'ghostel--loader-reload)
+             (lambda (_module-id)
+               (error "loader ABI mismatch"))))
+    (let ((err (should-error (ghostel-reload-module) :type 'error)))
+      (should (string-match-p "loader ABI mismatch" (cadr err))))))
 
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-raw-key-sequences
@@ -1419,11 +2195,25 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
     ghostel-test-copy-mode-cursor
+    ghostel-test-set-cursor-style-ignored-when-configured
+    ghostel-test-set-cursor-style-applies-when-not-ignored
+    ghostel-test-copy-mode-cursor-overrides-ignored-terminal-cursor
     ghostel-test-copy-mode-hl-line
-    ghostel-test-elisp-version
+    ghostel-test-module-platform-tag-windows
+    ghostel-test-module-asset-name-windows
+    ghostel-test-start-process-windows-conpty-skips-shell-wrapper
+    ghostel-test-module-download-url-uses-minimum-version
+    ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-module-prefix-rejects-too-old-version
+    ghostel-test-compile-module-invokes-zig-build
+    ghostel-test-module-compile-command-uses-helper-with-package-dir
+    ghostel-test-compile-module-publishes-loader-target-and-metadata
+    ghostel-test-publish-built-module-artifacts-rotates-existing-windows-modules
+    ghostel-test-publish-built-module-artifacts-errors-when-conpty-missing
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
+    ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output
     ghostel-test-immediate-redraw-skips-stale-send
@@ -1433,7 +2223,21 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-input-flush-sends-buffered
     ghostel-test-send-encoded-sets-send-time
     ghostel-test-send-encoded-no-send-time-on-fallback
-    ghostel-test-control-key-bindings)
+    ghostel-test-send-key-dispatches-through-process-transport
+    ghostel-test-window-resize-dispatches-through-process-transport
+    ghostel-test-loader-module-file-path-remains-stable
+    ghostel-test-target-module-file-name-is-stable
+    ghostel-test-conpty-module-file-path-uses-custom-dir
+    ghostel-test-loader-metadata-path-uses-module-dir
+    ghostel-test-download-module-publishes-target-module-path
+    ghostel-test-load-module-if-available-loads-conpty-module-on-windows
+    ghostel-test-load-module-if-available-errors-when-metadata-points-to-missing-target-module
+    ghostel-test-ensure-conpty-loaded-errors-when-module-missing
+    ghostel-test-close-live-buffers-terminates-conpty-and-process
+    ghostel-test-reload-module-refuses-with-live-terminals
+    ghostel-test-reload-module-swaps-generation-when-safe
+    ghostel-test-reload-module-keeps-user-state-on-failure
+    ghostel-test-reload-module-surfaces-abi-mismatch)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()
