@@ -245,6 +245,7 @@ const HyperlinkResult = struct {
 /// Scan the terminal for hyperlinks using the HTML formatter.
 /// Returns the number of hyperlink spans found.
 fn scanHyperlinks(
+    allocator: std.mem.Allocator,
     term: *Terminal,
     spans: []HyperlinkSpan,
     uri_buf: []u8,
@@ -267,10 +268,10 @@ fn scanHyperlinks(
         return parseHtmlHyperlinks(html_buf[0..out_len], spans, uri_buf);
     }
 
-    const heap_buf = std.heap.page_allocator.alloc(u8, 1024 * 1024) catch {
+    const heap_buf = allocator.alloc(u8, 1024 * 1024) catch {
         return .{ .count = 0, .uri_used = 0 };
     };
-    defer std.heap.page_allocator.free(heap_buf);
+    defer allocator.free(heap_buf);
     if (gt.c.ghostty_formatter_format_buf(formatter, heap_buf.ptr, heap_buf.len, &out_len) != gt.SUCCESS) {
         return .{ .count = 0, .uri_used = 0 };
     }
@@ -644,7 +645,7 @@ fn insertAndStyle(
 
 /// Redraw the terminal into the current Emacs buffer.
 /// When force_full is true, always erase and rebuild (matches Ghostty GPU behaviour).
-pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
+pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool, allocator: std.mem.Allocator) void {
     // Update render state from terminal
     if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
         return;
@@ -801,7 +802,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     if (dirty != gt.DIRTY_FALSE and has_hyperlinks) {
         var hl_spans: [128]HyperlinkSpan = undefined;
         var hl_uri_buf: [8192]u8 = undefined;
-        const hl = scanHyperlinks(term, &hl_spans, &hl_uri_buf);
+        const hl = scanHyperlinks(allocator, term, &hl_spans, &hl_uri_buf);
         if (hl.count > 0) {
             applyHyperlinks(env, &hl_spans, hl.count, &hl_uri_buf);
         }

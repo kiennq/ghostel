@@ -56,6 +56,7 @@ pub fn init(
     cols: u16,
     working_directory: []const u8,
     process_environment: emacs.Value,
+    allocator: std.mem.Allocator,
 ) !*State {
     if (!is_windows) return error.UnsupportedPlatform;
     if (!(try initApi())) return error.MissingConpty;
@@ -72,7 +73,7 @@ pub fn init(
     try createConpty(state, rows, cols);
     errdefer deinit(state);
 
-    try spawnShell(state, env, shell_command, working_directory, process_environment);
+    try spawnShell(state, env, shell_command, working_directory, process_environment, allocator);
 
     state.reader_thread = c.CreateThread(
         null,
@@ -233,15 +234,16 @@ fn spawnShell(
     shell_command: []const u8,
     working_directory: []const u8,
     process_environment: emacs.Value,
+    allocator: std.mem.Allocator,
 ) !void {
-    const command_line = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.c_allocator, shell_command);
-    defer std.heap.c_allocator.free(command_line);
+    const command_line = try std.unicode.utf8ToUtf16LeAllocZ(allocator, shell_command);
+    defer allocator.free(command_line);
 
-    const cwd = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.c_allocator, working_directory);
-    defer std.heap.c_allocator.free(cwd);
+    const cwd = try std.unicode.utf8ToUtf16LeAllocZ(allocator, working_directory);
+    defer allocator.free(cwd);
 
-    const env_block = try buildEnvironmentBlock(env, process_environment);
-    defer if (env_block) |blk| std.heap.c_allocator.free(blk);
+    const env_block = try buildEnvironmentBlock(allocator, env, process_environment);
+    defer if (env_block) |blk| allocator.free(blk);
 
     var attr_list_size: usize = 0;
     _ = c.InitializeProcThreadAttributeList(null, 1, 0, &attr_list_size);
@@ -290,30 +292,42 @@ fn spawnShell(
     _ = c.CloseHandle(pi.hThread);
 }
 
-fn buildEnvironmentBlock(env: emacs.Env, list: emacs.Value) !?[]u16 {
+fn buildEnvironmentBlock(allocator: std.mem.Allocator, env: emacs.Env, list: emacs.Value) !?[]u16 {
     if (!is_windows) return null;
 
-    var builder = std.ArrayList(u16).empty;
-    errdefer builder.deinit(std.heap.c_allocator);
+    var items = std.ArrayList([]const u8).empty;
+    defer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
 
     var iter = list;
     const car = env.intern("car");
     const cdr = env.intern("cdr");
     while (env.isNotNil(iter)) {
         const item = env.call1(car, iter);
-        const item_utf8 = env.extractStringAlloc(item, std.heap.c_allocator) orelse
+        const item_utf8 = env.extractStringAlloc(item, allocator) orelse
             return error.InvalidEnvironmentEntry;
-        defer std.heap.c_allocator.free(item_utf8);
-
-        const item_utf16 = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.c_allocator, item_utf8);
-        defer std.heap.c_allocator.free(item_utf16);
-
-        try builder.appendSlice(std.heap.c_allocator, item_utf16);
+        try items.append(allocator, item_utf8);
         iter = env.call1(cdr, iter);
     }
-    if (builder.items.len == 0) return null;
-    try builder.append(std.heap.c_allocator, 0);
-    return try builder.toOwnedSlice(std.heap.c_allocator);
+    return try buildEnvironmentBlockUtf8(allocator, items.items);
+}
+
+fn buildEnvironmentBlockUtf8(allocator: std.mem.Allocator, items: []const []const u8) !?[]u16 {
+    if (items.len == 0) return null;
+
+    var builder = std.ArrayList(u16).empty;
+    errdefer builder.deinit(allocator);
+
+    for (items) |item| {
+        const item_utf16 = try std.unicode.utf8ToUtf16LeAllocZ(allocator, item);
+        defer allocator.free(item_utf16);
+        try builder.appendSlice(allocator, item_utf16);
+        try builder.append(allocator, 0);
+    }
+    try builder.append(allocator, 0);
+    return try builder.toOwnedSlice(allocator);
 }
 
 fn readerThread(param: ?*anyopaque) callconv(.winapi) c.DWORD {
@@ -357,4 +371,22 @@ fn notify(fd: c_int) void {
     if (fd < 0) return;
     const signal = [_]u8{'1'};
     _ = c._write(fd, &signal, signal.len);
+}
+
+test "buildEnvironmentBlockUtf8 appends a double-null terminator" {
+    const items = [_][]const u8{ "TERM=xterm-256color", "FOO=bar" };
+    const block = (try buildEnvironmentBlockUtf8(std.testing.allocator, &items)).?;
+    defer std.testing.allocator.free(block);
+
+    const expected = [_]u16{
+        'T', 'E', 'R', 'M', '=', 'x', 't', 'e', 'r', 'm', '-', '2', '5', '6', 'c', 'o', 'l', 'o', 'r', 0,
+        'F', 'O', 'O', '=', 'b', 'a', 'r', 0,
+        0,
+    };
+    try std.testing.expectEqualSlices(u16, &expected, block);
+}
+
+test "buildEnvironmentBlockUtf8 returns null for an empty environment list" {
+    const items = [_][]const u8{};
+    try std.testing.expectEqual(@as(?[]u16, null), try buildEnvironmentBlockUtf8(std.testing.allocator, &items));
 }
