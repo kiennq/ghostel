@@ -94,8 +94,11 @@
   "Shell program to run in the terminal."
   :type 'string)
 
-(defcustom ghostel-max-scrollback 10000
-  "Maximum number of scrollback lines."
+(defcustom ghostel-max-scrollback (* 20 1024 1024)  ; 20MB
+  "Maximum scrollback size in bytes.
+Memory is allocated lazily, so a large value does not consume
+memory at startup.  The default of 20 MB holds roughly 10,000
+lines at typical terminal widths."
   :type 'integer)
 
 (defcustom ghostel-timer-delay 0.033

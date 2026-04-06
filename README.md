@@ -168,7 +168,7 @@ Soft-wrapped newlines are automatically stripped from copied text.
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
 - Cursor styles: block, bar, underline, hollow block
 - Alternate screen buffer (for TUI apps like htop, vim, etc.)
-- Scrollback buffer (configurable, default 10,000 lines)
+- Scrollback buffer (configurable, default 20MB (~10,000 lines))
 
 ### Links and File Detection
 - **OSC 8 hyperlinks** — clickable URLs emitted by terminal programs (click or `RET` to open)
@@ -399,7 +399,7 @@ powering Neovim's built-in terminal.
 | Copy mode                     | Yes       | Yes     |
 | Drag-and-drop                 | Yes       | No      |
 | Auto module download          | Yes       | No      |
-| Scrollback default            | 10,000    | 1,000   |
+| Scrollback default            | ~10,000   | 1,000   |
 | PTY throughput (plain ASCII)  | 72 MB/s   | 33 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 
