@@ -36,6 +36,13 @@ submodule (see [Building from source](#building-from-source)).
 
 ## Installation
 
+### MELPA
+
+```elisp
+(use-package ghostel
+  :ensure t)
+```
+
 ### use-package with vc (Emacs 30+)
 
 ```elisp
@@ -87,6 +94,29 @@ If you already have the repo, initialize the submodule and build:
 ```sh
 git submodule update --init vendor/ghostty
 ./build.sh
+```
+
+### Building from source (MELPA install)
+
+MELPA packages only include `.el` files — the build script, Zig sources, and
+ghostty submodule are not included.  This means `M-x ghostel-module-compile`
+is not available when installed from MELPA.
+
+The recommended approach is to download a **pre-built binary** via
+`M-x ghostel-download-module` (this works regardless of install method).
+
+If you prefer to compile from source, clone the repository, build, and copy
+the resulting module into your MELPA package directory:
+
+```sh
+git clone --recurse-submodules https://github.com/dakra/ghostel.git
+cd ghostel
+./build.sh
+
+# Copy the module into your MELPA package directory
+# (adjust the path to match your Emacs package directory and ghostel version)
+cp ghostel-module.dylib ~/.emacs.d/elpa/ghostel-*/    # macOS
+cp ghostel-module.so    ~/.emacs.d/elpa/ghostel-*/    # Linux
 ```
 
 ## Shell Integration
