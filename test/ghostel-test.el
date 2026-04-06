@@ -1136,7 +1136,7 @@ cell, so the visual line width must equal the terminal column count."
           (let ((global-hl-line-mode t))
             (should global-hl-line-mode)
             ;; Suppress should opt this buffer out
-            (ghostel--suppress-hl-line-mode)
+            (ghostel--suppress-interfering-modes)
             (should ghostel--saved-hl-line-mode)
             ;; Buffer-local global-hl-line-mode must be nil — this is the
             ;; mechanism that prevents global-hl-line-highlight (on

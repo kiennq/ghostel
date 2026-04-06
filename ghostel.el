@@ -447,7 +447,7 @@ matches the GitHub release tag even when MELPA rewrites the
 version to a date-based string."
   (require 'lisp-mnt nil t)
   (when (fboundp 'lm-header)
-    (let ((lib (or load-file-name (locate-library "ghostel"))))
+    (let ((lib (or load-file-name (locate-library "ghostel.el" t))))
       (when lib
         (with-temp-buffer
           (insert-file-contents lib nil 0 1024)
