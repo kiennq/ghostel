@@ -1156,6 +1156,30 @@ cell, so the visual line width must equal the terminal column count."
         (kill-buffer buf)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ghostel-project buffer naming
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-project-buffer-name ()
+  "Test that `ghostel-project' derives the buffer name correctly."
+  (require 'project)
+  (let ((ghostel-buffer-name "*ghostel*")
+        result)
+    ;; Stub project-current, project-root, and ghostel to capture args
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (_maybe-prompt) '(transient . "/tmp/myproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'ghostel)
+               (lambda ()
+                 (setq result (cons default-directory ghostel-buffer-name)))))
+      (ghostel-project)
+      ;; default-directory should be the project root
+      (should (equal "/tmp/myproj/" (car result)))
+      ;; Buffer name should be project-prefixed (no raw asterisks passed)
+      (should (string-match-p "ghostel" (cdr result)))
+      (should-not (string-match-p "\\*\\*" (cdr result))))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -1420,6 +1444,7 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-osc51-eval-unknown
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
+    ghostel-test-project-buffer-name
     ghostel-test-package-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch

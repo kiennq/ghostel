@@ -323,6 +323,7 @@ individual faces with `M-x customize-face`.
 | Command                        | Description                                  |
 |--------------------------------|----------------------------------------------|
 | `M-x ghostel`                  | Open a new terminal                          |
+| `M-x ghostel-project`          | Open a terminal in the current project root  |
 | `M-x ghostel-other`            | Switch to next terminal or create one        |
 | `M-x ghostel-clear`            | Clear screen and scrollback                  |
 | `M-x ghostel-clear-scrollback` | Clear scrollback only                        |
@@ -336,6 +337,16 @@ individual faces with `M-x customize-face`.
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
 | `M-x ghostel-download-module`  | Download pre-built native module             |
 | `M-x ghostel-module-compile`   | Compile native module from source            |
+
+### Project integration
+
+`ghostel-project` opens a terminal in the current project's root directory
+with a project-prefixed buffer name.  To make it available from
+`project-switch-project` (`C-x p p`):
+
+```elisp
+(add-to-list 'project-switch-commands '(ghostel-project "Ghostel") t)
+```
 
 ## Running Tests
 

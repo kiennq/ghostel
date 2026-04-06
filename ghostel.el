@@ -6,7 +6,7 @@
 ;; URL: https://github.com/dakra/ghostel
 ;; Version: 0.7.1
 ;; Keywords: terminals
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; This file is NOT part of GNU Emacs.
@@ -78,6 +78,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'project)
 (require 'term)
 (require 'url-parse)
 (require 'face-remap)
@@ -1977,11 +1978,13 @@ wheel events reach ghostel's own scroll commands."
 ;;;###autoload
 (defun ghostel-project ()
   "Create a new Ghostel terminal in the current project's root.
-The buffer name is prefixed with the project name."
+The buffer name is prefixed with the project name.
+To add this to `project-switch-commands':
+  (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
   (interactive)
   (let ((default-directory (project-root (project-current t)))
-	(ghostel-buffer-name (project-prefixed-buffer-name
-			      (string-replace "*" "" ghostel-buffer-name))))
+        (ghostel-buffer-name (project-prefixed-buffer-name
+                              (string-trim ghostel-buffer-name "*" "*"))))
     (ghostel)))
 
 (defun ghostel-other ()
