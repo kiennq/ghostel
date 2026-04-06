@@ -65,6 +65,82 @@
   "Return absolute path for NAME within DIR."
   (expand-file-name name dir))
 
+(defun ghostel-test--repo-root ()
+  "Return the Ghostel repository root for the current test file."
+  (let ((source (or load-file-name
+                    (and (boundp 'byte-compile-current-file)
+                         byte-compile-current-file)
+                    buffer-file-name
+                    default-directory)))
+    (or (locate-dominating-file source "ghostel.el")
+        (error "Could not locate Ghostel repository root from %s" source))))
+
+(defun ghostel-test--write-dyn-loader-fixture (path module-id lisp-name version)
+  "Write a tiny dyn-loader fixture module source to PATH."
+  (with-temp-file path
+    (insert
+     (format
+      (concat
+       "const c = @cImport({\n"
+       "    @cInclude(\"emacs-module.h\");\n"
+       "});\n"
+       "const ExportDescriptor = extern struct {\n"
+       "    export_id: u32,\n"
+       "    kind: u32,\n"
+       "    lisp_name: [*:0]const u8,\n"
+       "    min_arity: i32,\n"
+       "    max_arity: i32,\n"
+       "    docstring: [*:0]const u8,\n"
+       "    flags: u32,\n"
+       "};\n"
+       "const GenericManifest = extern struct {\n"
+       "    loader_abi: u32,\n"
+       "    module_id: [*:0]const u8,\n"
+       "    module_version: [*:0]const u8,\n"
+       "    exports_len: u32,\n"
+       "    exports: [*]const ExportDescriptor,\n"
+       "    invoke: *const fn (u32, ?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "    get_variable: *const fn (u32, ?*c.emacs_env, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "    set_variable: *const fn (u32, ?*c.emacs_env, c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "};\n"
+       "const exports = [_]ExportDescriptor{.{ .export_id = 1, .kind = 1, .lisp_name = \"%s\", .min_arity = 0, .max_arity = 0, .docstring = \"Return fixture version.\", .flags = 0 }};\n"
+       "fn invoke(export_id: u32, raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return switch (export_id) {\n"
+       "        1 => env.make_string.?(env, \"%s\", %d),\n"
+       "        else => env.intern.?(env, \"nil\"),\n"
+       "    };\n"
+       "}\n"
+       "fn getVariable(_: u32, raw_env: ?*c.emacs_env, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return env.intern.?(env, \"nil\");\n"
+       "}\n"
+       "fn setVariable(_: u32, raw_env: ?*c.emacs_env, _: c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return env.intern.?(env, \"nil\");\n"
+       "}\n"
+       "export fn loader_module_init_generic(out: *GenericManifest) callconv(.c) void {\n"
+       "    out.* = .{ .loader_abi = 1, .module_id = \"%s\", .module_version = \"%s\", .exports_len = exports.len, .exports = exports[0..].ptr, .invoke = &invoke, .get_variable = &getVariable, .set_variable = &setVariable };\n"
+       "}\n")
+      lisp-name version (length version) module-id version))))
+
+(defun ghostel-test--build-dyn-loader-fixture (source output)
+  "Compile a dyn-loader fixture from SOURCE to OUTPUT."
+  (let ((include-dir (expand-file-name "include" (ghostel-test--repo-root))))
+    (with-temp-buffer
+      (unless (eq 0 (process-file "zig" nil (current-buffer) nil
+                                  "build-lib" "-dynamic" "-lc" "-I" include-dir
+                                  source (concat "-femit-bin=" output)))
+        (error "Failed to build dyn-loader fixture %s: %s"
+               output
+               (string-trim (buffer-string)))))))
+
+(defun ghostel-test--write-loader-manifest (path module-file)
+  "Write loader metadata at PATH that points at MODULE-FILE."
+  (with-temp-file path
+    (insert (json-encode `((loader_abi . 1)
+                           (module_path . ,module-file))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: terminal creation
 ;; -----------------------------------------------------------------------
@@ -2533,6 +2609,55 @@ cell, so the visual line width must equal the terminal column count."
          (ghostel-module-dir module-dir))
     (should (equal (downcase (ghostel-test--fixture-path module-dir "ghostel-module.json"))
                    (downcase (ghostel--loader-metadata-path))))))
+
+(ert-deftest ghostel-test-dyn-loader-reload-loads-replaced-module-image ()
+  "Reloading a replaced target module should update exported function behavior."
+  (skip-unless (and (fboundp 'module-load)
+                    (executable-find "zig")
+                    (require 'comp-run nil t)
+                    (boundp 'comp-installed-trampolines-h)))
+  (let* ((suffix (format "%x%x" (emacs-pid) (random most-positive-fixnum)))
+         (module-id (format "ghostel-test-module-%s" suffix))
+         (lisp-name (format "ghostel-test--fixture-version-%s" suffix))
+         (fixture-dir (make-temp-file "ghostel-reload-fixture-" t))
+         (source-v1 (expand-file-name "sample-v1.zig" fixture-dir))
+         (source-v2 (expand-file-name "sample-v2.zig" fixture-dir))
+         (ext module-file-suffix)
+         (output-v1 (expand-file-name (concat "sample-v1" ext) fixture-dir))
+         (output-v2 (expand-file-name (concat "sample-v2" ext) fixture-dir))
+         (live-module (expand-file-name (concat "sample-live" ext) fixture-dir))
+         (manifest (expand-file-name "sample-module.json" fixture-dir))
+         (repo-root (ghostel-test--repo-root))
+         (loader-path (or (cl-find-if #'file-exists-p
+                                      (list (expand-file-name (concat "zig-out/bin/dyn-loader-module" ext)
+                                                              repo-root)
+                                            (expand-file-name (concat "dyn-loader-module" ext)
+                                                              repo-root)))
+                          ""))
+         (version-sym (intern lisp-name)))
+    (unwind-protect
+        (progn
+          (skip-unless (file-exists-p loader-path))
+          (ghostel-test--write-dyn-loader-fixture source-v1 module-id lisp-name "1.0")
+          (ghostel-test--write-dyn-loader-fixture source-v2 module-id lisp-name "2.0")
+          (ghostel-test--build-dyn-loader-fixture source-v1 output-v1)
+          (ghostel-test--build-dyn-loader-fixture source-v2 output-v2)
+          (copy-file output-v1 live-module t)
+          (ghostel-test--write-loader-manifest manifest
+                                               (file-name-nondirectory live-module))
+          (unless (featurep 'dyn-loader-module)
+            (module-load loader-path))
+          (dyn-loader-load-manifest manifest)
+          (should (equal "1.0" (funcall version-sym)))
+          (puthash version-sym 'stale-trampoline comp-installed-trampolines-h)
+          (rename-file live-module (concat live-module ".bak") t)
+          (copy-file output-v2 live-module t)
+          (dyn-loader-reload module-id)
+          (should (equal "2.0" (funcall version-sym)))
+          (should-not (gethash version-sym comp-installed-trampolines-h)))
+      (ignore-errors (fmakunbound version-sym))
+      (when (file-directory-p fixture-dir)
+        (ignore-errors (delete-directory fixture-dir t))))))
 
 (ert-deftest ghostel-test-reload-module-refuses-with-live-terminals ()
   (cl-letf (((symbol-function 'ghostel--live-buffers)

@@ -1,6 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 
 const is_windows = builtin.os.tag == .windows;
 
