@@ -61,20 +61,31 @@ Then `M-x ghostel` to open a terminal.
 
 ### Native module
 
-When the native module is missing, Ghostel will offer to **download a
-pre-built binary** or **compile from source** (controlled by
+Ghostel now uses a **stable dyn-loader module** plus a **stable target module**
+described by `ghostel-module.json`. Bootstrap always loads `dyn-loader-module`
+first, reads the metadata, and then activates the matching `ghostel-module`
+binary.
+
+The loader stays generic: it exposes `dyn-loader-load-manifest`,
+`dyn-loader-reload`, and the `dyn-loader-loaded-modules` variable so the
+same loader can manage multiple manifest-described target modules by
+`module_id`.
+
+When the native module payload is missing, Ghostel will offer to **download a
+pre-built package** or **compile from source** (controlled by
 `ghostel-module-auto-install`, default `ask`).  You can also trigger these
 manually:
 
-- `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
-- `M-x ghostel-module-compile` — build from source via `zig build`
+- `M-x ghostel-download-module` — download and publish the `.tar.xz` loader + target-module package from GitHub releases
+- `M-x ghostel-module-compile` — build and publish the loader + target-module layout via `zig build`
+- `M-x ghostel-reload-module` — manually reload the current target module from metadata (refuses while Ghostel terminals are still live)
 
 Set `ghostel-module-dir` to keep downloaded modules in a custom
 directory, similar to vterm's configurable module directory.  When this
-option is set, Ghostel loads and downloads `ghostel-module` there and
-does not fall back to the package directory; source builds still run in
-the package checkout and then copy the finished module into the custom
-directory.
+option is set, Ghostel publishes the stable loader, stable target module,
+and metadata there and does not fall back to the package directory; source
+builds still run in the package checkout and then publish the finished
+artifacts into the custom directory.
 
 ## Building from source
 
@@ -98,7 +109,7 @@ cd ghostel
 # Optional: override the vendored header with an Emacs source checkout
 # export EMACS_SOURCE_DIR=/path/to/emacs
 
-# Build everything (libghostty-vt + ghostel module)
+# Build everything (libghostty-vt + dyn-loader-module + ghostel-module)
 zig build -Doptimize=ReleaseFast
 ```
 
@@ -342,8 +353,9 @@ enabled.
 | `M-x ghostel-force-redraw`     | Force a full terminal redraw                 |
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
-| `M-x ghostel-download-module`  | Download pre-built native module             |
-| `M-x ghostel-module-compile`   | Compile native module from source            |
+| `M-x ghostel-download-module`  | Download and publish the native loader package |
+| `M-x ghostel-module-compile`   | Compile and publish the native loader package  |
+| `M-x ghostel-reload-module`    | Manually reload the versioned real module      |
 
 ## Running Tests
 

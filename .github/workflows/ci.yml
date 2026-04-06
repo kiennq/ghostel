@@ -101,14 +101,17 @@ jobs:
         with:
           name: ghostel-module-${{ matrix.platform }}
           path: |
-            dyn-loader-module${{ matrix.suffix }}
-            ghostel-module${{ matrix.suffix }}
-            conpty-module${{ matrix.suffix }}
-            ghostel-module.json
+            zig-out/bin/dyn-loader-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/conpty-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module.json
 
       - name: Upload module artifact
         if: matrix.os != 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module${{ matrix.suffix }}
+          path: |
+            zig-out/bin/dyn-loader-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module.json

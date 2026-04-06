@@ -5,4 +5,3 @@ zig-out/
 *.dll
 *.bak
 *.elc
-ghostel-module.json
