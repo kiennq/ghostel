@@ -123,11 +123,7 @@ fn fnConptyIsAlive(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _:
     const env = emacs.Env.init(raw_env.?);
     const key = termKey(env, args[0]) orelse return env.nil();
     const state = get(key) orelse return env.nil();
-    if (Conpty.isAlive(state)) return env.t();
-
-    _ = remove(key);
-    Conpty.deinit(state);
-    return env.nil();
+    return if (Conpty.isAlive(state)) env.t() else env.nil();
 }
 
 fn fnConptyKill(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {

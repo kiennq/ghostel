@@ -2052,6 +2052,10 @@ PROCESS is the shell process, EVENT describes the state change."
         ;; Flush any pending output before cleanup.
         (when ghostel--term
           (ghostel--flush-pending-output))
+        (when (and (ghostel--conpty-active-p)
+                   ghostel--term
+                   (fboundp 'conpty--kill))
+          (conpty--kill ghostel--term))
         (when ghostel--redraw-timer
           (cancel-timer ghostel--redraw-timer)
           (setq ghostel--redraw-timer nil))
