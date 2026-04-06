@@ -1,77 +1,32 @@
-/// Ghostel — Emacs dynamic module entry point.
-///
-/// This is the top-level file compiled into ghostel-module.so/.dylib.
-/// It exports emacs_module_init (the C entry point Emacs calls on load)
-/// and registers all Elisp-callable functions.
+/// Ghostel target module export dispatch.
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
 const render = @import("render.zig");
 const input = @import("input.zig");
-const Conpty = @import("conpty.zig");
+const api = @import("api.zig");
+const loader = @import("dyn_loader_abi");
 
 const c = emacs.c;
 
-/// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.7.1";
-
-// ---------------------------------------------------------------------------
-// Module entry point
-// ---------------------------------------------------------------------------
-
-/// Emacs calls this when loading the dynamic module.
-export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int {
-    if (runtime.size < @sizeOf(c.struct_emacs_runtime)) {
-        return 1; // ABI mismatch
-    }
-
-    const raw_env = runtime.get_environment.?(runtime);
-    const env = emacs.Env.init(raw_env);
-
-    // Register functions
-    env.bindFunction("ghostel--new", 2, 3, &fnNew, "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK)");
-    env.bindFunction("ghostel--write-input", 2, 2, &fnWriteInput, "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)");
-    env.bindFunction("ghostel--set-size", 3, 3, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)");
-    env.bindFunction("ghostel--get-title", 1, 1, &fnGetTitle, "Get the terminal title.\n\n(ghostel--get-title TERM)");
-    env.bindFunction("ghostel--get-pwd", 1, 1, &fnGetPwd, "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)");
-    env.bindFunction("ghostel--redraw", 1, 2, &fnRedraw, "Redraw the terminal into the current buffer.\n\n(ghostel--redraw TERM &optional FULL)");
-    env.bindFunction("ghostel--scroll", 2, 2, &fnScroll, "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)");
-    env.bindFunction("ghostel--scroll-top", 1, 1, &fnScrollTop, "Scroll the terminal viewport to the top of scrollback.\n\n(ghostel--scroll-top TERM)");
-    env.bindFunction("ghostel--scroll-bottom", 1, 1, &fnScrollBottom, "Scroll the terminal viewport to the bottom.\n\n(ghostel--scroll-bottom TERM)");
-    env.bindFunction("ghostel--encode-key", 3, 4, &fnEncodeKey, "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)");
-    env.bindFunction("ghostel--mouse-event", 6, 6, &fnMouseEvent, "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)");
-    env.bindFunction("ghostel--focus-event", 2, 2, &fnFocusEvent, "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)");
-    env.bindFunction("ghostel--set-palette", 2, 2, &fnSetPalette, "Set the ANSI color palette.\n\n(ghostel--set-palette TERM COLORS-STRING)");
-    env.bindFunction("ghostel--set-default-colors", 3, 3, &fnSetDefaultColors, "Set default foreground and background colors.\n\n(ghostel--set-default-colors TERM FG-HEX BG-HEX)");
-    env.bindFunction("ghostel--mode-enabled", 2, 2, &fnModeEnabled, "Return t if terminal DEC private MODE is enabled.\n\n(ghostel--mode-enabled TERM MODE)");
-    env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
-    env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
-    env.bindFunction("ghostel--module-version", 0, 0, &fnModuleVersion, "Return the native module version string.\n\n(ghostel--module-version)");
-    env.bindFunction("ghostel--conpty-init", 7, 7, &fnConptyInit, "Start a Windows ConPTY backend.\n\n(ghostel--conpty-init TERM PROCESS COMMAND ROWS COLS CWD ENV)");
-    env.bindFunction("ghostel--conpty-read-pending", 1, 1, &fnConptyReadPending, "Read pending Windows ConPTY output.\n\n(ghostel--conpty-read-pending TERM)");
-    env.bindFunction("ghostel--conpty-write", 2, 2, &fnConptyWrite, "Write raw bytes to the Windows ConPTY backend.\n\n(ghostel--conpty-write TERM DATA)");
-    env.bindFunction("ghostel--conpty-resize", 3, 3, &fnConptyResize, "Resize the Windows ConPTY backend.\n\n(ghostel--conpty-resize TERM ROWS COLS)");
-    env.bindFunction("ghostel--conpty-is-alive", 1, 1, &fnConptyIsAlive, "Return t if the Windows ConPTY child is alive.\n\n(ghostel--conpty-is-alive TERM)");
-    env.bindFunction("ghostel--conpty-kill", 1, 1, &fnConptyKill, "Terminate the Windows ConPTY child.\n\n(ghostel--conpty-kill TERM)");
-
-    emacs.initSymbols(env);
-    env.provide("ghostel-module");
-    return 0;
+export fn loader_module_init_generic(out: *loader.GenericManifest) callconv(.c) void {
+    out.* = .{
+        .loader_abi = api.loader_abi,
+        .module_id = api.module_id.ptr,
+        .module_version = api.module_version.ptr,
+        .exports_len = ghostel_export_descriptors.len,
+        .exports = ghostel_export_descriptors[0..].ptr,
+        .invoke = &invokeExport,
+        .get_variable = &getVariable,
+        .set_variable = &setVariable,
+    };
 }
 
-// ---------------------------------------------------------------------------
-// Plugin version — required by Emacs >= 27
-// ---------------------------------------------------------------------------
-
-export const plugin_is_GPL_compatible: c_int = 0;
-
-// ---------------------------------------------------------------------------
-// Exported Elisp functions
-// ---------------------------------------------------------------------------
+export const plugin_is_GPL_compatible: c_int = 1;
 
 /// (ghostel--new ROWS COLS &optional MAX-SCROLLBACK)
-fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const rows: u16 = @intCast(env.extractInteger(args[0]));
     const cols: u16 = @intCast(env.extractInteger(args[1]));
@@ -117,7 +72,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
 }
 
 /// (ghostel--write-input TERM DATA)
-fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse {
         env.signalError("ghostel: invalid terminal handle");
@@ -290,7 +245,7 @@ fn extractOsc133(env: emacs.Env, data: []const u8) void {
 }
 
 /// (ghostel--set-size TERM ROWS COLS)
-fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse {
         env.signalError("ghostel: invalid terminal handle");
@@ -308,106 +263,8 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
     return env.nil();
 }
 
-fn fnConptyInit(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse {
-        env.signalError("ghostel: invalid terminal handle");
-        return env.nil();
-    };
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var command_stack: [512]u8 = undefined;
-    var cwd_stack: [512]u8 = undefined;
-    const command = env.extractString(args[2], &command_stack) orelse blk: {
-        break :blk env.extractStringAlloc(args[2], allocator);
-    };
-    const cwd = env.extractString(args[5], &cwd_stack) orelse blk: {
-        break :blk env.extractStringAlloc(args[5], allocator);
-    };
-
-    if (command == null or cwd == null) {
-        env.signalError("ghostel: invalid ConPTY arguments");
-        return env.nil();
-    }
-
-    Conpty.deinit(term.conpty);
-    term.conpty = null;
-    term.conpty = Conpty.init(
-        env,
-        args[1],
-        command.?,
-        @intCast(env.extractInteger(args[3])),
-        @intCast(env.extractInteger(args[4])),
-        cwd.?,
-        args[6],
-        allocator,
-    ) catch {
-        env.signalError("ghostel: failed to initialize Windows ConPTY backend");
-        return env.nil();
-    };
-
-    return env.t();
-}
-
-fn fnConptyReadPending(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    const state = term.conpty orelse return env.nil();
-    return Conpty.readPending(env, state);
-}
-
-fn fnConptyWrite(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    const state = term.conpty orelse return env.nil();
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var stack_buf: [65536]u8 = undefined;
-    const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        break :blk env.extractStringAlloc(args[1], allocator);
-    };
-    if (data == null) return env.nil();
-
-    Conpty.write(state, data.?) catch {
-        env.signalError("ghostel: failed to write to Windows ConPTY backend");
-        return env.nil();
-    };
-    return env.t();
-}
-
-fn fnConptyResize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    const state = term.conpty orelse return env.nil();
-    return if (Conpty.resize(
-        state,
-        @intCast(env.extractInteger(args[1])),
-        @intCast(env.extractInteger(args[2])),
-    )) env.t() else env.nil();
-}
-
-fn fnConptyIsAlive(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    const state = term.conpty orelse return env.nil();
-    return if (Conpty.isAlive(state)) env.t() else env.nil();
-}
-
-fn fnConptyKill(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    const state = term.conpty orelse return env.nil();
-    return if (Conpty.kill(state)) env.t() else env.nil();
-}
-
 /// (ghostel--get-title TERM)
-fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -418,7 +275,7 @@ fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*an
 }
 
 /// (ghostel--get-pwd TERM)
-fn fnGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -431,7 +288,7 @@ fn fnGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyo
 /// (ghostel--redraw TERM &optional FULL)
 /// Reads the render state and updates the current Emacs buffer with styled text.
 /// When FULL is non-nil, always perform a full redraw instead of incremental.
-fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const force_full = nargs > 1 and env.isNotNil(args[1]);
@@ -442,7 +299,7 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
 }
 
 /// (ghostel--scroll TERM DELTA)
-fn fnScroll(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelScroll(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -453,7 +310,7 @@ fn fnScroll(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyo
 }
 
 /// (ghostel--scroll-top TERM)
-fn fnScrollTop(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelScrollTop(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     term.scrollViewport(gt.SCROLL_TOP, 0);
@@ -461,7 +318,7 @@ fn fnScrollTop(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*a
 }
 
 /// (ghostel--scroll-bottom TERM)
-fn fnScrollBottom(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelScrollBottom(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     term.scrollViewport(gt.SCROLL_BOTTOM, 0);
@@ -473,7 +330,7 @@ fn fnScrollBottom(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: 
 /// KEY is a key name string (e.g. "a", "return", "up", "f1").
 /// MODS is a modifier string (e.g. "ctrl", "shift,ctrl", "").
 /// UTF8 is optional text generated by the key (e.g. "a" for the 'a' key).
-fn fnEncodeKey(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelEncodeKey(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -506,7 +363,7 @@ fn fnEncodeKey(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _:
 /// BUTTON: 0=none, 1=left, 2=right, 3=middle
 /// ROW, COL: 0-based cell coordinates
 /// MODS: modifier bitmask
-fn fnMouseEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelMouseEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -525,7 +382,7 @@ fn fnMouseEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 /// (ghostel--focus-event TERM GAINED)
 /// Encode a focus gained/lost event and send to the PTY.
 /// Only sends if the terminal has enabled focus reporting (DEC mode 1004).
-fn fnFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -555,7 +412,7 @@ fn fnFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 
 /// (ghostel--mode-enabled TERM MODE)
 /// Return t if terminal DEC private MODE is enabled, nil otherwise.
-fn fnModeEnabled(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelModeEnabled(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const mode: gt.c.GhosttyMode = @intCast(env.extractInteger(args[1]));
@@ -564,8 +421,8 @@ fn fnModeEnabled(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?
 
 /// (ghostel--set-palette TERM COLORS-STRING)
 /// Set the 16 ANSI colors from a concatenated hex string like "#000000#aa0000...".
-/// The remaining 240 palette entries are taken from the terminal's current palette.
-fn fnSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+/// Applies colors via OSC 4 so Ghostty updates its effective palette safely.
+pub fn ghostelSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse {
         env.signalError("ghostel: invalid terminal handle");
@@ -644,7 +501,7 @@ fn parseHexColor(s: []const u8) ?gt.ColorRgb {
 
 /// (ghostel--set-default-colors TERM FG-HEX BG-HEX)
 /// Set the terminal's default foreground and background colors from "#RRGGBB" strings.
-fn fnSetDefaultColors(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelSetDefaultColors(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse {
         env.signalError("ghostel: invalid terminal handle");
@@ -684,7 +541,7 @@ fn fnSetDefaultColors(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value,
 
 /// (ghostel--debug-state TERM)
 /// Returns a string with render state debug info.
-fn fnDebugState(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelDebugState(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -741,7 +598,7 @@ fn fnDebugState(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 
 /// (ghostel--debug-feed TERM STR)
 /// Feed STR to the terminal, update render state, return first row.
-fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
@@ -799,10 +656,90 @@ fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*a
 }
 
 /// (ghostel--module-version)
-fn fnModuleVersion(raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+pub fn ghostelModuleVersion(raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
-    return env.makeString(version);
+    return env.makeString(api.module_version);
 }
+
+const ExportId = enum(u32) {
+    new_term = 1,
+    write_input = 2,
+    set_size = 3,
+    get_title = 4,
+    get_pwd = 5,
+    redraw = 6,
+    scroll = 8,
+    scroll_top = 9,
+    scroll_bottom = 10,
+    encode_key = 11,
+    mouse_event = 12,
+    focus_event = 13,
+    set_palette = 14,
+    set_default_colors = 15,
+    mode_enabled = 16,
+    debug_state = 17,
+    debug_feed = 18,
+    module_version = 19,
+};
+
+pub const ghostel_export_descriptors = [_]loader.ExportDescriptor{
+    .{ .export_id = @intFromEnum(ExportId.new_term), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--new", .min_arity = 2, .max_arity = 3, .docstring = "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.write_input), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--write-input", .min_arity = 2, .max_arity = 2, .docstring = "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.set_size), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--set-size", .min_arity = 3, .max_arity = 3, .docstring = "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.get_title), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--get-title", .min_arity = 1, .max_arity = 1, .docstring = "Get the terminal title.\n\n(ghostel--get-title TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.get_pwd), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--get-pwd", .min_arity = 1, .max_arity = 1, .docstring = "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.redraw), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--redraw", .min_arity = 1, .max_arity = 2, .docstring = "Redraw the terminal into the current buffer.\n\n(ghostel--redraw TERM &optional FULL)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.scroll), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--scroll", .min_arity = 2, .max_arity = 2, .docstring = "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.scroll_top), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--scroll-top", .min_arity = 1, .max_arity = 1, .docstring = "Scroll the terminal viewport to the top of scrollback.\n\n(ghostel--scroll-top TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.scroll_bottom), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--scroll-bottom", .min_arity = 1, .max_arity = 1, .docstring = "Scroll the terminal viewport to the bottom.\n\n(ghostel--scroll-bottom TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.encode_key), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--encode-key", .min_arity = 3, .max_arity = 4, .docstring = "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.mouse_event), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--mouse-event", .min_arity = 6, .max_arity = 6, .docstring = "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.focus_event), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--focus-event", .min_arity = 2, .max_arity = 2, .docstring = "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.set_palette), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--set-palette", .min_arity = 2, .max_arity = 2, .docstring = "Set the ANSI color palette.\n\n(ghostel--set-palette TERM COLORS-STRING)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.set_default_colors), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--set-default-colors", .min_arity = 3, .max_arity = 3, .docstring = "Set default foreground and background colors.\n\n(ghostel--set-default-colors TERM FG-HEX BG-HEX)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.mode_enabled), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--mode-enabled", .min_arity = 2, .max_arity = 2, .docstring = "Return t if terminal DEC private MODE is enabled.\n\n(ghostel--mode-enabled TERM MODE)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.debug_state), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--debug-state", .min_arity = 1, .max_arity = 1, .docstring = "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.debug_feed), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--debug-feed", .min_arity = 2, .max_arity = 2, .docstring = "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)", .flags = 0 },
+    .{ .export_id = @intFromEnum(ExportId.module_version), .kind = @intFromEnum(loader.ExportKind.function), .lisp_name = "ghostel--module-version", .min_arity = 0, .max_arity = 0, .docstring = "Return the native module version string.\n\n(ghostel--module-version)", .flags = 0 },
+};
+
+pub fn invokeExport(export_id: u32, raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, data: ?*anyopaque) callconv(.c) c.emacs_value {
+    return switch (@as(ExportId, @enumFromInt(export_id))) {
+        .new_term => ghostelNew(raw_env, nargs, args, data),
+        .write_input => ghostelWriteInput(raw_env, nargs, args, data),
+        .set_size => ghostelSetSize(raw_env, nargs, args, data),
+        .get_title => ghostelGetTitle(raw_env, nargs, args, data),
+        .get_pwd => ghostelGetPwd(raw_env, nargs, args, data),
+        .redraw => ghostelRedraw(raw_env, nargs, args, data),
+        .scroll => ghostelScroll(raw_env, nargs, args, data),
+        .scroll_top => ghostelScrollTop(raw_env, nargs, args, data),
+        .scroll_bottom => ghostelScrollBottom(raw_env, nargs, args, data),
+        .encode_key => ghostelEncodeKey(raw_env, nargs, args, data),
+        .mouse_event => ghostelMouseEvent(raw_env, nargs, args, data),
+        .focus_event => ghostelFocusEvent(raw_env, nargs, args, data),
+        .set_palette => ghostelSetPalette(raw_env, nargs, args, data),
+        .set_default_colors => ghostelSetDefaultColors(raw_env, nargs, args, data),
+        .mode_enabled => ghostelModeEnabled(raw_env, nargs, args, data),
+        .debug_state => ghostelDebugState(raw_env, nargs, args, data),
+        .debug_feed => ghostelDebugFeed(raw_env, nargs, args, data),
+        .module_version => ghostelModuleVersion(raw_env, nargs, args, data),
+    };
+}
+
+pub fn getVariable(export_id: u32, raw_env: ?*c.emacs_env, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    _ = export_id;
+    const env = emacs.Env.init(raw_env.?);
+    env.signalError("ghostel: variable export not supported");
+    return env.nil();
+}
+
+pub fn setVariable(export_id: u32, raw_env: ?*c.emacs_env, _: c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    _ = export_id;
+    const env = emacs.Env.init(raw_env.?);
+    env.signalError("ghostel: variable export not supported");
+    return env.nil();
+}
+
 
 // ---------------------------------------------------------------------------
 // Ghostty callbacks — invoked synchronously during vtWrite
@@ -893,4 +830,15 @@ test "normalizeBareLfAlloc reuses the original slice when no normalization is ne
     const normalized = try normalizeBareLfAlloc(arena.allocator(), raw);
     try std.testing.expectEqualStrings(raw, normalized);
     try std.testing.expectEqual(@intFromPtr(raw.ptr), @intFromPtr(normalized.ptr));
+}
+
+test "loader module publishes generic export manifest" {
+    var manifest = std.mem.zeroes(loader.GenericManifest);
+    loader_module_init_generic(&manifest);
+
+    try std.testing.expectEqual(loader.LoaderAbiVersion, manifest.loader_abi);
+    try std.testing.expectEqualStrings("ghostel", std.mem.span(manifest.module_id));
+    try std.testing.expect(manifest.exports_len > 0);
+    try std.testing.expectEqual(@intFromEnum(loader.ExportKind.function), manifest.exports[0].kind);
+    try std.testing.expectEqualStrings("ghostel--new", std.mem.span(manifest.exports[0].lisp_name));
 }
