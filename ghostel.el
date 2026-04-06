@@ -372,6 +372,7 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function conpty--write "conpty-module")
 (declare-function ghostel--encode-key "dyn-loader-module")
 (declare-function ghostel--focus-event "dyn-loader-module")
+(declare-function ghostel--cursor-position "dyn-loader-module")
 (declare-function ghostel--mode-enabled "dyn-loader-module")
 (declare-function ghostel--module-version "dyn-loader-module")
 (declare-function ghostel--mouse-event "dyn-loader-module")

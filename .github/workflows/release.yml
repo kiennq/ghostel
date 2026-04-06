@@ -50,7 +50,6 @@ jobs:
                 .github/workflows/ci.yml \
                 include \
                 src \
-                vendor/dyn-loader \
                 vendor/emacs-util-mods \
                 vendor/ghostty
             then
@@ -132,7 +131,7 @@ jobs:
             ${{ env.ZIG_GLOBAL_CACHE_DIR }}
             ${{ env.ZIG_LOCAL_CACHE_DIR }}
             vendor/ghostty/.zig-cache
-          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/dyn-loader/**', 'vendor/emacs-util-mods/**', 'include/**', '.github/workflows/release.yml') }}
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/emacs-util-mods/**', 'include/**', '.github/workflows/release.yml') }}
           restore-keys: |
             release-${{ runner.os }}-${{ matrix.platform }}-
 
