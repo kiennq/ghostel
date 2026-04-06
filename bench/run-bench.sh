@@ -84,7 +84,7 @@ done
 
 # Verify ghostel module exists
 MODULE=""
-for ext in dylib so; do
+for ext in dll dylib so; do
     if [ -f "$GHOSTEL_DIR/ghostel-module.$ext" ]; then
         MODULE="$GHOSTEL_DIR/ghostel-module.$ext"
         break

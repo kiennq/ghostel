@@ -18,6 +18,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 
 ;; ---------------------------------------------------------------------------
 ;; Configuration
@@ -54,6 +55,9 @@ Always available since term is built into Emacs.")
 
 (defvar ghostel-bench--results nil
   "List of result plists from benchmark runs.")
+
+(defvar ghostel-bench--module-dir nil
+  "Temporary Ghostel module directory used by the benchmark harness.")
 
 ;; ---------------------------------------------------------------------------
 ;; Data generators
@@ -195,6 +199,19 @@ for reliable measurement."
   "Create a ghostel terminal for benchmarking."
   (ghostel--new rows cols ghostel-bench-scrollback))
 
+(defun ghostel-bench--cat-file-command (file)
+  "Return a command list that writes FILE to stdout."
+  (let ((path (expand-file-name file)))
+    (if (eq system-type 'windows-nt)
+        (list "cmd.exe" "/d" "/c" "type" (subst-char-in-string ?/ ?\\ path))
+      (list "cat" path))))
+
+(defun ghostel-bench--echo-command ()
+  "Return a command list for a process that echoes stdin to stdout."
+  (if (eq system-type 'windows-nt)
+      (list "cmd.exe" "/q" "/d" "/c" "more")
+    (list "cat")))
+
 (defun ghostel-bench--make-vterm (rows cols)
   "Create a vterm terminal for benchmarking."
   (vterm--new rows cols ghostel-bench-scrollback nil nil nil nil nil))
@@ -214,7 +231,9 @@ The caller must call `delete-process' when done."
   (setq term-width cols)
   (setq term-height rows)
   (setq term-buffer-maximum-size ghostel-bench-scrollback)
-  (let ((proc (start-process "term-bench" (current-buffer) "cat")))
+  (let* ((command (ghostel-bench--echo-command))
+         (proc (apply #'start-process "term-bench" (current-buffer)
+                      (car command) (cdr command))))
     (set-process-query-on-exit-flag proc nil)
     proc))
 
@@ -248,7 +267,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
            (proc (make-process
                   :name "ghostel-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -290,7 +309,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
            (proc (make-process
                   :name "vterm-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -322,7 +341,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
            (proc (make-process
                   :name "eat-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -362,7 +381,7 @@ and render in a single call."
            (proc (make-process
                   :name "term-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -820,8 +839,54 @@ real-world performance (see PTY and streaming benchmarks for that)."
 ;; Entry points
 ;; ---------------------------------------------------------------------------
 
+(defun ghostel-bench--package-dir ()
+  "Return the Ghostel checkout root for this benchmark file."
+  (let ((bench-file (or (locate-library "ghostel-bench.el" t)
+                        load-file-name
+                        buffer-file-name)))
+    (unless bench-file
+      (error "Unable to locate ghostel-bench.el on load-path"))
+    (file-name-directory
+     (directory-file-name
+      (file-name-directory bench-file)))))
+
+(defun ghostel-bench--copy-module-artifact (name source-dir dest-dir)
+  "Copy module artifact NAME from SOURCE-DIR into DEST-DIR."
+  (let ((source (expand-file-name name source-dir))
+        (dest (expand-file-name name dest-dir)))
+    (unless (file-exists-p source)
+      (error "Missing benchmark artifact: %s" source))
+    (copy-file source dest t)))
+
+(defun ghostel-bench--prepare-ghostel-module-dir ()
+  "Stage Ghostel native modules into a temporary directory for benchmarking."
+  (or ghostel-bench--module-dir
+      (let* ((package-dir (ghostel-bench--package-dir))
+             (module-dir (make-temp-file "ghostel-bench-modules-" t))
+             (suffix module-file-suffix)
+             (loader-name (concat "dyn-loader-module" suffix))
+             (target-name (concat "ghostel-module" suffix)))
+        (ghostel-bench--copy-module-artifact loader-name package-dir module-dir)
+        (ghostel-bench--copy-module-artifact target-name package-dir module-dir)
+        (when (eq system-type 'windows-nt)
+          (let* ((conpty-name (concat "conpty-module" suffix))
+                 (conpty-source-dir
+                  (if (file-exists-p (expand-file-name conpty-name package-dir))
+                      package-dir
+                    (expand-file-name "zig-out/bin" package-dir))))
+            (ghostel-bench--copy-module-artifact conpty-name conpty-source-dir module-dir)))
+        (with-temp-file (expand-file-name "ghostel-module.json" module-dir)
+          (set-buffer-multibyte nil)
+          (insert (json-encode
+                   `((loader_abi . 1)
+                     (module_path . ,target-name)))))
+        (setq ghostel-bench--module-dir module-dir))))
+
 (defun ghostel-bench--load-backends ()
   "Load available backends, adjusting include flags."
+  (setq load-prefer-newer t)
+  (setq ghostel-module-auto-install nil
+        ghostel-module-dir (ghostel-bench--prepare-ghostel-module-dir))
   (require 'ghostel)
   (when ghostel-bench-include-vterm
     (condition-case err
@@ -896,7 +961,7 @@ Returns a list of (PTY-MS RENDER-MS TOTAL-MS) for each keystroke."
              (proc (make-process
                     :name "ghostel-typing-bench"
                     :buffer buf
-                    :command (list "cat")
+                    :command (ghostel-bench--echo-command)
                     :connection-type 'pty
                     :coding 'binary
                     :noquery t
