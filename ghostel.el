@@ -576,9 +576,6 @@ DIR is the module directory."
 (defvar-local ghostel--input-timer nil
   "Timer for flushing coalesced input.")
 
-
-
-
 (defvar-local ghostel--last-directory nil
   "Last known working directory from OSC 7, used for dedup.")
 
@@ -590,10 +587,6 @@ variable re-enables automatic renaming for the next title update.")
 (defvar-local ghostel--prompt-positions nil
   "List of prompt positions as (buffer-line . exit-status) pairs.
 Used for prompt navigation and optional re-application after full redraws.")
-
-
-(defvar ghostel--buffer-counter 0
-  "Counter for generating unique terminal buffer names.")
 
 
 ;;; Keymap
@@ -1984,9 +1977,14 @@ wheel events reach ghostel's own scroll commands."
 ;;; Entry point
 
 ;;;###autoload
-(defun ghostel ()
-  "Create a new Ghostel terminal buffer."
-  (interactive)
+(defun ghostel (&optional arg)
+  "Start a new Ghostel terminal. If the buffer already exists, switch to it.
+With a non-numeric prefix arg, create a new buffer.
+With a numeric prefix ARG, switch to the buffer with that number or
+create it if it doesn't exist yet.
+The name of the buffer is determined by the value of `ghostel-buffer-name'."
+  (interactive "P")
+  (cl-assert ghostel-buffer-name)
   (unless (fboundp 'ghostel--new)
     (let ((dir (file-name-directory (locate-library "ghostel"))))
       (ghostel--ensure-module dir)
@@ -1995,33 +1993,41 @@ wheel events reach ghostel's own scroll commands."
         (if (file-exists-p mod)
             (module-load mod)
           (user-error "Ghostel native module not available")))))
-  (let* ((index (cl-incf ghostel--buffer-counter))
-         (buf-name (if (= index 1)
-                       ghostel-buffer-name
-                     (format "%s<%d>" ghostel-buffer-name index)))
-         (buffer (generate-new-buffer buf-name)))
+  (let ((buffer (cond ((numberp arg)
+		       (get-buffer-create (format "%s<%d>"
+						  ghostel-buffer-name
+						  arg)))
+		      (arg
+		       (generate-new-buffer ghostel-buffer-name))
+		      (t
+		       (get-buffer-create ghostel-buffer-name)))))
+    (cl-assert (and buffer (buffer-live-p buffer)))
     (with-current-buffer buffer
-      (ghostel-mode)
-      (setq ghostel--managed-buffer-name (buffer-name))
-      (let* ((height (window-body-height))
-             (width (window-max-chars-per-line)))
-        (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback))
-        (ghostel--apply-palette ghostel--term))
-      (ghostel--start-process))
+      (unless (derived-mode-p 'ghostel-mode)
+        (ghostel-mode)
+        (setq ghostel--managed-buffer-name (buffer-name))
+        (let* ((height (window-body-height))
+               (width (window-max-chars-per-line)))
+          (setq ghostel--term
+                (ghostel--new height width ghostel-max-scrollback))
+          (ghostel--apply-palette ghostel--term))
+        (ghostel--start-process)))
     (switch-to-buffer buffer)))
 
 ;;;###autoload
 (defun ghostel-project ()
-  "Create a new Ghostel terminal in the current project's root.
+  "Start a new Ghostel terminal in the current project's root.
 The buffer name is prefixed with the project name.
+If a buffer already exists for this project switch to it.
+Otherwise create a new Ghostel buffer. This function accepts the same
+universal arguments that `ghostel' does.
 To add this to `project-switch-commands':
   (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
   (interactive)
   (let ((default-directory (project-root (project-current t)))
         (ghostel-buffer-name (project-prefixed-buffer-name
                               (string-trim ghostel-buffer-name "*" "*"))))
-    (ghostel)))
+    (ghostel current-prefix-arg)))
 
 (defun ghostel-other ()
   "Switch to the next ghostel terminal buffer, or create one."

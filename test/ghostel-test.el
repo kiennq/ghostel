@@ -1199,7 +1199,7 @@ cell, so the visual line width must equal the terminal column count."
               ((symbol-function 'project-root)
                (lambda (proj) (cdr proj)))
               ((symbol-function 'ghostel)
-               (lambda ()
+               (lambda (&optional _)
                  (setq result (cons default-directory ghostel-buffer-name)))))
       (ghostel-project)
       ;; default-directory should be the project root
@@ -1207,6 +1207,28 @@ cell, so the visual line width must equal the terminal column count."
       ;; Buffer name should be project-prefixed (no raw asterisks passed)
       (should (string-match-p "ghostel" (cdr result)))
       (should-not (string-match-p "\\*\\*" (cdr result))))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel-project passes universal args to ghostel
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-project-universal-arg ()
+  "Test that `ghostel-project' passes the universal arg to `ghostel'."
+  (require 'project)
+  (let ((ghostel-buffer-name "*ghostel*")
+	(current-prefix-arg '4)
+        result)
+    ;; Stub project-current, project-root, and ghostel to capture args
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (_maybe-prompt) '(transient . "/tmp/myproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'ghostel)
+               (lambda (&optional arg)
+                 (setq result arg))))
+      (ghostel-project)
+      ;; Pass the prefix argument to `ghostel'
+      (should (equal '4 result)))))
 
 ;; -----------------------------------------------------------------------
 ;; Runner
@@ -1536,6 +1558,7 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
     ghostel-test-project-buffer-name
+    ghostel-test-project-universal-arg
     ghostel-test-package-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
