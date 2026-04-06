@@ -46,8 +46,11 @@ jobs:
                 ghostel.el \
                 build.zig \
                 build.zig.zon \
+                .github/workflows/release.yml \
+                .github/workflows/ci.yml \
                 include \
                 src \
+                vendor/dyn-loader \
                 vendor/ghostty
             then
               should_release=false
@@ -123,7 +126,7 @@ jobs:
             ${{ env.ZIG_GLOBAL_CACHE_DIR }}
             ${{ env.ZIG_LOCAL_CACHE_DIR }}
             vendor/ghostty/.zig-cache
-          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'include/**', '.github/workflows/release.yml') }}
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/dyn-loader/**', 'include/**', '.github/workflows/release.yml') }}
           restore-keys: |
             release-${{ runner.os }}-${{ matrix.platform }}-
 
@@ -138,11 +141,18 @@ jobs:
           set -euo pipefail
           zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
-      - name: Rename artifact for release
+      - name: Package release artifact
         shell: bash
         run: |
-          mv ghostel-module${{ matrix.suffix }} \
-             ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
+          files=(
+            dyn-loader-module${{ matrix.suffix }}
+            ghostel-module${{ matrix.suffix }}
+            ghostel-module.json
+          )
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            files+=(conpty-module${{ matrix.suffix }})
+          fi
+          tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
       - name: Upload artifact to release
         uses: ncipollo/release-action@v1
@@ -153,5 +163,5 @@ jobs:
           omitNameDuringUpdate: true
           omitDraftDuringUpdate: true
           omitPrereleaseDuringUpdate: true
-          artifacts: ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
+          artifacts: ghostel-module-${{ matrix.platform }}.tar.xz
           token: ${{ secrets.GITHUB_TOKEN }}
