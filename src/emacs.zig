@@ -19,7 +19,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     // --- Symbol interning ---
@@ -319,11 +321,18 @@ pub const Sym = struct {
 };
 
 pub var sym: Sym = undefined;
+var sym_initialized = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
 pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
     inline for (std.meta.fields(Sym)) |field| {
         @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
     }
+    sym_initialized = true;
 }
