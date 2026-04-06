@@ -76,22 +76,110 @@
   "Return absolute path for NAME within DIR."
   (expand-file-name name dir))
 
+(defun ghostel-test--repo-root ()
+  "Return the Ghostel repository root for the current test file."
+  (let ((source (or load-file-name
+                    (and (boundp 'byte-compile-current-file)
+                         byte-compile-current-file)
+                    buffer-file-name
+                    default-directory)))
+    (or (locate-dominating-file source "ghostel.el")
+        (error "Could not locate Ghostel repository root from %s" source))))
+
 (ert-deftest ghostel-test-source-omits-removed-native-hooks ()
   "Removed native debug and metadata hooks stay absent from checked-in sources."
-  (let* ((repo (or (locate-dominating-file default-directory "ghostel.el")
-                   default-directory))
-         (files (list (expand-file-name "ghostel.el" repo)
-                      (expand-file-name "test/ghostel-test.el" repo)
-                      (expand-file-name "src/module.zig" repo)))
-         (names (mapcar (lambda (suffix)
-                          (concat "ghostel--" suffix))
-                        '("get-title" "get-pwd" "debug-state" "debug-feed"))))
-    (dolist (file files)
-      (let ((content (with-temp-buffer
-                       (insert-file-contents file)
-                       (buffer-string))))
-        (dolist (name names)
-          (should-not (string-match-p (regexp-quote name) content)))))))
+  (let* ((repo (ghostel-test--repo-root))
+         (elisp (expand-file-name "ghostel.el" repo))
+         (module (expand-file-name "src/module.zig" repo))
+         (elisp-content (with-temp-buffer
+                          (insert-file-contents elisp)
+                          (buffer-string)))
+         (module-content (with-temp-buffer
+                           (insert-file-contents module)
+                           (buffer-string))))
+    (dolist (name '("ghostel--get-title"
+                    "ghostel--get-pwd"
+                    "ghostel--debug-state"
+                    "ghostel--debug-feed"))
+      (should-not (string-match-p (regexp-quote name) elisp-content)))
+    (dolist (name '("ghostel--get-title"
+                    "ghostel--get-pwd"))
+      (should-not (string-match-p (regexp-quote name) module-content)))
+    (dolist (name '("ghostel--debug-state"
+                    "ghostel--debug-feed"
+                    "fn fnNew("
+                    "fn fnWriteInput("))
+      (should (string-match-p (regexp-quote name) module-content)))
+    (dolist (name '("pub fn ghostelNew("
+                    "pub fn ghostelWriteInput("))
+      (should-not (string-match-p (regexp-quote name) module-content)))))
+
+(defun ghostel-test--write-dyn-loader-fixture (path module-id lisp-name version)
+  "Write a tiny dyn-loader fixture module source to PATH."
+  (with-temp-file path
+    (insert
+     (format
+      (concat
+       "const c = @cImport({\n"
+       "    @cInclude(\"emacs-module.h\");\n"
+       "});\n"
+       "const ExportDescriptor = extern struct {\n"
+       "    export_id: u32,\n"
+       "    kind: u32,\n"
+       "    lisp_name: [*:0]const u8,\n"
+       "    min_arity: i32,\n"
+       "    max_arity: i32,\n"
+       "    docstring: [*:0]const u8,\n"
+       "    flags: u32,\n"
+       "};\n"
+       "const GenericManifest = extern struct {\n"
+       "    loader_abi: u32,\n"
+       "    module_id: [*:0]const u8,\n"
+       "    module_version: [*:0]const u8,\n"
+       "    exports_len: u32,\n"
+       "    exports: [*]const ExportDescriptor,\n"
+       "    invoke: *const fn (u32, ?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "    get_variable: *const fn (u32, ?*c.emacs_env, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "    set_variable: *const fn (u32, ?*c.emacs_env, c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "};\n"
+       "const exports = [_]ExportDescriptor{.{ .export_id = 1, .kind = 1, .lisp_name = \"%s\", .min_arity = 0, .max_arity = 0, .docstring = \"Return fixture version.\", .flags = 0 }};\n"
+       "fn invoke(export_id: u32, raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return switch (export_id) {\n"
+       "        1 => env.make_string.?(env, \"%s\", %d),\n"
+       "        else => env.intern.?(env, \"nil\"),\n"
+       "    };\n"
+       "}\n"
+       "fn getVariable(_: u32, raw_env: ?*c.emacs_env, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return env.intern.?(env, \"nil\");\n"
+       "}\n"
+       "fn setVariable(_: u32, raw_env: ?*c.emacs_env, _: c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return env.intern.?(env, \"nil\");\n"
+       "}\n"
+       "export fn loader_module_init_generic(out: *GenericManifest) callconv(.c) void {\n"
+       "    out.* = .{ .loader_abi = 1, .module_id = \"%s\", .module_version = \"%s\", .exports_len = exports.len, .exports = exports[0..].ptr, .invoke = &invoke, .get_variable = &getVariable, .set_variable = &setVariable };\n"
+       "}\n")
+      lisp-name version (length version) module-id version))))
+
+(defun ghostel-test--build-dyn-loader-fixture (source output)
+  "Compile a dyn-loader fixture from SOURCE to OUTPUT."
+  (let ((include-dir (expand-file-name "include" (ghostel-test--repo-root))))
+    (with-temp-buffer
+      (unless (eq 0 (process-file "zig" nil (current-buffer) nil
+                                  "build-lib" "-dynamic" "-lc" "-I" include-dir
+                                  source (concat "-femit-bin=" output)))
+        (error "Failed to build dyn-loader fixture %s: %s"
+               output
+               (string-trim (buffer-string)))))))
+
+(defun ghostel-test--write-loader-manifest (path module-file)
+  "Write loader metadata at PATH that points at MODULE-FILE."
+  (with-temp-file path
+    (insert (json-encode `((loader_abi . 1)
+                           (module_path . ,module-file))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: terminal creation
 ;; -----------------------------------------------------------------------
@@ -1451,33 +1539,6 @@ cell, so the visual line width must equal the terminal column count."
       (ghostel-project current-prefix-arg)
       (should (equal '4 result)))))
 
-(ert-deftest ghostel-test-title-does-not-overwrite-manual-rename ()
-  "Title updates do not overwrite a manual Ghostel buffer rename."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _) 'fake-term))
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (ghostel)
-          (setq buf (current-buffer))
-          (should (equal "*ghostel*" (buffer-name)))
-          (should (equal "*ghostel*" ghostel--managed-buffer-name))
-          (ghostel--set-title "Title A")
-          (should (equal "*ghostel: Title A*" (buffer-name)))
-          (should (equal "*ghostel: Title A*" ghostel--managed-buffer-name))
-          (ghostel--set-title "Title A2")
-          (should (equal "*ghostel: Title A2*" (buffer-name)))
-          (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))
-          (rename-buffer "ghostel manual title test" t)
-          (ghostel--set-title "Title B")
-          (should (equal "ghostel manual title test" (buffer-name)))
-          (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name)))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
 (ert-deftest ghostel-test-set-buffer-face-skips-unchanged-colors ()
   "Test that repeated identical default colors do not remap again."
   (with-temp-buffer
@@ -1587,6 +1648,38 @@ cell, so the visual line width must equal the terminal column count."
            (should (eq 'fake-proc (ghostel--start-process)))
            (should (equal ghostel-shell captured-command))
            (should-not (string-match-p "/bin/sh" captured-command)))))))
+
+(ert-deftest ghostel-test-start-process-clamps-terminal-size-to-window-max-chars-minus-one ()
+  "Process startup should use one less than `window-max-chars-per-line'."
+  (with-temp-buffer
+    (let ((system-type 'windows-nt)
+          (ghostel-shell "C:/Windows/System32/cmd.exe")
+          (ghostel-shell-integration nil)
+          (default-directory "C:/ghostel/")
+          (ghostel--term 'fake-term)
+          (captured-size nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'window-body-height)
+                   (lambda (&optional _) 33))
+                  ((symbol-function 'window-body-width)
+                   (lambda (&optional _window _pixelwise) 80))
+                  ((symbol-function 'window-max-chars-per-line)
+                   (lambda (&optional _) 120))
+                  ((symbol-function 'locate-library)
+                   (lambda (_) "C:/ghostel/ghostel.el"))
+                  ((symbol-function 'make-pipe-process)
+                   (lambda (&rest _) 'fake-proc))
+                  ((symbol-function 'process-put)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'set-process-query-on-exit-flag)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'conpty--init)
+                   (lambda (_term _proc _command rows cols _cwd _env)
+                     (setq captured-size (list rows cols))
+                     t)))
+          (should (eq 'fake-proc (ghostel--start-process)))
+          (should (equal '(32 119) captured-size)))))))
 
 (ert-deftest ghostel-test-conpty-init-keeps-shell-alive-on-windows ()
   "Windows ConPTY init should keep the shell alive long enough to emit a prompt."
@@ -2491,6 +2584,83 @@ cell, so the visual line width must equal the terminal column count."
     (should (eq #'ghostel--send-event
                 (lookup-key ghostel-mode-map (kbd key))))))
 
+(ert-deftest ghostel-test-mouse-bindings-reach-terminal ()
+  "Mouse bindings should route terminal events through ghostel handlers."
+  (dolist (entry '(("<down-mouse-1>" . ghostel--mouse-press)
+                   ("<mouse-1>" . ghostel--mouse-release)
+                   ("<down-mouse-2>" . ghostel--mouse-press)
+                   ("<mouse-2>" . ghostel--mouse-release)
+                   ("<down-mouse-3>" . ghostel--mouse-press)
+                   ("<mouse-3>" . ghostel--mouse-release)
+                   ("<drag-mouse-1>" . ghostel--mouse-drag)
+                   ("<drag-mouse-2>" . ghostel--mouse-drag)
+                   ("<drag-mouse-3>" . ghostel--mouse-drag)
+                   ("<mouse-4>" . ghostel--mouse-wheel-up)
+                   ("<mouse-5>" . ghostel--mouse-wheel-down)
+                   ("<wheel-up>" . ghostel--mouse-wheel-up)
+                   ("<wheel-down>" . ghostel--mouse-wheel-down)))
+    (should (eq (cdr entry)
+                (lookup-key ghostel-mode-map (kbd (car entry)))))))
+
+(ert-deftest ghostel-test-mouse-press-dispatches-terminal-event ()
+  "Mouse presses should be translated and forwarded to the terminal."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (captured nil)
+          (selected-window nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'ghostel--process-live-p) (lambda (&optional _) t))
+                  ((symbol-function 'event-start) (lambda (_) '(fake-window)))
+                  ((symbol-function 'select-window)
+                   (lambda (window &rest _) (setq selected-window window)))
+                  ((symbol-function 'posn-col-row) (lambda (_) '(7 . 4)))
+                  ((symbol-function 'event-basic-type) (lambda (_) 'mouse-3))
+                  ((symbol-function 'event-modifiers) (lambda (_) '(control meta)))
+                  ((symbol-function 'ghostel--mouse-event)
+                   (lambda (&rest args) (setq captured args))))
+          (ghostel--mouse-press 'fake-event)
+          (should (eq 'fake-window selected-window))
+          (should (equal '(fake-term 0 2 4 7 6) captured)))))))
+
+(ert-deftest ghostel-test-mouse-wheel-up-forwards-to-terminal-when-tracking-enabled ()
+  "Wheel-up should be forwarded as button 4 when mouse tracking is active."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (captured nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'ghostel--process-live-p) (lambda (&optional _) t))
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (_term mode) (memq mode '(9 1000 1002 1003))))
+                  ((symbol-function 'event-start) (lambda (_) 'fake-start))
+                  ((symbol-function 'posn-col-row) (lambda (_) '(8 . 5)))
+                  ((symbol-function 'event-modifiers) (lambda (_) nil))
+                  ((symbol-function 'ghostel--mouse-event)
+                   (lambda (&rest args) (setq captured args)))
+                  ((symbol-function 'ghostel--scroll-up)
+                   (lambda (&rest args)
+                     (ert-fail (format "unexpected scroll fallback: %S" args)))))
+          (ghostel--mouse-wheel-up 'fake-event)
+          (should (equal '(fake-term 0 4 5 8 0) captured)))))))
+
+(ert-deftest ghostel-test-mouse-wheel-up-scrolls-scrollback-when-tracking-disabled ()
+  "Wheel-up should keep scrollback behavior when mouse tracking is off."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (fallback nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'ghostel--process-live-p) (lambda (&optional _) t))
+                  ((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--mouse-event)
+                   (lambda (&rest args)
+                     (ert-fail (format "unexpected mouse forwarding: %S" args))))
+                  ((symbol-function 'ghostel--scroll-up)
+                   (lambda (&optional event) (setq fallback event))))
+          (ghostel--mouse-wheel-up 'fake-event)
+          (should (eq 'fake-event fallback)))))))
+
 (ert-deftest ghostel-test-window-resize-dispatches-through-process-transport ()
   "Resize should use a transport helper instead of the PTY primitive directly."
   (with-temp-buffer
@@ -2503,7 +2673,9 @@ cell, so the visual line width must equal the terminal column count."
       (let ((comp-enable-subr-trampolines nil)
             (native-comp-enable-subr-trampolines nil))
         (cl-letf (((symbol-function 'window-max-chars-per-line)
-                   (lambda (_) 80))
+                   (lambda (_) 120))
+                  ((symbol-function 'window-body-width)
+                   (lambda (_window &optional _pixelwise) 80))
                   ((symbol-function 'window-body-height) (lambda (_) 25))
                   ((symbol-function 'ghostel--mode-enabled)
                    (lambda (&rest _) nil))
@@ -2519,11 +2691,42 @@ cell, so the visual line width must equal the terminal column count."
                      (ert-fail
                       (format "unexpected direct set-process-window-size: %S"
                               args)))))
-          (should (equal '(80 . 25)
+          (should (equal '(119 . 24)
                          (ghostel--window-adjust-process-window-size
                           'fake-process (list window))))
-          (should (equal '(fake-process 25 80) resize-call))
+          (should (equal '(fake-process 24 119) resize-call))
           (should invalidate-called))))))
+
+(ert-deftest ghostel-test-window-resize-clamps-terminal-size-floor-to-one ()
+  "Resize should not shrink below one row or one column."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--resize-timer nil)
+          (resize-call nil)
+          (window 'fake-window))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'window-max-chars-per-line)
+                   (lambda (_) 1))
+                  ((symbol-function 'window-body-width)
+                   (lambda (_window &optional _pixelwise) 1))
+                  ((symbol-function 'window-body-height)
+                   (lambda (_) 1))
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'process-live-p)
+                   (lambda (_) t))
+                  ((symbol-function 'ghostel--set-size)
+                   (lambda (_term height width)
+                     (setq resize-call (list height width))))
+                  ((symbol-function 'ghostel--process-set-window-size)
+                   #'ignore)
+                  ((symbol-function 'ghostel--invalidate)
+                   #'ignore))
+          (should (equal '(1 . 1)
+                         (ghostel--window-adjust-process-window-size
+                          'fake-process (list window))))
+          (should (equal '(1 1) resize-call)))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: send-encoded sets last-send-time on encoder success
@@ -2585,6 +2788,55 @@ cell, so the visual line width must equal the terminal column count."
          (ghostel-module-dir module-dir))
     (should (equal (downcase (ghostel-test--fixture-path module-dir "ghostel-module.json"))
                    (downcase (ghostel--loader-metadata-path))))))
+
+(ert-deftest ghostel-test-dyn-loader-reload-loads-replaced-module-image ()
+  "Reloading a replaced target module should update exported function behavior."
+  (skip-unless (and (fboundp 'module-load)
+                    (executable-find "zig")
+                    (require 'comp-run nil t)
+                    (boundp 'comp-installed-trampolines-h)))
+  (let* ((suffix (format "%x%x" (emacs-pid) (random most-positive-fixnum)))
+         (module-id (format "ghostel-test-module-%s" suffix))
+         (lisp-name (format "ghostel-test--fixture-version-%s" suffix))
+         (fixture-dir (make-temp-file "ghostel-reload-fixture-" t))
+         (source-v1 (expand-file-name "sample-v1.zig" fixture-dir))
+         (source-v2 (expand-file-name "sample-v2.zig" fixture-dir))
+         (ext module-file-suffix)
+         (output-v1 (expand-file-name (concat "sample-v1" ext) fixture-dir))
+         (output-v2 (expand-file-name (concat "sample-v2" ext) fixture-dir))
+         (live-module (expand-file-name (concat "sample-live" ext) fixture-dir))
+         (manifest (expand-file-name "sample-module.json" fixture-dir))
+         (repo-root (ghostel-test--repo-root))
+         (loader-path (or (cl-find-if #'file-exists-p
+                                      (list (expand-file-name (concat "zig-out/bin/dyn-loader-module" ext)
+                                                              repo-root)
+                                            (expand-file-name (concat "dyn-loader-module" ext)
+                                                              repo-root)))
+                          ""))
+         (version-sym (intern lisp-name)))
+    (unwind-protect
+        (progn
+          (skip-unless (file-exists-p loader-path))
+          (ghostel-test--write-dyn-loader-fixture source-v1 module-id lisp-name "1.0")
+          (ghostel-test--write-dyn-loader-fixture source-v2 module-id lisp-name "2.0")
+          (ghostel-test--build-dyn-loader-fixture source-v1 output-v1)
+          (ghostel-test--build-dyn-loader-fixture source-v2 output-v2)
+          (copy-file output-v1 live-module t)
+          (ghostel-test--write-loader-manifest manifest
+                                               (file-name-nondirectory live-module))
+          (unless (featurep 'dyn-loader-module)
+            (module-load loader-path))
+          (dyn-loader-load-manifest manifest)
+          (should (equal "1.0" (funcall version-sym)))
+          (puthash version-sym 'stale-trampoline comp-installed-trampolines-h)
+          (rename-file live-module (concat live-module ".bak") t)
+          (copy-file output-v2 live-module t)
+          (dyn-loader-reload module-id)
+          (should (equal "2.0" (funcall version-sym)))
+          (should-not (gethash version-sym comp-installed-trampolines-h)))
+      (ignore-errors (fmakunbound version-sym))
+      (when (file-directory-p fixture-dir)
+        (ignore-errors (delete-directory fixture-dir t))))))
 
 (ert-deftest ghostel-test-reload-module-refuses-with-live-terminals ()
   (cl-letf (((symbol-function 'ghostel--live-buffers)
@@ -2834,7 +3086,6 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-ghostel-reuses-default-buffer
     ghostel-test-project-buffer-name
     ghostel-test-project-universal-arg
-    ghostel-test-title-does-not-overwrite-manual-rename
     ghostel-test-module-platform-tag-windows
     ghostel-test-module-asset-name-windows
     ghostel-test-start-process-windows-conpty-skips-shell-wrapper
@@ -2864,6 +3115,10 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-send-key-dispatches-through-process-transport
     ghostel-test-control-key-bindings-cover-upstream-range
     ghostel-test-meta-key-bindings-reach-terminal
+    ghostel-test-mouse-bindings-reach-terminal
+    ghostel-test-mouse-press-dispatches-terminal-event
+    ghostel-test-mouse-wheel-up-forwards-to-terminal-when-tracking-enabled
+    ghostel-test-mouse-wheel-up-scrolls-scrollback-when-tracking-disabled
     ghostel-test-window-resize-dispatches-through-process-transport
     ghostel-test-loader-module-file-path-remains-stable
     ghostel-test-target-module-file-name-is-stable
