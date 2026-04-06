@@ -441,15 +441,17 @@ Choice: " url)
       (?s nil))))
 
 (defun ghostel--package-version ()
-  "Return ghostel package version string, or nil.
-Returns nil without error when `package.el' is unavailable."
-  (when (and (require 'package nil t)
-             (boundp 'package-alist)
-             (fboundp 'package-desc-version)
-             (fboundp 'package-version-join))
-    (let ((pkg (car (alist-get 'ghostel package-alist))))
-      (when pkg
-        (package-version-join (package-desc-version pkg))))))
+  "Return ghostel release version string, or nil.
+Reads the Version header from ghostel.el so the download URL
+matches the GitHub release tag even when MELPA rewrites the
+version to a date-based string."
+  (require 'lisp-mnt nil t)
+  (when (fboundp 'lm-header)
+    (let ((lib (or load-file-name (locate-library "ghostel"))))
+      (when lib
+        (with-temp-buffer
+          (insert-file-contents lib nil 0 1024)
+          (lm-header "Version"))))))
 
 (defun ghostel--download-file (url dest)
   "Download URL to DEST.  Return non-nil on success."
@@ -499,22 +501,6 @@ The output is shown in a *ghostel-build* compilation buffer."
                                                     default-directory))))
     (compile (expand-file-name "build.sh") t)))
 
-(defun ghostel--elisp-version ()
-  "Return the ghostel Elisp version from the package header."
-  (or (ghostel--package-version)
-      ;; Fall back to parsing the header from the source file.
-      (let ((file (or load-file-name
-                      (locate-library "ghostel")
-                      buffer-file-name)))
-        (when file
-          ;; Ensure we read the .el source, not a .elc byte-compiled file.
-          (when (string-suffix-p ".elc" file)
-            (setq file (substring file 0 -1)))
-          (when (file-exists-p file)
-            (with-temp-buffer
-              (insert-file-contents file nil 0 512)
-              (when (re-search-forward "^;; Version: \\([0-9.]+\\)" nil t)
-                (match-string 1))))))))
 
 (defun ghostel--check-module-version (dir)
   "Check if the loaded module is older than required.

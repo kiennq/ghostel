@@ -1163,11 +1163,11 @@ cell, so the visual line width must equal the terminal column count."
 ;; Test: module version check
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-elisp-version ()
-  "Test that `ghostel--elisp-version' returns a version string."
-  (let ((ver (ghostel--elisp-version)))
+(ert-deftest ghostel-test-package-version ()
+  "Test that `ghostel--package-version' returns a version string."
+  (let ((ver (ghostel--package-version)))
     (should (stringp ver))
-    (should (string-match-p "^[0-9]+\\.[0-9]+" ver))))
+    (should (string-match-p "^[0-9]+\\.[0-9]+\\.[0-9]+" ver))))
 
 (ert-deftest ghostel-test-module-version-match ()
   "Test that version check does nothing when module meets minimum."
@@ -1420,7 +1420,7 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-osc51-eval-unknown
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
-    ghostel-test-elisp-version
+    ghostel-test-package-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
