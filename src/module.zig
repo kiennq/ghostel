@@ -51,7 +51,6 @@ pub fn ghostelNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value,
         term.setUserdata(term) catch break :blk false;
         term.setWritePty(&writePtyCallback) catch break :blk false;
         term.setBell(&bellCallback) catch break :blk false;
-        term.setTitleChanged(&titleChangedCallback) catch break :blk false;
         term.setDeviceAttributes(&deviceAttributesCallback) catch break :blk false;
         break :blk true;
     };
@@ -780,16 +779,6 @@ fn deviceAttributesCallback(_: gt.Terminal, _: ?*anyopaque, out: [*c]gt.DeviceAt
         .unit_id = 0,
     };
     return true;
-}
-
-/// Called when the terminal title changes.
-fn titleChangedCallback(_: gt.Terminal, userdata: ?*anyopaque) callconv(.c) void {
-    const term: *Terminal = @ptrCast(@alignCast(userdata));
-    const env = term.env orelse return;
-
-    if (term.getTitle()) |title| {
-        _ = env.call1(emacs.sym.@"ghostel--set-title", env.makeString(title));
-    }
 }
 
 fn normalizeBareLfAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
