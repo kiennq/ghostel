@@ -31,11 +31,11 @@ checkdoc:
 		--eval "(let ((sentence-end-double-space nil) \
 		              (checkdoc-proper-noun-list nil) \
 		              (checkdoc-verb-check-experimental-flag nil) \
-		              (inhibit-message t) \
 		              (ok t)) \
 		  (dolist (f '(\"ghostel.el\" \"ghostel-debug.el\")) \
 		    (ignore-errors (kill-buffer \"*Warnings*\")) \
-		    (checkdoc-file f) \
+		    (let ((inhibit-message t)) \
+		      (checkdoc-file f)) \
 		    (when (get-buffer \"*Warnings*\") \
 		      (setq ok nil) \
 		      (with-current-buffer \"*Warnings*\" \
