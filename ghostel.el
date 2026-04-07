@@ -1977,7 +1977,7 @@ wheel events reach ghostel's own scroll commands."
 
 ;;;###autoload
 (defun ghostel (&optional arg)
-  "Start a new Ghostel terminal. If the buffer already exists, switch to it.
+  "Start a new Ghostel terminal.  If the buffer already exists, switch to it.
 With a non-numeric prefix arg, create a new buffer.
 With a numeric prefix ARG, switch to the buffer with that number or
 create it if it doesn't exist yet.
@@ -1999,17 +1999,17 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
                        (generate-new-buffer ghostel-buffer-name))
                       (t
                        (get-buffer-create ghostel-buffer-name)))))
-    (with-current-buffer buffer
-      (unless (derived-mode-p 'ghostel-mode)
-        (ghostel-mode)
-        (setq ghostel--managed-buffer-name (buffer-name))
-        (let* ((height (window-body-height))
-               (width (window-max-chars-per-line)))
-          (setq ghostel--term
-                (ghostel--new height width ghostel-max-scrollback))
-          (ghostel--apply-palette ghostel--term))
-        (ghostel--start-process)))
-    (switch-to-buffer buffer)))
+    (pop-to-buffer buffer (append display-buffer--same-window-action
+                                  '((category . comint))))
+    (unless (derived-mode-p 'ghostel-mode)
+      (ghostel-mode)
+      (setq ghostel--managed-buffer-name (buffer-name))
+      (let* ((height (window-body-height))
+             (width (window-max-chars-per-line)))
+        (setq ghostel--term
+              (ghostel--new height width ghostel-max-scrollback))
+        (ghostel--apply-palette ghostel--term))
+      (ghostel--start-process))))
 
 ;;;###autoload
 (defun ghostel-project (&optional arg)
@@ -2037,7 +2037,8 @@ To add this to `project-switch-commands':
          (current (current-buffer))
          (others (cl-remove current bufs)))
     (if others
-        (switch-to-buffer (car others))
+        (pop-to-buffer (car others) (append display-buffer--same-window-action
+                                            '((category . comint))))
       (ghostel))))
 
 (provide 'ghostel)
