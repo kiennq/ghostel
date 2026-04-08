@@ -8,7 +8,7 @@
 /// - DIRTY_FULL: erase buffer and redraw everything
 /// - DIRTY_PARTIAL: only update dirty rows in-place
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Terminal = @import("terminal.zig");
 
@@ -227,7 +227,7 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
     env.putTextProperty(start_val, end_val, s.face, face);
 }
 
-/// A hyperlink span detected from the terminal grid.
+/// A hyperlink span detected from the HTML formatter output.
 const HyperlinkSpan = struct {
     row: u16,
     col_start: u16,
@@ -242,102 +242,208 @@ const HyperlinkResult = struct {
     uri_used: usize,
 };
 
-/// Scan specific rows for hyperlinks using the grid_ref API.
-/// Queries each cell directly for its hyperlink URI, coalescing
-/// adjacent cells with the same URI into spans.
-fn scanHyperlinksFromGrid(
-    terminal: gt.Terminal,
-    cols: u16,
-    hyperlink_rows: []const u16,
+/// Scan the terminal for hyperlinks using the HTML formatter.
+/// Returns the number of hyperlink spans found.
+fn scanHyperlinks(
+    allocator: std.mem.Allocator,
+    term: *Terminal,
     spans: []HyperlinkSpan,
     uri_buf: []u8,
 ) HyperlinkResult {
+    // Create HTML formatter
+    var opts = std.mem.zeroes(gt.FormatterTerminalOptions);
+    opts.size = @sizeOf(gt.FormatterTerminalOptions);
+    opts.emit = @intCast(gt.FORMATTER_FORMAT_HTML);
+
+    var formatter: gt.Formatter = undefined;
+    if (gt.c.ghostty_formatter_terminal_new(null, &formatter, term.terminal, opts) != gt.SUCCESS) {
+        return .{ .count = 0, .uri_used = 0 };
+    }
+    defer gt.c.ghostty_formatter_free(formatter);
+
+    // Format into a stack buffer; fall back to heap if too small
+    var html_buf: [262144]u8 = undefined;
+    var out_len: usize = 0;
+    if (gt.c.ghostty_formatter_format_buf(formatter, &html_buf, html_buf.len, &out_len) == gt.SUCCESS) {
+        return parseHtmlHyperlinks(html_buf[0..out_len], spans, uri_buf);
+    }
+
+    const heap_buf = allocator.alloc(u8, 1024 * 1024) catch {
+        return .{ .count = 0, .uri_used = 0 };
+    };
+    defer allocator.free(heap_buf);
+    if (gt.c.ghostty_formatter_format_buf(formatter, heap_buf.ptr, heap_buf.len, &out_len) != gt.SUCCESS) {
+        return .{ .count = 0, .uri_used = 0 };
+    }
+    return parseHtmlHyperlinks(heap_buf[0..out_len], spans, uri_buf);
+}
+
+/// Parse HTML output to extract hyperlink spans and their URIs.
+fn parseHtmlHyperlinks(
+    html: []const u8,
+    spans: []HyperlinkSpan,
+    uri_buf: []u8,
+) HyperlinkResult {
+    var row: u16 = 0;
+    var col: u16 = 0;
     var span_count: usize = 0;
     var uri_used: usize = 0;
 
-    for (hyperlink_rows) |row| {
-        var in_link = false;
-        var link_start_col: u16 = 0;
-        var link_uri_start: usize = 0;
-        var link_uri_len: usize = 0;
+    var in_link = false;
+    var link_start_col: u16 = 0;
+    var link_start_row: u16 = 0;
+    var link_uri_start: usize = 0;
+    var link_uri_len: usize = 0;
 
-        for (0..cols) |col_idx| {
-            const col: u16 = @intCast(col_idx);
+    const a_open = "<a href=\"";
+    const a_close = "</a>";
 
-            // Build viewport point for this cell
-            var point: gt.Point = undefined;
-            point.tag = gt.c.GHOSTTY_POINT_TAG_VIEWPORT;
-            point.value = .{ .coordinate = .{ .x = col, .y = @intCast(row) } };
+    var i: usize = 0;
+    while (i < html.len) {
+        if (html[i] == '<') {
+            const remaining = html[i..];
+            if (remaining.len >= a_open.len and std.mem.eql(u8, remaining[0..a_open.len], a_open)) {
+                // <a href="URI"> — extract URI
+                const uri_start_idx = i + a_open.len;
+                var uri_end_idx = uri_start_idx;
+                while (uri_end_idx < html.len and html[uri_end_idx] != '"') : (uri_end_idx += 1) {}
 
-            // Resolve grid ref
-            var grid_ref = std.mem.zeroes(gt.GridRef);
-            grid_ref.size = @sizeOf(gt.GridRef);
-            if (gt.c.ghostty_terminal_grid_ref(terminal, point, &grid_ref) != gt.SUCCESS) {
+                const raw_uri = html[uri_start_idx..uri_end_idx];
+                // Un-escape HTML entities in the URI
+                const decoded_len = htmlUnescapeInto(raw_uri, uri_buf[uri_used..]);
+                if (decoded_len > 0) {
+                    link_uri_start = uri_used;
+                    link_uri_len = decoded_len;
+                    uri_used += decoded_len;
+                }
+
+                // Close any previous open link
                 if (in_link and span_count < spans.len and col > link_start_col) {
-                    spans[span_count] = .{ .row = row, .col_start = link_start_col, .col_end = col, .uri_start = link_uri_start, .uri_len = link_uri_len };
+                    spans[span_count] = .{
+                        .row = link_start_row,
+                        .col_start = link_start_col,
+                        .col_end = col,
+                        .uri_start = link_uri_start,
+                        .uri_len = link_uri_len,
+                    };
                     span_count += 1;
                 }
-                in_link = false;
+
+                in_link = true;
+                link_start_row = row;
+                link_start_col = col;
+
+                // Skip to end of tag
+                while (i < html.len and html[i] != '>') : (i += 1) {}
+                if (i < html.len) i += 1;
                 continue;
-            }
-
-            // Query hyperlink URI (stack buffer; heap fallback for long URIs)
-            var uri_stack: [2048]u8 = undefined;
-            var out_len: usize = 0;
-            var result = gt.c.ghostty_grid_ref_hyperlink_uri(&grid_ref, &uri_stack, uri_stack.len, &out_len);
-            var heap_uri: ?[]u8 = null;
-            defer if (heap_uri) |buf| std.heap.c_allocator.free(buf);
-
-            if (result == gt.OUT_OF_SPACE and out_len > uri_stack.len) {
-                if (std.heap.c_allocator.alloc(u8, out_len)) |buf| {
-                    heap_uri = buf;
-                    result = gt.c.ghostty_grid_ref_hyperlink_uri(&grid_ref, buf.ptr, buf.len, &out_len);
-                } else |_| {}
-            }
-
-            if (result == gt.SUCCESS and out_len > 0) {
-                const uri = if (heap_uri) |buf| buf[0..out_len] else uri_stack[0..out_len];
-                // Check if this extends the current span (same URI)
-                if (in_link and link_uri_len == out_len and
-                    std.mem.eql(u8, uri_buf[link_uri_start..link_uri_start + link_uri_len], uri))
-                {
-                    // Same URI — span continues
-                } else {
-                    // Close previous span if any
-                    if (in_link and span_count < spans.len and col > link_start_col) {
-                        spans[span_count] = .{ .row = row, .col_start = link_start_col, .col_end = col, .uri_start = link_uri_start, .uri_len = link_uri_len };
+            } else if (remaining.len >= a_close.len and std.mem.eql(u8, remaining[0..a_close.len], a_close)) {
+                // </a> — end hyperlink
+                if (in_link and span_count < spans.len) {
+                    const start_col = if (row == link_start_row) link_start_col else 0;
+                    if (col > start_col) {
+                        spans[span_count] = .{
+                            .row = row,
+                            .col_start = start_col,
+                            .col_end = col,
+                            .uri_start = link_uri_start,
+                            .uri_len = link_uri_len,
+                        };
                         span_count += 1;
                     }
-                    // Start new span, copy URI to shared buffer
-                    if (uri_used + out_len <= uri_buf.len) {
-                        @memcpy(uri_buf[uri_used .. uri_used + out_len], uri);
-                        link_uri_start = uri_used;
-                        link_uri_len = out_len;
-                        uri_used += out_len;
-                        link_start_col = col;
-                        in_link = true;
-                    } else {
-                        in_link = false;
-                    }
-                }
-            } else {
-                // No hyperlink on this cell — close any open span
-                if (in_link and span_count < spans.len and col > link_start_col) {
-                    spans[span_count] = .{ .row = row, .col_start = link_start_col, .col_end = col, .uri_start = link_uri_start, .uri_len = link_uri_len };
-                    span_count += 1;
                 }
                 in_link = false;
+                i += a_close.len;
+                continue;
+            } else {
+                // Other tag — skip to closing >
+                while (i < html.len and html[i] != '>') : (i += 1) {}
+                if (i < html.len) i += 1;
+                continue;
             }
-        }
-
-        // Close span at end of row
-        if (in_link and span_count < spans.len and cols > link_start_col) {
-            spans[span_count] = .{ .row = row, .col_start = link_start_col, .col_end = cols, .uri_start = link_uri_start, .uri_len = link_uri_len };
-            span_count += 1;
+        } else if (html[i] == '&') {
+            // HTML entity — counts as 1 visible character
+            while (i < html.len and html[i] != ';') : (i += 1) {}
+            if (i < html.len) i += 1;
+            col += 1;
+        } else if (html[i] == '\n') {
+            // Row boundary
+            if (in_link) {
+                const start_col = if (row == link_start_row) link_start_col else 0;
+                if (col > start_col and span_count < spans.len) {
+                    spans[span_count] = .{
+                        .row = row,
+                        .col_start = start_col,
+                        .col_end = col,
+                        .uri_start = link_uri_start,
+                        .uri_len = link_uri_len,
+                    };
+                    span_count += 1;
+                }
+                // Link continues on next row
+                link_start_row = row + 1;
+                link_start_col = 0;
+            }
+            row += 1;
+            col = 0;
+            i += 1;
+        } else {
+            // Regular character — advance column, handle UTF-8
+            if (html[i] & 0x80 == 0) {
+                i += 1;
+            } else if (html[i] & 0xE0 == 0xC0) {
+                i += 2;
+            } else if (html[i] & 0xF0 == 0xE0) {
+                i += 3;
+            } else {
+                i += @min(4, html.len - i);
+            }
+            col += 1;
         }
     }
 
     return .{ .count = span_count, .uri_used = uri_used };
+}
+
+/// Decode HTML entities in src into dst. Returns number of bytes written.
+fn htmlUnescapeInto(src: []const u8, dst: []u8) usize {
+    var di: usize = 0;
+    var si: usize = 0;
+    while (si < src.len and di < dst.len) {
+        if (src[si] == '&') {
+            const rem = src[si..];
+            if (std.mem.startsWith(u8, rem, "&amp;")) {
+                dst[di] = '&';
+                di += 1;
+                si += 5;
+            } else if (std.mem.startsWith(u8, rem, "&lt;")) {
+                dst[di] = '<';
+                di += 1;
+                si += 4;
+            } else if (std.mem.startsWith(u8, rem, "&gt;")) {
+                dst[di] = '>';
+                di += 1;
+                si += 4;
+            } else if (std.mem.startsWith(u8, rem, "&quot;")) {
+                dst[di] = '"';
+                di += 1;
+                si += 6;
+            } else if (std.mem.startsWith(u8, rem, "&#39;")) {
+                dst[di] = '\'';
+                di += 1;
+                si += 5;
+            } else {
+                dst[di] = src[si];
+                di += 1;
+                si += 1;
+            }
+        } else {
+            dst[di] = src[si];
+            di += 1;
+            si += 1;
+        }
+    }
+    return di;
 }
 
 /// Apply hyperlink text properties to the Emacs buffer.
@@ -678,7 +784,7 @@ pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
 
 /// Redraw the terminal into the current Emacs buffer.
 /// When force_full is true, always erase and rebuild (matches Ghostty GPU behaviour).
-pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
+pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool, allocator: std.mem.Allocator) void {
     // Update render state from terminal
     if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
         return;
@@ -689,8 +795,6 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     var dirty: c_int = gt.DIRTY_FALSE;
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty));
     var has_hyperlinks: bool = false;
-    var hyperlink_rows: [256]u16 = undefined;
-    var hyperlink_row_count: usize = 0;
     var has_wide_chars: bool = false;
 
     if (dirty != gt.DIRTY_FALSE) {
@@ -748,16 +852,12 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
             }
 
             // Check for hyperlinks (row-level flag, may have false positives)
-            {
+            if (!has_hyperlinks) {
                 var raw_row: gt.c.GhosttyRow = undefined;
                 if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW, @ptrCast(&raw_row)) == gt.SUCCESS) {
                     var row_has_links: bool = false;
                     _ = gt.c.ghostty_row_get(raw_row, gt.ROW_DATA_HYPERLINK, @ptrCast(&row_has_links));
-                    if (row_has_links and hyperlink_row_count < hyperlink_rows.len) {
-                        hyperlink_rows[hyperlink_row_count] = @intCast(row_count);
-                        hyperlink_row_count += 1;
-                        has_hyperlinks = true;
-                    }
+                    if (row_has_links) has_hyperlinks = true;
                 }
             }
 
@@ -835,18 +935,13 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     }
 
     // Scan for hyperlinks and apply text properties (before cursor positioning).
-    // Uses the grid_ref API to query hyperlink URIs directly from cells,
-    // only for rows flagged with GHOSTTY_ROW_DATA_HYPERLINK.
+    // Only run the expensive HTML formatter when a viewport row actually has
+    // a hyperlink — this avoids formatting the entire terminal (including
+    // scrollback) on every redraw.
     if (dirty != gt.DIRTY_FALSE and has_hyperlinks) {
         var hl_spans: [128]HyperlinkSpan = undefined;
         var hl_uri_buf: [8192]u8 = undefined;
-        const hl = scanHyperlinksFromGrid(
-            term.terminal,
-            term.cols,
-            hyperlink_rows[0..hyperlink_row_count],
-            &hl_spans,
-            &hl_uri_buf,
-        );
+        const hl = scanHyperlinks(allocator, term, &hl_spans, &hl_uri_buf);
         if (hl.count > 0) {
             applyHyperlinks(env, &hl_spans, hl.count, &hl_uri_buf);
         }
