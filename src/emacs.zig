@@ -3,16 +3,12 @@
 /// Provides type-safe access to emacs_env functions, cached symbol
 /// interning, and helper methods for common operations.
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const c = @cImport({
-    // Detect musl from Zig's target ABI and tell the wrapper header.
-    // We cannot rely on __GLIBC__ because Zig's translate-c does not
-    // implicitly include glibc's <features.h>.
-    if (builtin.abi == .musl or builtin.abi == .musleabi or builtin.abi == .musleabihf) {
-        @cDefine("GHOSTEL_MUSL", "1");
-    }
-    @cInclude("emacs-module-wrapper.h");
+    // Ensure struct timespec is fully defined on Linux (glibc gates it
+    // behind _POSIX_C_SOURCE).  Harmless on macOS/BSDs.
+    @cDefine("_POSIX_C_SOURCE", "199309L");
+    @cInclude("emacs-module.h");
 });
 
 /// Emacs value type alias for convenience.
@@ -23,7 +19,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     // --- Symbol interning ---
@@ -159,6 +157,10 @@ pub const Env = struct {
         self.raw.non_local_exit_signal.?(self.raw, symbol, data);
     }
 
+    pub fn openChannel(self: Env, process: Value) i32 {
+        return self.raw.open_channel.?(self.raw, process);
+    }
+
     // --- Function registration ---
 
     pub fn makeFunction(
@@ -240,6 +242,14 @@ pub const Env = struct {
         _ = self.call4(sym.@"put-text-property", start, end, prop, value);
     }
 
+    pub fn bufferReadOnly(self: Env) bool {
+        return self.isNotNil(self.call1(sym.@"symbol-value", sym.@"buffer-read-only"));
+    }
+
+    pub fn setBufferReadOnly(self: Env, read_only: bool) void {
+        _ = self.call2(sym.@"set", sym.@"buffer-read-only", if (read_only) self.t() else self.nil());
+    }
+
     /// Signal an error with a message string.
     pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
@@ -283,7 +293,9 @@ pub const Sym = struct {
     // Built-in functions
     cons: Value,
     list: Value,
+    @"set": Value,
     @"symbol-value": Value,
+    @"buffer-read-only": Value,
     @"put-text-property": Value,
     @"goto-char": Value,
     point: Value,
@@ -316,16 +328,22 @@ pub const Sym = struct {
     @"ghostel--osc52-handle": Value,
     @"ghostel--osc133-marker": Value,
     @"ghostel--flush-output": Value,
-    @"ghostel--set-title": Value,
     ding: Value,
 };
 
 pub var sym: Sym = undefined;
+var sym_initialized = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
 pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
     inline for (std.meta.fields(Sym)) |field| {
         @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
     }
+    sym_initialized = true;
 }

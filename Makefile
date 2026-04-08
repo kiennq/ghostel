@@ -11,7 +11,7 @@ ELC := ghostel.elc ghostel-debug.elc
 all: build test-all test-evil lint
 
 build:
-	./build.sh
+	zig build
 
 check:
 	zig build check
@@ -34,7 +34,7 @@ test-evil:
 		git clone --depth 1 https://github.com/emacs-evil/evil.git "$(EVIL_DIR)"; \
 	fi
 	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L . \
-		-l ert -l test/evil-ghostel-test.el -f evil-ghostel-test-run
+		-l ert -l test/ghostel-evil-test.el -f ghostel-evil-test-run
 
 byte-compile: $(ELC)
 
@@ -79,6 +79,7 @@ bench-quick:
 	bash bench/run-bench.sh --quick
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f conpty-module.dll conpty-module.dylib conpty-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache
