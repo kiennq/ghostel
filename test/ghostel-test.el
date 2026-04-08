@@ -3595,6 +3595,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-module-version-newer-than-minimum
     ghostel-test-title-does-not-overwrite-manual-rename
     ghostel-test-title-tracking-disabled
+    ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output
     ghostel-test-immediate-redraw-skips-stale-send
@@ -3607,6 +3608,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-scroll-on-input-send-event
     ghostel-test-scroll-on-input-disabled
     ghostel-test-scroll-forwards-mouse-tracking
+    ghostel-test-scroll-fallback-no-mouse-tracking
     ghostel-test-control-key-bindings
     ghostel-test-meta-key-bindings
     ghostel-test-send-key-dispatches-through-process-transport
