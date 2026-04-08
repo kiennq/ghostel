@@ -3588,8 +3588,13 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-module-download-url-uses-minimum-version
     ghostel-test-download-module-prefix-empty-uses-latest
     ghostel-test-download-module-prefix-rejects-too-old-version
+    ghostel-test-compile-module-invokes-zig-build
     ghostel-test-module-compile-command-uses-package-dir
+    ghostel-test-compile-module-publishes-module-and-conpty
     ghostel-test-replace-module-file-deletes-before-rotating
+    ghostel-test-publish-downloaded-module-archive-preserves-existing-windows-backups
+    ghostel-test-publish-built-module-artifacts-rotates-existing-windows-modules
+    ghostel-test-publish-built-module-artifacts-errors-when-conpty-missing
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
@@ -3618,6 +3623,9 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-conpty-module-file-path-uses-custom-dir
     ghostel-test-module-file-path-uses-custom-dir
     ghostel-test-download-module-publishes-downloaded-archive
+    ghostel-test-load-module-if-available-loads-conpty-module-on-windows
+    ghostel-test-load-module-if-available-skips-when-module-missing
+    ghostel-test-ensure-conpty-loaded-errors-when-module-missing
     ghostel-test-sentinel-kills-conpty-backend-on-exit
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h
