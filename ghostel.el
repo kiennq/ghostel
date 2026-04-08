@@ -996,11 +996,12 @@ Used for prompt navigation and optional re-application after full redraws.")
     ;; Prompt navigation (OSC 133)
     (define-key map (kbd "C-c C-n")   #'ghostel-next-prompt)
     (define-key map (kbd "C-c C-p")   #'ghostel-previous-prompt)
-    ;; Mouse wheel for scrollback
-    (define-key map (kbd "<mouse-4>")       #'ghostel--scroll-up)
-    (define-key map (kbd "<mouse-5>")       #'ghostel--scroll-down)
-    (define-key map (kbd "<wheel-up>")      #'ghostel--scroll-up)
-    (define-key map (kbd "<wheel-down>")    #'ghostel--scroll-down)
+    ;; Mouse wheel: forward to the terminal when mouse reporting is enabled,
+    ;; otherwise keep the existing scrollback behavior.
+    (define-key map (kbd "<mouse-4>")       #'ghostel--mouse-wheel-up)
+    (define-key map (kbd "<mouse-5>")       #'ghostel--mouse-wheel-down)
+    (define-key map (kbd "<wheel-up>")      #'ghostel--mouse-wheel-up)
+    (define-key map (kbd "<wheel-down>")    #'ghostel--mouse-wheel-down)
     ;; Mouse click events (for terminal mouse tracking)
     (define-key map (kbd "<down-mouse-1>")  #'ghostel--mouse-press)
     (define-key map (kbd "<mouse-1>")       #'ghostel--mouse-release)
@@ -1515,48 +1516,71 @@ boundary (nothing to scroll into), does nothing."
     (when (memq 'meta mods) (setq result (logior result 2)))
     result))
 
+(defconst ghostel--mouse-tracking-modes '(9 1000 1002 1003)
+  "DEC private modes that enable VT mouse reporting.")
+
+(defun ghostel--mouse-tracking-enabled-p ()
+  "Return non-nil when the terminal is actively reporting mouse events."
+  (and ghostel--term
+       (cl-some (lambda (mode)
+                  (ghostel--mode-enabled ghostel--term mode))
+                ghostel--mouse-tracking-modes)))
+
+(defun ghostel--mouse-position (event &optional endp)
+  "Return `(COL . ROW)' for EVENT using its start position or ENDP."
+  (let* ((posn (if endp (event-end event) (event-start event)))
+         (col-row (posn-col-row posn)))
+    (cons (max 0 (or (car col-row) 0))
+          (max 0 (or (cdr col-row) 0)))))
+
+(defun ghostel--send-mouse-event (event action button &optional endp)
+  "Forward EVENT to the terminal with ACTION and BUTTON.
+When ENDP is non-nil, use `event-end' for the mouse position."
+  (when (and ghostel--term (ghostel--process-live-p))
+    (pcase-let ((`(,col . ,row) (ghostel--mouse-position event endp)))
+      (ghostel--mouse-event ghostel--term
+                            action
+                            button
+                            row col
+                            (ghostel--mouse-mods event)))))
+
 (defun ghostel--mouse-press (event)
   "Handle mouse button press EVENT for terminal mouse tracking."
   (interactive "e")
   (select-window (posn-window (event-start event)))
-  (when (and ghostel--term (ghostel--process-live-p))
-    (let* ((posn (event-start event))
-           (col-row (posn-col-row posn))
-           (col (car col-row))
-           (row (cdr col-row)))
-      (ghostel--mouse-event ghostel--term
-                            0  ; press
-                            (ghostel--mouse-button-number event)
-                            row col
-                            (ghostel--mouse-mods event)))))
+  (ghostel--send-mouse-event event
+                             0
+                             (ghostel--mouse-button-number event)))
 
 (defun ghostel--mouse-release (event)
   "Handle mouse button release EVENT for terminal mouse tracking."
   (interactive "e")
-  (when (and ghostel--term (ghostel--process-live-p))
-    (let* ((posn (event-end event))
-           (col-row (posn-col-row posn))
-           (col (car col-row))
-           (row (cdr col-row)))
-      (ghostel--mouse-event ghostel--term
-                            1  ; release
-                            (ghostel--mouse-button-number event)
-                            row col
-                            (ghostel--mouse-mods event)))))
+  (ghostel--send-mouse-event event
+                             1
+                             (ghostel--mouse-button-number event)
+                             t))
 
 (defun ghostel--mouse-drag (event)
   "Handle mouse drag EVENT as motion for terminal mouse tracking."
   (interactive "e")
-  (when (and ghostel--term (ghostel--process-live-p))
-    (let* ((posn (event-end event))
-           (col-row (posn-col-row posn))
-           (col (car col-row))
-           (row (cdr col-row)))
-      (ghostel--mouse-event ghostel--term
-                            2  ; motion
-                            (ghostel--mouse-button-number event)
-                            row col
-                            (ghostel--mouse-mods event)))))
+  (ghostel--send-mouse-event event
+                             2
+                             (ghostel--mouse-button-number event)
+                             t))
+
+(defun ghostel--mouse-wheel-up (event)
+  "Handle wheel-up EVENT for mouse reporting or viewport scrollback."
+  (interactive "e")
+  (if (ghostel--mouse-tracking-enabled-p)
+      (ghostel--send-mouse-event event 0 4)
+    (ghostel--scroll-up event)))
+
+(defun ghostel--mouse-wheel-down (event)
+  "Handle wheel-down EVENT for mouse reporting or viewport scrollback."
+  (interactive "e")
+  (if (ghostel--mouse-tracking-enabled-p)
+      (ghostel--send-mouse-event event 0 5)
+    (ghostel--scroll-down event)))
 
 
 ;;; Copy mode
