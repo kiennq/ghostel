@@ -38,53 +38,6 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - uses: purcell/setup-emacs@master
-        with:
-          version: '29.4'
-
-      - name: Find Emacs module header
-        run: |
-          set -e
-          EMACS_BIN="$(command -v emacs || true)"
-          HEADER=""
-
-          if [ -n "$EMACS_BIN" ]; then
-            EMACS_BIN_DIR="$(dirname "$EMACS_BIN")"
-            for dir in "$EMACS_BIN_DIR/../include" "$EMACS_BIN_DIR/../share/emacs/include"; do
-              if [ -f "$dir/emacs-module.h" ]; then
-                HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                break
-              fi
-            done
-
-            if [ -z "$HEADER" ] && [ -L "$EMACS_BIN" ]; then
-              REAL_DIR="$(dirname "$(readlink -f "$EMACS_BIN")")"
-              for dir in "$REAL_DIR/../include" "$REAL_DIR/../../include"; do
-                if [ -f "$dir/emacs-module.h" ]; then
-                  HEADER="$(cd "$dir" && pwd)/emacs-module.h"
-                  break
-                fi
-              done
-            fi
-          fi
-
-          if [ -z "$HEADER" ]; then
-            for dir in /usr/include /usr/local/include /opt/homebrew/include; do
-              FOUND="$(find "$dir" -maxdepth 5 -name emacs-module.h -print -quit 2>/dev/null || true)"
-              if [ -n "$FOUND" ]; then
-                HEADER="$FOUND"
-                break
-              fi
-            done
-          fi
-
-          if [ -z "$HEADER" ]; then
-            echo "::error::emacs-module.h not found"
-            exit 1
-          fi
-          echo "EMACS_INCLUDE_DIR=$(dirname "$HEADER")" >> "$GITHUB_ENV"
-          echo "Found emacs-module.h at: $HEADER"
-
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -93,9 +46,9 @@ jobs:
       - name: Build native module
         run: |
           if [ -n "${{ matrix.target }}" ]; then
-            ./build.sh -t "${{ matrix.target }}"
+            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
           else
-            ./build.sh
+            zig build -Doptimize=ReleaseFast
           fi
 
       - name: Strip non-exported symbols (macOS)

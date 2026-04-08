@@ -81,32 +81,41 @@ pre-built binary** or **compile from source** (controlled by
 manually:
 
 - `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
-- `M-x ghostel-module-compile` — build from source via `build.sh`
+- `M-x ghostel-module-compile` — build from source via `zig build`
 
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
+Ghostel vendors a generated `include/emacs-module.h`, so normal builds do not
+require local Emacs headers or an Emacs source checkout.  If you want to
+override the vendored header, set `EMACS_INCLUDE_DIR` to a directory containing
+`emacs-module.h`, or set `EMACS_SOURCE_DIR` to an Emacs source checkout and
+Ghostel will generate the header from the upstream module fragments.
 
 ```sh
 # Clone with submodule
 git clone --recurse-submodules https://github.com/dakra/ghostel.git
 cd ghostel
 
+# Optional: override the vendored header with an Emacs source checkout
+# export EMACS_SOURCE_DIR=/path/to/emacs
+
 # Build everything (libghostty-vt + ghostel module)
-./build.sh
+zig build -Doptimize=ReleaseFast
 ```
 
 If you already have the repo, initialize the submodule and build:
 
 ```sh
-git submodule update --init vendor/ghostty
-./build.sh
+git submodule update --init --recursive vendor/ghostty
+zig build -Doptimize=ReleaseFast
 ```
 
 ### Building from source (MELPA install)
 
-MELPA packages only include `.el` files — the build script, Zig sources, and
-ghostty submodule are not included.  This means `M-x ghostel-module-compile`
+MELPA packages only include `.el` files — `build.zig`, the vendored header,
+Zig sources, and the ghostty submodule are not included.  This means
+`M-x ghostel-module-compile`
 is not available when installed from MELPA.
 
 The recommended approach is to download a **pre-built binary** via
@@ -118,7 +127,7 @@ the resulting module into your MELPA package directory:
 ```sh
 git clone --recurse-submodules https://github.com/dakra/ghostel.git
 cd ghostel
-./build.sh
+zig build -Doptimize=ReleaseFast
 
 # Copy the module into your MELPA package directory
 # (adjust the path to match your Emacs package directory and ghostel version)

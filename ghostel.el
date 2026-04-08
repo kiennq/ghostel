@@ -71,7 +71,7 @@
 ;;
 ;; Building the native module:
 ;;
-;;   Run ./build.sh from the project root, or M-x ghostel-module-compile
+;;   Run zig build from the project root, or M-x ghostel-module-compile
 ;;   from within Emacs.  Requires Zig 0.14+ and the vendored ghostty
 ;;   submodule.
 
@@ -415,20 +415,23 @@ Returns non-nil on success."
 (defun ghostel--compile-module (dir)
   "Compile the native module from source in DIR.
 Runs synchronously and returns non-nil on success."
-  (let ((default-directory dir)
-        (script (expand-file-name "build.sh" dir)))
-    (if (file-executable-p script)
-        (progn
-          (message "ghostel: compiling native module (this may take a moment)...")
-          (let ((ret (call-process script nil "*ghostel-build*" nil)))
-            (if (eq ret 0)
-                (progn (message "ghostel: native module compiled successfully") t)
-              (display-warning 'ghostel
-                               "Module compilation failed.  See *ghostel-build* buffer for details.")
-              nil)))
-      (display-warning 'ghostel
-                       (format "build.sh not found in %s.\nClone with submodules and run ./build.sh manually." dir))
-      nil)))
+  (let ((default-directory dir))
+    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (condition-case err
+        (let ((ret (process-file "zig" nil "*ghostel-build*" nil
+                                 "build" "-Doptimize=ReleaseFast")))
+          (if (eq ret 0)
+              (progn (message "ghostel: native module compiled successfully") t)
+            (display-warning 'ghostel
+                             "Module compilation failed.  See *ghostel-build* buffer for details.")
+            nil))
+      (file-missing
+       (display-warning 'ghostel
+                        (format "zig executable not found while compiling in %s" dir))
+       nil)
+      (error
+       (display-warning 'ghostel (error-message-string err))
+       nil))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -514,12 +517,12 @@ version to a date-based string."
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
 (defun ghostel-module-compile ()
-  "Compile the ghostel native module by running build.sh.
+  "Compile the ghostel native module by running zig build.
 The output is shown in a *ghostel-build* compilation buffer."
   (interactive)
   (let ((default-directory (file-name-directory (or (locate-library "ghostel")
                                                     default-directory))))
-    (compile (expand-file-name "build.sh") t)))
+    (compile "zig build -Doptimize=ReleaseFast" t)))
 
 
 (defun ghostel--check-module-version (dir)
@@ -1685,6 +1688,10 @@ DIR may be a file:// URL or a plain path."
     (let ((path (if (string-prefix-p "file://" dir)
                     (url-filename (url-generic-parse-url dir))
                   dir)))
+      (when (and (eq system-type 'windows-nt)
+                 path
+                 (string-match-p "\\`/[[:alpha:]]:/" path))
+        (setq path (substring path 1)))
       (when (and path (file-directory-p path))
         (setq default-directory (file-name-as-directory path))))))
 
