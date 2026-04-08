@@ -71,7 +71,7 @@
 ;;
 ;; Building the native module:
 ;;
-;;   Run ./build.sh from the project root, or M-x ghostel-module-compile
+;;   Run zig build from the project root, or M-x ghostel-module-compile
 ;;   from within Emacs.  Requires Zig 0.14+ and the vendored ghostty
 ;;   submodule.
 
@@ -444,20 +444,23 @@ Returns non-nil on success."
 (defun ghostel--compile-module (dir)
   "Compile the native module from source in DIR.
 Runs synchronously and returns non-nil on success."
-  (let ((default-directory dir)
-        (script (expand-file-name "build.sh" dir)))
-    (if (file-executable-p script)
-        (progn
-          (message "ghostel: compiling native module (this may take a moment)...")
-          (let ((ret (call-process script nil "*ghostel-build*" nil)))
-            (if (eq ret 0)
-                (progn (message "ghostel: native module compiled successfully") t)
-              (display-warning 'ghostel
-                               "Module compilation failed.  See *ghostel-build* buffer for details.")
-              nil)))
-      (display-warning 'ghostel
-                       (format "build.sh not found in %s.\nClone with submodules and run ./build.sh manually." dir))
-      nil)))
+  (let ((default-directory dir))
+    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (condition-case err
+        (let ((ret (process-file "zig" nil "*ghostel-build*" nil
+                                 "build" "-Doptimize=ReleaseFast")))
+          (if (eq ret 0)
+              (progn (message "ghostel: native module compiled successfully") t)
+            (display-warning 'ghostel
+                             "Module compilation failed.  See *ghostel-build* buffer for details.")
+            nil))
+      (file-missing
+       (display-warning 'ghostel
+                        (format "zig executable not found while compiling in %s" dir))
+       nil)
+      (error
+       (display-warning 'ghostel (error-message-string err))
+       nil))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -543,12 +546,12 @@ version to a date-based string."
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
 (defun ghostel-module-compile ()
-  "Compile the ghostel native module by running build.sh.
+  "Compile the ghostel native module by running zig build.
 The output is shown in a *ghostel-build* compilation buffer."
   (interactive)
   (let ((default-directory (file-name-directory (or (locate-library "ghostel")
                                                     default-directory))))
-    (compile (expand-file-name "build.sh") t)))
+    (compile "zig build -Doptimize=ReleaseFast" t)))
 
 
 (defun ghostel--check-module-version (dir)
@@ -607,11 +610,6 @@ DIR is the module directory."
 
 (defvar-local ghostel--force-next-redraw nil
   "When non-nil, redraw regardless of synchronized output mode.")
-
-(defvar-local ghostel--has-wide-chars nil
-  "Set by the native renderer when wide characters are present.
-Cleared before each redraw; checked afterwards to decide whether
-pixel-based trailing-space compensation is needed.")
 
 (defvar-local ghostel--resize-timer nil
   "Timer for debounced SIGWINCH on alt screen.")
@@ -1075,53 +1073,31 @@ pasted using bracketed paste."
     (when (and ghostel--process (process-live-p ghostel--process))
       (process-send-string ghostel--process "\f"))))
 
-(defun ghostel--forward-scroll-event (event button)
-  "Try to forward a scroll EVENT as mouse BUTTON to the terminal.
-Return non-nil if the event was forwarded (mouse tracking is active)."
-  (when (and event ghostel--term ghostel--process
-             (process-live-p ghostel--process)
-             (not ghostel--copy-mode-active))
-    (let* ((posn (event-start event))
-           (col-row (posn-col-row posn))
-           (col (car col-row))
-           (row (cdr col-row)))
-      (ghostel--mouse-event ghostel--term
-                            0  ; press
-                            button
-                            row col
-                            (ghostel--mouse-mods event)))))
-
-(defun ghostel--scroll-up (&optional event)
-  "Scroll the terminal viewport up (into scrollback).
-When the terminal has mouse tracking enabled, forward EVENT as a
-scroll event to the running application instead."
+(defun ghostel--scroll-up (&optional _event)
+  "Scroll the terminal viewport up (into scrollback)."
   (interactive "e")
   (if ghostel--copy-mode-full-buffer
       (scroll-down 3)
     (when ghostel--term
-      (unless (ghostel--forward-scroll-event event 4) ; button 4 = scroll up
-        (ghostel--scroll ghostel--term -3)
-        (if ghostel--copy-mode-active
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))))
+      (ghostel--scroll ghostel--term -3)
+      (if ghostel--copy-mode-active
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term ghostel-full-redraw))
+        (setq ghostel--force-next-redraw t)
+        (ghostel--invalidate)))))
 
-(defun ghostel--scroll-down (&optional event)
-  "Scroll the terminal viewport down.
-When the terminal has mouse tracking enabled, forward EVENT as a
-scroll event to the running application instead."
+(defun ghostel--scroll-down (&optional _event)
+  "Scroll the terminal viewport down."
   (interactive "e")
   (if ghostel--copy-mode-full-buffer
       (scroll-up 3)
     (when ghostel--term
-      (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
-        (ghostel--scroll ghostel--term 3)
-        (if ghostel--copy-mode-active
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))))
+      (ghostel--scroll ghostel--term 3)
+      (if ghostel--copy-mode-active
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term ghostel-full-redraw))
+        (setq ghostel--force-next-redraw t)
+        (ghostel--invalidate)))))
 
 (defun ghostel-copy-mode-scroll-up ()
   "Scroll the terminal viewport up by a page in copy mode."
@@ -1553,39 +1529,41 @@ Skips regions that already have a `help-echo' property (e.g. from OSC 8)."
 
 
 (defun ghostel--compensate-wide-chars ()
-  "Shrink trailing spaces on lines where wide-char glyphs cause pixel overflow.
+  "Hide trailing spaces on lines where wide-char glyphs cause pixel overflow.
 Emoji glyphs often render wider than `char-width' times `frame-char-width'
 pixels, making the display engine treat the line as wider than the window
 even though `string-width' equals the terminal column count.  For each
-overflowing line we replace the trailing whitespace with a single stretch
-glyph of exactly the remaining pixel width."
-  (let ((win (get-buffer-window)))
-    (when (and win (display-graphic-p))
-      (let ((win-w (window-body-width win t))
-            (inhibit-read-only t))
-        (save-excursion
-          (goto-char (point-min))
-          (while (not (eobp))
-            (let* ((bol (line-beginning-position))
-                   (eol (line-end-position))
-                   (spaces-start (save-excursion
-                                   (goto-char eol)
-                                   (skip-chars-backward " " bol)
-                                   (point)))
-                   (avail (- eol spaces-start)))
-              (when (> avail 0)
-                ;; Strip stale compensation so pixel measurement is accurate.
-                (remove-text-properties spaces-start eol '(display nil))
-                (let* ((content-pw (car (window-text-pixel-size win bol spaces-start)))
-                       (remaining (max 0 (- win-w content-pw)))
-                       (natural-pw (* avail (frame-char-width (window-frame win)))))
-                  ;; Only compensate when we would shrink the trailing spaces;
-                  ;; never widen them as that could introduce truncation on
-                  ;; lines that fit naturally.
-                  (when (< remaining natural-pw)
-                    (put-text-property spaces-start eol 'display
-                                       `(space :width (,remaining)))))))
-            (forward-line 1)))))))
+overflowing line, hide the minimal trailing spaces via `display' properties.
+Only called by the native renderer when wide characters are present."
+  (when (and (display-graphic-p)
+             (fboundp 'string-pixel-width))
+    (let ((char-w (frame-char-width))
+          (win-w (window-body-width nil t)))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (let* ((bol (line-beginning-position))
+                 (eol (line-end-position))
+                 (len (- eol bol)))
+            ;; Only measure pixel width when the line has wide characters.
+            ;; string-width > length means at least one char has char-width > 1.
+            (when (and (> len 0)
+                       (> (string-width (buffer-substring bol eol)) len))
+              (let* ((line (buffer-substring bol eol))
+                     (pw (string-pixel-width line))
+                     (overshoot (- pw win-w)))
+                (when (> overshoot 0)
+                  (let* ((spaces-start (save-excursion
+                                         (goto-char eol)
+                                         (skip-chars-backward " " bol)
+                                         (point)))
+                         (avail (- eol spaces-start))
+                         (hide (min (ceiling (/ (float overshoot) char-w))
+                                    avail)))
+                    (when (> hide 0)
+                      (put-text-property (- eol hide) eol
+                                         'display "")))))))
+          (forward-line 1))))))
 
 
 ;;; Prompt navigation (OSC 133)
@@ -1745,18 +1723,16 @@ Do not overwrite a manual buffer rename."
 (defun ghostel--set-cursor-style (style visible)
   "Set the cursor style based on terminal state.
 STYLE is one of: 0=bar, 1=block, 2=underline, 3=hollow-block.
-VISIBLE is t or nil.
-Skipped when copy mode is active because copy mode manages its own cursor."
-  (unless ghostel--copy-mode-active
-    (setq cursor-type
-          (if visible
-              (pcase style
-                (0 '(bar . 2))       ; bar
-                (1 'box)             ; block
-                (2 '(hbar . 2))      ; underline
-                (3 'hollow)          ; hollow block
-                (_ 'box))
-            nil))))
+VISIBLE is t or nil."
+  (setq cursor-type
+        (if visible
+            (pcase style
+              (0 '(bar . 2))       ; bar
+              (1 'box)             ; block
+              (2 '(hbar . 2))      ; underline
+              (3 'hollow)          ; hollow block
+              (_ 'box))
+          nil)))
 
 (defun ghostel--update-directory (dir)
   "Update `default-directory' from terminal's OSC 7 report.
@@ -1770,7 +1746,11 @@ file:// URL does not match the local machine, construct a TRAMP path."
                  (host (url-host url))
                  (filename (url-filename url)))
             (if (ghostel--local-host-p host)
-                (setq path filename)
+                (progn
+                  (when (and (eq system-type 'windows-nt)
+                             (string-match-p "\\`/[[:alpha:]]:/" filename))
+                    (setq filename (substring filename 1)))
+                  (setq path filename))
               ;; Remote host — construct a TRAMP path.
               ;; Reuse the full remote prefix from default-directory
               ;; when available (preserves multi-hop, method, user).
@@ -2255,23 +2235,17 @@ frame after idle to improve interactive responsiveness."
         (unless (and (not ghostel--force-next-redraw)
                      (ghostel--mode-enabled ghostel--term 2026))
           (setq ghostel--force-next-redraw nil)
-          (setq ghostel--has-wide-chars nil)
           (let ((inhibit-read-only t)
                 (inhibit-redisplay t)
                 (inhibit-modification-hooks t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (when ghostel--has-wide-chars
-            (ghostel--compensate-wide-chars)))))))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
   (interactive)
   (when ghostel--term
-    (setq ghostel--has-wide-chars nil)
     (let ((inhibit-read-only t))
-      (ghostel--redraw ghostel--term ghostel-full-redraw))
-    (when ghostel--has-wide-chars
-      (ghostel--compensate-wide-chars))))
+      (ghostel--redraw ghostel--term ghostel-full-redraw))))
 
 
 ;;; Window resize
