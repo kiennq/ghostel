@@ -3627,6 +3627,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-load-module-if-available-skips-when-module-missing
     ghostel-test-ensure-conpty-loaded-errors-when-module-missing
     ghostel-test-sentinel-kills-conpty-backend-on-exit
+    ghostel-test-copy-mode-recenter
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h
     ghostel-test-send-next-key-regular-char
