@@ -956,11 +956,6 @@ DIR is the module directory."
 (defvar-local ghostel--last-directory nil
   "Last known working directory from OSC 7, used for dedup.")
 
-(defvar-local ghostel--managed-buffer-name nil
-  "Last buffer name managed by Ghostel title tracking.
-Nil means title tracking has not claimed the buffer yet.  Clearing this
-variable re-enables automatic renaming for the next title update.")
-
 (defvar-local ghostel--prompt-positions nil
   "List of prompt positions as (buffer-line . exit-status) pairs.
 Used for prompt navigation and optional re-application after full redraws.")
@@ -2083,16 +2078,6 @@ This ensures terminal text is visible regardless of the Emacs theme."
                                    :background bg)
           ghostel--face-colors (list fg bg))))
 
-(defun ghostel--set-title (title)
-  "Update the buffer name with TITLE from the terminal.
-Do not overwrite a manual buffer rename."
-  (let ((new-name (format "*ghostel: %s*" title)))
-    (when (or (null ghostel--managed-buffer-name)
-              (equal (buffer-name) ghostel--managed-buffer-name))
-      (rename-buffer new-name t)
-      ;; Keep the actual name because `rename-buffer' may uniquify it.
-      (setq ghostel--managed-buffer-name (buffer-name)))))
-
 (defun ghostel--set-cursor-style (style visible)
   "Set the cursor style based on terminal state.
 STYLE is one of: 0=bar, 1=block, 2=underline, 3=hollow-block.
@@ -2790,7 +2775,6 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
                                   '((category . comint))))
     (unless (derived-mode-p 'ghostel-mode)
       (ghostel-mode)
-      (setq ghostel--managed-buffer-name (buffer-name))
       (let* ((height (window-body-height))
              (width (window-max-chars-per-line)))
         (setq ghostel--term

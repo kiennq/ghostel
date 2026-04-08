@@ -1602,33 +1602,6 @@ cell, so the visual line width must equal the terminal column count."
       (ghostel-project current-prefix-arg)
       (should (equal '4 result)))))
 
-(ert-deftest ghostel-test-title-does-not-overwrite-manual-rename ()
-  "Title updates do not overwrite a manual Ghostel buffer rename."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _) 'fake-term))
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (ghostel)
-          (setq buf (current-buffer))
-          (should (equal "*ghostel*" (buffer-name)))
-          (should (equal "*ghostel*" ghostel--managed-buffer-name))
-          (ghostel--set-title "Title A")
-          (should (equal "*ghostel: Title A*" (buffer-name)))
-          (should (equal "*ghostel: Title A*" ghostel--managed-buffer-name))
-          (ghostel--set-title "Title A2")
-          (should (equal "*ghostel: Title A2*" (buffer-name)))
-          (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))
-          (rename-buffer "ghostel manual title test" t)
-          (ghostel--set-title "Title B")
-          (should (equal "ghostel manual title test" (buffer-name)))
-          (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name)))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
 (ert-deftest ghostel-test-set-buffer-face-skips-unchanged-colors ()
   "Test that repeated identical default colors do not remap again."
   (with-temp-buffer
@@ -3417,7 +3390,6 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-copy-mode-load-all
     ghostel-test-copy-all
     ghostel-test-copy-mode-full-buffer-scroll
-    ghostel-test-title-does-not-overwrite-manual-rename
     ghostel-test-module-platform-tag-windows
     ghostel-test-module-asset-name-windows
     ghostel-test-start-process-windows-conpty-skips-shell-wrapper
