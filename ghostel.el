@@ -1036,24 +1036,28 @@ pasted using bracketed paste."
 (defun ghostel-copy-mode-scroll-up ()
   "Scroll the terminal viewport up by a page in copy mode."
   (interactive)
-  (if ghostel--copy-mode-full-buffer
-      (scroll-down-command)
-    (when ghostel--term
-      (let ((height (count-lines (point-min) (point-max))))
-        (ghostel--scroll ghostel--term (- 2 height))
-        (let ((inhibit-read-only t))
-          (ghostel--redraw ghostel--term ghostel-full-redraw))))))
+  (let ((col (current-column)))
+    (if ghostel--copy-mode-full-buffer
+        (scroll-down-command)
+      (when ghostel--term
+        (let ((height (count-lines (point-min) (point-max))))
+          (ghostel--scroll ghostel--term (- 2 height))
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)))))
+    (move-to-column col)))
 
 (defun ghostel-copy-mode-scroll-down ()
   "Scroll the terminal viewport down by a page in copy mode."
   (interactive)
-  (if ghostel--copy-mode-full-buffer
-      (scroll-up-command)
-    (when ghostel--term
-      (let ((height (count-lines (point-min) (point-max))))
-        (ghostel--scroll ghostel--term (- height 2))
-        (let ((inhibit-read-only t))
-          (ghostel--redraw ghostel--term ghostel-full-redraw))))))
+  (let ((col (current-column)))
+    (if ghostel--copy-mode-full-buffer
+        (scroll-up-command)
+      (when ghostel--term
+        (let ((height (count-lines (point-min) (point-max))))
+          (ghostel--scroll ghostel--term (- height 2))
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)))))
+    (move-to-column col)))
 
 (defun ghostel-copy-mode-previous-line ()
   "Move to the previous line, scrolling the viewport if at the top."
