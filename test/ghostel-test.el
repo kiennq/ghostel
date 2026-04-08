@@ -3582,6 +3582,9 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-project-universal-arg
     ghostel-test-copy-all
     ghostel-test-copy-mode-full-buffer-scroll
+    ghostel-test-module-platform-tag-windows
+    ghostel-test-module-asset-name-windows
+    ghostel-test-start-process-windows-conpty-skips-shell-wrapper
     ghostel-test-module-download-url-uses-minimum-version
     ghostel-test-download-module-prefix-empty-uses-latest
     ghostel-test-download-module-prefix-rejects-too-old-version
@@ -3606,10 +3609,14 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-scroll-forwards-mouse-tracking
     ghostel-test-control-key-bindings
     ghostel-test-meta-key-bindings
+    ghostel-test-send-key-dispatches-through-process-transport
     ghostel-test-control-key-bindings-cover-upstream-range
     ghostel-test-meta-key-bindings-reach-terminal
+    ghostel-test-window-resize-dispatches-through-process-transport
+    ghostel-test-conpty-module-file-path-uses-custom-dir
     ghostel-test-module-file-path-uses-custom-dir
     ghostel-test-download-module-publishes-downloaded-archive
+    ghostel-test-sentinel-kills-conpty-backend-on-exit
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h
     ghostel-test-send-next-key-regular-char
