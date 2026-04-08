@@ -55,16 +55,16 @@ jobs:
         if: runner.os == 'macOS'
         run: strip -x ghostel-module${{ matrix.suffix }}
 
-      - name: Rename artifact for release
+      - name: Package artifact for release
         run: |
-          mv ghostel-module${{ matrix.suffix }} \
-             ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
+          tar -cJf ghostel-module-${{ matrix.platform }}.tar.xz \
+            ghostel-module${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
+          path: ghostel-module-${{ matrix.platform }}.tar.xz
 
   release:
     needs: build
