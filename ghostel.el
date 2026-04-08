@@ -115,16 +115,9 @@ detection fails."
 
 (defcustom ghostel-max-scrollback (* 5 1024 1024)  ; 5MB
   "Maximum scrollback size in bytes.
-5 MB holds roughly 5,000 rows on a typical 80-column terminal
-\(fewer on wider terminals — the cost scales with column count).
-
-The full scrollback is materialized into the Emacs buffer so that
-`isearch', `consult-line', and other buffer-based commands work
-across history.  Each materialized row also lives in the Emacs
-buffer with text properties for color/style/links, so the
-practical Emacs heap cost is roughly equal to the libghostty
-allocation, and large values noticeably slow down sustained
-high-throughput output (e.g. `cat huge.log')."
+Memory is allocated lazily, so a large value does not consume
+memory at startup.  The default of 20 MB holds roughly 10,000
+lines at typical terminal widths."
   :type 'integer)
 
 (defcustom ghostel-timer-delay 0.033
@@ -398,7 +391,9 @@ before sending the input."
 
 (defcustom ghostel-github-release-url
   "https://github.com/dakra/ghostel/releases"
-  "Base URL for ghostel GitHub releases.")
+  "Base URL for Ghostel GitHub releases.
+Customize this when downloading pre-built modules from a fork or mirror."
+  :type 'string)
 
 (defconst ghostel--minimum-module-version "0.12.2"
   "Minimum native module version required by this Elisp version.
@@ -494,10 +489,15 @@ Must stay in sync with the native module ABI.")
   "Return platform tag for the current system, e.g. \"x86_64-linux\".
 Returns nil if the platform is not recognized."
   (let* ((arch (car (split-string system-configuration "-")))
+         (arch (pcase arch
+                 ("amd64" "x86_64")
+                 ("arm64" "aarch64")
+                 (_ arch)))
          (os (cond
-              ((eq system-type 'darwin) "macos")
-              ((eq system-type 'gnu/linux) "linux")
-              (t nil))))
+                ((eq system-type 'darwin) "macos")
+                ((eq system-type 'gnu/linux) "linux")
+                ((eq system-type 'windows-nt) "windows")
+                (t nil))))
     (when os
       (format "%s-%s" arch os))))
 
@@ -505,7 +505,7 @@ Returns nil if the platform is not recognized."
   "Return the expected release asset file name for the current platform."
   (let ((tag (ghostel--module-platform-tag)))
     (when tag
-      (format "ghostel-module-%s%s" tag module-file-suffix))))
+      (format "ghostel-module-%s.tar.xz" tag))))
 
 (defun ghostel--module-download-url (&optional version)
   "Return the download URL for the current platform's pre-built module.
@@ -705,8 +705,9 @@ Returns non-nil on success."
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
-          (let ((dest (expand-file-name
-                       (concat "ghostel-module" module-file-suffix) dir)))
+          (unless (file-directory-p dir)
+            (make-directory dir t))
+          (let ((dest (expand-file-name (file-name-nondirectory url) dir)))
             (message "ghostel: downloading native module from %s..." url)
             (when (ghostel--download-file url dest)
               (ghostel--publish-downloaded-module-archive dest dir)
@@ -852,7 +853,7 @@ Leaving the prompt empty downloads the latest release."
     (when (and (file-exists-p mod)
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
-    (if (ghostel--download-module dir)
+    (if (ghostel--download-module dir version latest-release)
         (progn
           (ghostel--ensure-loader-loaded mod)
           (ghostel--bootstrap-module dir)
@@ -894,7 +895,8 @@ DIR is the module directory."
                      (file-exists-p manifest))
                 noninteractive)
       (ghostel--ensure-module dir))
-    (if (file-exists-p mod)
+    (if (and (file-exists-p mod)
+             (file-exists-p manifest))
         (condition-case err
             (if (featurep 'dyn-loader-module)
                 (if (ghostel--live-buffers)
@@ -936,10 +938,6 @@ DIR is the module directory."
 
 (defvar-local ghostel--term nil
   "Handle to the native terminal instance.")
-
-(defvar-local ghostel--term-rows nil
-  "Row count of the native terminal, for viewport/scrollback arithmetic.
-Updated whenever the terminal is created or resized.")
 
 (defvar-local ghostel--copy-mode-active nil
   "Non-nil when copy mode is active.")
@@ -1445,7 +1443,7 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             (ghostel--mouse-mods event)))))
 
 (defun ghostel--scroll-up (&optional event)
-  "Scroll the Emacs window up (toward older scrollback).
+  "Scroll the terminal viewport up (into scrollback).
 When the terminal has mouse tracking enabled, forward EVENT as a
 scroll event to the running application instead."
   (interactive "e")
@@ -1453,7 +1451,7 @@ scroll event to the running application instead."
     (scroll-down 3)))
 
 (defun ghostel--scroll-down (&optional event)
-  "Scroll the Emacs window down (toward newer content).
+  "Scroll the terminal viewport down.
 When the terminal has mouse tracking enabled, forward EVENT as a
 scroll event to the running application instead."
   (interactive "e")
@@ -1461,36 +1459,36 @@ scroll event to the running application instead."
     (scroll-up 3)))
 
 (defun ghostel-copy-mode-scroll-up ()
-  "Scroll the Emacs window up by a page in copy mode."
+  "Scroll the terminal viewport up by a page in copy mode."
   (interactive)
   (scroll-down-command))
 
 (defun ghostel-copy-mode-scroll-down ()
-  "Scroll the Emacs window down by a page in copy mode."
+  "Scroll the terminal viewport down by a page in copy mode."
   (interactive)
   (scroll-up-command))
 
 (defun ghostel-copy-mode-previous-line ()
-  "Move to the previous line in copy mode."
+  "Move to the previous line, scrolling the viewport if at the top."
   (interactive)
   (let ((col (current-column)))
     (forward-line -1)
     (move-to-column col)))
 
 (defun ghostel-copy-mode-next-line ()
-  "Move to the next line in copy mode."
+  "Move to the next line, scrolling the viewport if at the bottom."
   (interactive)
   (let ((col (current-column)))
     (forward-line 1)
     (move-to-column col)))
 
 (defun ghostel-copy-mode-beginning-of-buffer ()
-  "Move to the top of the buffer (oldest scrollback) in copy mode."
+  "Scroll to the top of scrollback in copy mode."
   (interactive)
   (goto-char (point-min)))
 
 (defun ghostel-copy-mode-end-of-buffer ()
-  "Move to the bottom of the buffer (current viewport) in copy mode."
+  "Scroll to the bottom of scrollback in copy mode."
   (interactive)
   (goto-char (point-max))
   (skip-chars-backward " \t\n"))
@@ -1502,7 +1500,10 @@ scroll event to the running application instead."
   (skip-chars-backward " \t"))
 
 (defun ghostel-copy-mode-recenter ()
-  "Recenter the current line in the window."
+  "Recenter the terminal viewport around the current line in copy mode.
+Scrolls the terminal viewport so the current line is vertically
+centered, then redraws.  When the scroll is clamped at a scrollback
+boundary (nothing to scroll into), does nothing."
   (interactive)
   (recenter))
 
@@ -1612,12 +1613,13 @@ Covers both `global-hl-line-mode' and buffer-local `hl-line-mode'.")
 
 (defun ghostel-copy-mode ()
   "Enter copy mode for selecting and copying terminal text.
-Live terminal output is paused; standard Emacs navigation, search,
-and marking work across the full scrollback that is already rendered
-in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
+The display is frozen and standard Emacs navigation keys work.
+Set mark, navigate to select, then \\[ghostel-copy-mode-copy] to copy.
+Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
   (interactive)
   (if ghostel--copy-mode-active
       (ghostel-copy-mode-exit)
+    ;; Freeze display
     (setq ghostel--copy-mode-active t)
     (when ghostel--redraw-timer
       (cancel-timer ghostel--redraw-timer)
@@ -1625,6 +1627,7 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
     ;; Ensure cursor is visible for navigation
     (setq ghostel--saved-cursor-type cursor-type)
     (setq cursor-type (default-value 'cursor-type))
+    ;; Switch to copy mode keymap (standard Emacs keys work by default)
     (setq ghostel--saved-local-map (current-local-map))
     (use-local-map ghostel-copy-mode-map)
     (when ghostel--saved-hl-line-mode
@@ -1744,47 +1747,42 @@ at the given line in another window."
   (interactive)
   (ghostel--open-link (get-text-property (point) 'help-echo)))
 
-(defun ghostel--detect-urls (&optional begin end)
-  "Scan a buffer region for plain-text URLs and file:line references.
-BEGIN and END default to `point-min' and `point-max' respectively.
-Skips regions that already have a `help-echo' property (e.g. from OSC 8).
-Bounding the scan keeps streaming output from re-scanning the entire
-materialized scrollback on every redraw."
-  (let ((begin (or begin (point-min)))
-        (end (or end (point-max))))
-    (save-excursion
-      ;; Pass 1: http(s) URLs
-      (when ghostel-enable-url-detection
-        (goto-char begin)
-        (while (re-search-forward
-                "https?://[^ \t\n\r\"<>]*[^ \t\n\r\"<>.,;:!?)>]"
-                end t)
-          (let ((beg (match-beginning 0))
-                (mend (match-end 0)))
-            (unless (get-text-property beg 'help-echo)
-              (let ((url (match-string-no-properties 0)))
-                (put-text-property beg mend 'help-echo url)
-                (put-text-property beg mend 'mouse-face 'highlight)
-                (put-text-property beg mend 'keymap ghostel-link-map))))))
-      ;; Pass 2: file:line references (e.g. "./foo.el:42" or "/tmp/bar.rs:10")
-      (when ghostel-enable-file-detection
-        (goto-char begin)
-        (while (re-search-forward
-                "\\(?:\\./\\|/\\)[^ \t\n\r:\"<>]+:[0-9]+"
-                end t)
-          (let ((beg (match-beginning 0))
-                (mend (match-end 0)))
-            (unless (get-text-property beg 'help-echo)
-              (let* ((text (match-string-no-properties 0))
-                     (sep (string-match ":[0-9]+\\'" text))
-                     (path (substring text 0 sep))
-                     (line (substring text (1+ sep)))
-                     (abs-path (expand-file-name path)))
-                (when (file-exists-p abs-path)
-                  (put-text-property beg mend 'help-echo
-                                     (concat "fileref:" abs-path ":" line))
-                  (put-text-property beg mend 'mouse-face 'highlight)
-                  (put-text-property beg mend 'keymap ghostel-link-map))))))))))
+(defun ghostel--detect-urls ()
+  "Scan the buffer for plain-text URLs and file:line references.
+Skips regions that already have a `help-echo' property (e.g. from OSC 8)."
+  (save-excursion
+    ;; Pass 1: http(s) URLs
+    (when ghostel-enable-url-detection
+      (goto-char (point-min))
+      (while (re-search-forward
+              "https?://[^ \t\n\r\"<>]*[^ \t\n\r\"<>.,;:!?)>]"
+              nil t)
+        (let ((beg (match-beginning 0))
+              (end (match-end 0)))
+          (unless (get-text-property beg 'help-echo)
+            (let ((url (match-string-no-properties 0)))
+              (put-text-property beg end 'help-echo url)
+              (put-text-property beg end 'mouse-face 'highlight)
+              (put-text-property beg end 'keymap ghostel-link-map))))))
+    ;; Pass 2: file:line references (e.g. "./foo.el:42" or "/tmp/bar.rs:10")
+    (when ghostel-enable-file-detection
+      (goto-char (point-min))
+      (while (re-search-forward
+              "\\(?:\\./\\|/\\)[^ \t\n\r:\"<>]+:[0-9]+"
+              nil t)
+        (let ((beg (match-beginning 0))
+              (end (match-end 0)))
+          (unless (get-text-property beg 'help-echo)
+            (let* ((text (match-string-no-properties 0))
+                   (sep (string-match ":[0-9]+\\'" text))
+                   (path (substring text 0 sep))
+                   (line (substring text (1+ sep)))
+                   (abs-path (expand-file-name path)))
+              (when (file-exists-p abs-path)
+                (put-text-property beg end 'help-echo
+                                   (concat "fileref:" abs-path ":" line))
+                (put-text-property beg end 'mouse-face 'highlight)
+                (put-text-property beg end 'keymap ghostel-link-map)))))))))
 
 
 (defun ghostel--compensate-wide-chars ()
@@ -1933,15 +1931,7 @@ Parses the command and arguments, looks up the command in
          (args (cdr parts))
          (entry (assoc command ghostel-eval-cmds)))
     (if entry
-        ;; Catch errors from the dispatched function: this callback runs
-        ;; synchronously inside the native VT parser, so any unhandled
-        ;; error propagates back up through `ghostel--write-input' and
-        ;; crashes the process filter / redraw timer.
-        (condition-case err
-            (apply (cadr entry) args)
-          (error
-           (message "ghostel: error calling %s: %s"
-                    command (error-message-string err))))
+        (apply (cadr entry) args)
       (message "ghostel: unknown eval command %S (add to `ghostel-eval-cmds' to allow)"
                command))))
 
@@ -2185,14 +2175,6 @@ the redraw is performed immediately to minimize typing latency."
       (when ghostel--term
         ;; Accumulate output for batched write-input at redraw time.
         (push output ghostel--pending-output)
-        ;; Respond to OSC 4/10/11 color queries immediately: programs like
-        ;; `duf' read stdin with a tight timeout and give up if the reply
-        ;; waits for the redraw timer.  Flushing runs the extractor in the
-        ;; native module, which writes the reply back through the PTY
-        ;; before this filter returns.
-        (when (string-match-p
-               "\e\\]\\(?:4;[0-9]+;\\?\\|10;\\?\\|11;\\?\\)" output)
-          (ghostel--flush-pending-output))
         ;; Immediate redraw for interactive echo: small output arriving
         ;; within `ghostel-immediate-redraw-interval' of last keystroke.
         (if (and (> ghostel-immediate-redraw-threshold 0)
@@ -2399,8 +2381,10 @@ Returns nil on failure."
   "Start the shell process with a PTY.
 When `default-directory' is a remote TRAMP path, spawn the shell
 on the remote host."
-  (let* ((height (max 1 (window-body-height)))
-         (width (max 1 (window-max-chars-per-line)))
+  (let* ((size (ghostel--terminal-size (window-max-chars-per-line)
+                                       (window-body-height)))
+         (width (car size))
+         (height (cdr size))
          (remote-p (file-remote-p default-directory))
          (shell (ghostel--get-shell))
          (ghostel-dir (file-name-directory
@@ -2489,17 +2473,19 @@ on the remote host."
                        "erase '^?' iutf8 echo")
                       (t "erase '^?' iutf8")))
          (shell-command
-          (list "/bin/sh" "-c"
-                (concat "stty " stty-flags
-                        (format " rows %d columns %d" height width)
-                        " 2>/dev/null; "
-                        "printf '\\033[H\\033[2J'; exec "
-                        (shell-quote-argument shell)
-                        (and shell-args
-                             (concat " "
-                                     (mapconcat #'shell-quote-argument
-                                                shell-args " "))))))
-         (process-environment
+          (if (eq system-type 'windows-nt)
+              (list shell)
+            (list "/bin/sh" "-c"
+                  (concat "stty " stty-flags
+                          (format " rows %d columns %d" height width)
+                          " 2>/dev/null; "
+                          "printf '\\033[H\\033[2J'; exec "
+                          (shell-quote-argument shell)
+                          (and shell-args
+                               (concat " "
+                                       (mapconcat #'shell-quote-argument
+                                                  shell-args " ")))))))
+         (env-overrides
           (append
            (list
             "INSIDE_EMACS=ghostel"
@@ -2592,19 +2578,10 @@ frame after idle to improve interactive responsiveness."
   (when ghostel--pending-output
     (let ((combined (apply #'concat (nreverse ghostel--pending-output))))
       (setq ghostel--pending-output nil)
-      ;; An OSC 51;E callback dispatched synchronously from the native
-      ;; parser (e.g. `find-file-other-window') can change the current
-      ;; buffer via `select-window'.  Isolate that so callers keep
-      ;; reading buffer-locals — notably `ghostel--term' — from the
-      ;; ghostel buffer after this returns.
-      (save-current-buffer
-        (ghostel--write-input ghostel--term combined)))))
+      (ghostel--write-input ghostel--term combined))))
 
 (defun ghostel--delayed-redraw (buffer)
-  "Perform the actual redraw in BUFFER.
-If point is currently inside the materialized scrollback (above the
-viewport), save and restore it so scrolling up to read history is not
-interrupted by live output updating the terminal cursor."
+  "Perform the actual redraw in BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq ghostel--redraw-timer nil)
@@ -2662,7 +2639,7 @@ interrupted by live output updating the terminal cursor."
             (dolist (win (get-buffer-window-list buffer nil t))
               (when (and vs (>= pt vs))
                 (set-window-start win vs t))
-              (set-window-point win pt))))))))
+              (set-window-point win pt)))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
@@ -2686,7 +2663,9 @@ PROCESS is the shell process, WINDOWS is the list of windows."
                                       #'ghostel--window-adjust-process-window-size)))
                         adjust-fn
                       #'window-adjust-process-window-size-smallest))
-         (size (funcall adjust-fn process windows))
+         (raw-size (funcall adjust-fn process windows))
+         (size (and raw-size
+                    (ghostel--terminal-size (car raw-size) (cdr raw-size))))
          (width (car size))
          (height (cdr size))
          (buffer (process-buffer process)))
@@ -2697,33 +2676,27 @@ PROCESS is the shell process, WINDOWS is the list of windows."
           (when (ghostel--conpty-active-p)
             (ghostel--process-set-window-size process height width))
           (setq ghostel--force-next-redraw t)
-<<<<<<< HEAD
           ;; Redraw synchronously so the buffer is updated before
           ;; Emacs displays the stale content at the new window size.
           (when ghostel--redraw-timer
             (cancel-timer ghostel--redraw-timer)
             (setq ghostel--redraw-timer nil))
           (ghostel--delayed-redraw buffer))))
-    ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
-    ;; after this function returns, matching eat/vterm timing.
-||||||| parent of 242f627 (Support Windows with conpty module)
-          (ghostel--invalidate))))
     ;; Return size so Emacs can drive PTY SIGWINCH after this hook.
     ;; ConPTY backends are pipe processes, so they must be resized
     ;; explicitly above through `ghostel--process-set-window-size'.
     size))
 
 
-
+
 ;;; Major mode
 
 (define-derived-mode ghostel-mode fundamental-mode "Ghostel"
   "Major mode for Ghostel terminal emulator."
   (buffer-disable-undo)
   (font-lock-mode -1)
-  (setq buffer-read-only nil)
+  (setq buffer-read-only t)
   (setq-local scroll-margin 0)
-  (setq-local auto-hscroll-mode nil)
   (setq-local hscroll-margin 0)
   (setq-local truncate-lines t)
   (setq-local scroll-conservatively 101)
@@ -2764,14 +2737,10 @@ With a numeric prefix ARG, switch to the buffer with that number or
 create it if it doesn't exist yet.
 The name of the buffer is determined by the value of `ghostel-buffer-name'."
   (interactive "P")
-  (unless (fboundp 'ghostel--new)
-    (let ((dir (file-name-directory (locate-library "ghostel"))))
-      (ghostel--ensure-module dir)
-      (let ((mod (expand-file-name
-                  (concat "ghostel-module" module-file-suffix) dir)))
-        (if (file-exists-p mod)
-            (module-load mod)
-          (user-error "Ghostel native module not available")))))
+  (unless (ghostel--native-runtime-ready-p)
+    (ghostel--initialize-native-modules)
+    (unless (ghostel--native-runtime-ready-p)
+      (user-error "Ghostel native module not available")))
   (let ((buffer (cond ((numberp arg)
                        (get-buffer-create (format "%s<%d>"
                                                   ghostel-buffer-name
@@ -2789,7 +2758,6 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
              (width (window-max-chars-per-line)))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
-        (setq ghostel--term-rows height)
         (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))))
 
