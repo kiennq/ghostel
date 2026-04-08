@@ -84,6 +84,11 @@ manually:
 - `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
 - `M-x ghostel-module-compile` — build from source via `zig build`
 
+With `C-u M-x ghostel-download-module`, Ghostel prompts for a module version.
+An empty version downloads the latest release, and
+`ghostel-github-release-url` can be customized to pull binaries from a fork or
+mirror.
+
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
