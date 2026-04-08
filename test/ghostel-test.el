@@ -3582,7 +3582,11 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-project-universal-arg
     ghostel-test-copy-all
     ghostel-test-copy-mode-full-buffer-scroll
+    ghostel-test-module-download-url-uses-minimum-version
+    ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-module-prefix-rejects-too-old-version
     ghostel-test-module-compile-command-uses-package-dir
+    ghostel-test-replace-module-file-deletes-before-rotating
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
@@ -3604,6 +3608,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-meta-key-bindings
     ghostel-test-control-key-bindings-cover-upstream-range
     ghostel-test-meta-key-bindings-reach-terminal
+    ghostel-test-module-file-path-uses-custom-dir
+    ghostel-test-download-module-publishes-downloaded-archive
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h
     ghostel-test-send-next-key-regular-char
