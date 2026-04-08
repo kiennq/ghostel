@@ -2434,13 +2434,18 @@ Returns nil on failure."
      (message "ghostel: remote shell integration failed: %s"
               (error-message-string err))
      nil)))
-
+(defun ghostel--window-terminal-size (&optional window)
+  "Return the visible terminal size for WINDOW as a `(WIDTH . HEIGHT)' cons."
+  (let ((window (or window (selected-window))))
+    (cons (max 1 (1- (window-max-chars-per-line window)))
+          (max 1 (1- (window-body-height window))))))
 (defun ghostel--start-process ()
   "Start the shell process with a PTY.
 When `default-directory' is a remote TRAMP path, spawn the shell
 on the remote host."
-  (let* ((height (max 1 (window-body-height)))
-         (width (max 1 (window-max-chars-per-line)))
+  (let* ((size (ghostel--window-terminal-size))
+         (width (car size))
+         (height (cdr size))
          (remote-p (file-remote-p default-directory))
          (shell (ghostel--get-shell))
          (ghostel-dir (file-name-directory
@@ -2663,9 +2668,9 @@ frame after idle to improve interactive responsiveness."
 (defun ghostel--window-adjust-process-window-size (process windows)
   "Resize the terminal to match the new Emacs window dimensions.
 PROCESS is the shell process, WINDOWS is the list of windows."
-  (let* ((window (car windows))
-         (width (window-max-chars-per-line window))
-         (height (window-body-height window)))
+  (let* ((size (ghostel--window-terminal-size (car windows)))
+         (width (car size))
+         (height (cdr size)))
     (when ghostel--term
       (if (ghostel--mode-enabled ghostel--term 1049)
           ;; Alt screen: debounce the entire resize (terminal + SIGWINCH)
@@ -2775,8 +2780,9 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
                                   '((category . comint))))
     (unless (derived-mode-p 'ghostel-mode)
       (ghostel-mode)
-      (let* ((height (window-body-height))
-             (width (window-max-chars-per-line)))
+      (let* ((size (ghostel--window-terminal-size))
+             (width (car size))
+             (height (cdr size)))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
         (ghostel--apply-palette ghostel--term))
