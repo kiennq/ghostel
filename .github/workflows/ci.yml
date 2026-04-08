@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  byte-compile:
+  test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,21 +28,6 @@ jobs:
             -f batch-byte-compile \
             ghostel.el ghostel-debug.el
 
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        emacs_version:
-          - '28.2'
-          - '29.4'
-          - 'snapshot'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: purcell/setup-emacs@master
-        with:
-          version: ${{ matrix.emacs_version }}
-
       - name: Run pure Elisp tests
         run: |
           emacs --batch -Q -L . \
@@ -57,18 +42,16 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
+          - os: windows-latest
+            platform: x86_64-windows
+            target: x86_64-windows-gnu
+            suffix: .dll
           - os: macos-latest
             platform: aarch64-macos
+            target: aarch64-macos
             suffix: .dylib
-          - os: macos-latest
-            platform: x86_64-macos
-            suffix: .dylib
-            target: x86_64-macos
-          - os: ubuntu-latest
-            platform: aarch64-linux
-            suffix: .so
-            target: aarch64-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -76,27 +59,29 @@ jobs:
           submodules: recursive
           persist-credentials: true
 
-      - name: Rewrite SSH to HTTPS for submodules
-        run: |
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git submodule sync --recursive
-          git submodule update --init --recursive
-
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
       - name: Build native module
+        shell: bash
         run: |
-          if [ -n "${{ matrix.target }}" ]; then
-            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
-          else
-            zig build -Doptimize=ReleaseFast
-          fi
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
-      - name: Upload module artifact
+      - name: Upload Windows module artifact
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module${{ matrix.suffix }}
+          path: |
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/conpty-module${{ matrix.suffix }}
+
+      - name: Upload module artifact
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostel-module-${{ matrix.platform }}
+          path: zig-out/bin/ghostel-module${{ matrix.suffix }}

@@ -1,12 +1,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const emacs_util_mods = @import("vendor/emacs-util-mods/build.zig");
 
-const vendored_emacs_include_dir = "include";
-const EmacsIncludeSource = union(enum) {
-    include_dir: []const u8,
-    source_dir: []const u8,
-    vendored,
-};
+const vendored_emacs_include_dir = emacs_util_mods.vendored_emacs_include_dir;
+const EmacsIncludeSource = emacs_util_mods.EmacsIncludeSource;
 
 pub fn build(b: *std.Build) void {
     const default_target: std.Target.Query = if (builtin.os.tag == .windows)
@@ -21,12 +18,21 @@ pub fn build(b: *std.Build) void {
         .default_target = default_target,
     });
     const optimize = b.standardOptimizeOption(.{});
+    const strip_binaries = optimize != .Debug;
     const target_os = target.result.os.tag;
     const emacs_include = resolveEmacsIncludePath(b);
+    const emacs_mod = b.createModule(.{
+        .root_source_file = b.path("src/emacs.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    emacs_mod.addSystemIncludePath(emacs_include);
     const ghostty_dep = b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
         .@"emit-lib-vt" = true,
+        .strip = strip_binaries,
     }) orelse std.debug.panic(
         "ghostty dependency unavailable; initialize the vendor/ghostty submodule",
         .{},
@@ -36,9 +42,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/module.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip_binaries,
         .link_libc = true,
     });
     addModuleIncludes(b, mod, emacs_include);
+    mod.addImport("emacs", emacs_mod);
     mod.linkLibrary(ghostty_dep.artifact("ghostty-vt-static"));
 
     const lib = b.addLibrary(.{
@@ -57,6 +65,31 @@ pub fn build(b: *std.Build) void {
         moduleOutputName(target_os),
     );
     b.getInstallStep().dependOn(&copy_step.step);
+    if (target_os == .windows) {
+        const conpty_mod = b.createModule(.{
+            .root_source_file = b.path(conptyModuleSourcePath()),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip_binaries,
+            .link_libc = true,
+        });
+        addLoaderIncludes(conpty_mod, emacs_include);
+        conpty_mod.addImport("emacs", emacs_mod);
+
+        const conpty_lib = b.addLibrary(.{
+            .name = "conpty-module",
+            .linkage = .dynamic,
+            .root_module = conpty_mod,
+        });
+        addWindowsRuntimeLibraries(b, conpty_lib, target.result);
+        b.installArtifact(conpty_lib);
+
+        const copy_conpty = b.addInstallFile(
+            conpty_lib.getEmittedBin(),
+            "bin/conpty-module.dll",
+        );
+        b.getInstallStep().dependOn(&copy_conpty.step);
+    }
 
     const check_mod = b.createModule(.{
         .root_source_file = b.path("src/module.zig"),
@@ -65,6 +98,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addModuleIncludes(b, check_mod, emacs_include);
+    check_mod.addImport("emacs", emacs_mod);
 
     const check_obj = b.addObject(.{
         .name = "ghostel-module-check",
@@ -73,6 +107,22 @@ pub fn build(b: *std.Build) void {
 
     const check = b.step("check", "Check that the module compiles (no linking)");
     check.dependOn(&check_obj.step);
+    if (target_os == .windows) {
+        const conpty_check_mod = b.createModule(.{
+            .root_source_file = b.path(conptyModuleSourcePath()),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        addLoaderIncludes(conpty_check_mod, emacs_include);
+        conpty_check_mod.addImport("emacs", emacs_mod);
+
+        const conpty_check_obj = b.addObject(.{
+            .name = "conpty-module-check",
+            .root_module = conpty_check_mod,
+        });
+        check.dependOn(&conpty_check_obj.step);
+    }
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/module.zig"),
@@ -81,6 +131,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addModuleIncludes(b, test_mod, emacs_include);
+    test_mod.addImport("emacs", emacs_mod);
     test_mod.linkLibrary(ghostty_dep.artifact("ghostty-vt-static"));
 
     const unit_tests = b.addTest(.{
@@ -93,6 +144,28 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    if (target_os == .windows) {
+        const conpty_test_mod = b.createModule(.{
+            .root_source_file = b.path(conptyModuleSourcePath()),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        addLoaderIncludes(conpty_test_mod, emacs_include);
+        conpty_test_mod.addImport("emacs", emacs_mod);
+
+        const conpty_tests = b.addTest(.{
+            .root_module = conpty_test_mod,
+        });
+        addWindowsRuntimeLibraries(b, conpty_tests, target.result);
+
+        const run_conpty_tests = b.addRunArtifact(conpty_tests);
+        test_step.dependOn(&run_conpty_tests.step);
+    }
+}
+
+fn addLoaderIncludes(mod: *std.Build.Module, emacs_include: std.Build.LazyPath) void {
+    mod.addSystemIncludePath(emacs_include);
 }
 
 fn addModuleIncludes(
@@ -100,115 +173,27 @@ fn addModuleIncludes(
     mod: *std.Build.Module,
     emacs_include: std.Build.LazyPath,
 ) void {
-    mod.addSystemIncludePath(emacs_include);
+    addLoaderIncludes(mod, emacs_include);
     mod.addIncludePath(b.path("vendor/ghostty/include"));
 }
 
 fn resolveEmacsIncludePath(b: *std.Build) std.Build.LazyPath {
-    return switch (resolveEmacsIncludeSource(
-        b.graph.env_map.get("EMACS_INCLUDE_DIR"),
-        b.graph.env_map.get("EMACS_SOURCE_DIR"),
-    )) {
-        .include_dir => |dir| .{ .cwd_relative = dir },
-        .source_dir => |dir| blk: {
-            const generated = b.addWriteFiles();
-            const header = generateEmacsModuleHeader(b.allocator, dir) catch |err|
-                std.debug.panic("failed to generate emacs-module.h from {s}: {s}", .{
-                    dir,
-                    @errorName(err),
-                });
-            _ = generated.add("emacs-module.h", header);
-            break :blk generated.getDirectory();
-        },
-        .vendored => .{ .cwd_relative = vendoredEmacsIncludeDir() },
-    };
+    return emacs_util_mods.resolveEmacsIncludePath(b);
 }
 
 fn resolveEmacsIncludeSource(
     emacs_include_dir: ?[]const u8,
     emacs_source_dir: ?[]const u8,
 ) EmacsIncludeSource {
-    if (emacs_include_dir) |dir| return .{ .include_dir = dir };
-    if (emacs_source_dir) |dir| return .{ .source_dir = dir };
-    return .vendored;
+    return emacs_util_mods.resolveEmacsIncludeSource(emacs_include_dir, emacs_source_dir);
 }
 
 fn vendoredEmacsIncludeDir() []const u8 {
     return vendored_emacs_include_dir;
 }
 
-fn generateEmacsModuleHeader(allocator: std.mem.Allocator, source_dir: []const u8) ![]u8 {
-    const src_dir = try std.fs.path.join(allocator, &.{ source_dir, "src" });
-    defer allocator.free(src_dir);
-
-    const template_path = try std.fs.path.join(allocator, &.{ src_dir, "emacs-module.in.h" });
-    defer allocator.free(template_path);
-
-    var header = try readFileAllocAbsolute(allocator, template_path);
-    errdefer allocator.free(header);
-
-    const major_version = try detectEmacsModuleVersion(allocator, src_dir);
-    const version_text = try std.fmt.allocPrint(allocator, "{d}", .{major_version});
-    defer allocator.free(version_text);
-
-    header = try replaceOwned(allocator, header, "@emacs_major_version@", version_text);
-
-    var version: usize = 25;
-    while (version <= major_version) : (version += 1) {
-        const fragment_name = try std.fmt.allocPrint(allocator, "module-env-{d}.h", .{version});
-        defer allocator.free(fragment_name);
-        const fragment_path = try std.fs.path.join(allocator, &.{ src_dir, fragment_name });
-        defer allocator.free(fragment_path);
-        const fragment = try readFileAllocAbsolute(allocator, fragment_path);
-        defer allocator.free(fragment);
-
-        const placeholder = try std.fmt.allocPrint(allocator, "@module_env_snippet_{d}@", .{version});
-        defer allocator.free(placeholder);
-
-        header = try replaceOwned(allocator, header, placeholder, fragment);
-    }
-
-    return header;
-}
-
-fn detectEmacsModuleVersion(allocator: std.mem.Allocator, src_dir: []const u8) !usize {
-    var max_version: usize = 0;
-    var version: usize = 25;
-    while (version < 80) : (version += 1) {
-        const fragment_name = try std.fmt.allocPrint(allocator, "module-env-{d}.h", .{version});
-        defer allocator.free(fragment_name);
-        const fragment_path = try std.fs.path.join(allocator, &.{ src_dir, fragment_name });
-        defer allocator.free(fragment_path);
-
-        if (pathExistsAbsolute(fragment_path)) {
-            max_version = version;
-        }
-    }
-
-    if (max_version == 0) return error.EmacsModuleFragmentsNotFound;
-    return max_version;
-}
-
-fn replaceOwned(
-    allocator: std.mem.Allocator,
-    text: []u8,
-    needle: []const u8,
-    replacement: []const u8,
-) ![]u8 {
-    const replaced = try std.mem.replaceOwned(u8, allocator, text, needle, replacement);
-    allocator.free(text);
-    return replaced;
-}
-
-fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-}
-
-fn pathExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
+fn conptyModuleSourcePath() []const u8 {
+    return "vendor/emacs-util-mods/src/conpty/module.zig";
 }
 
 fn addWindowsRuntimeLibraries(
@@ -265,8 +250,8 @@ test "emacs include resolution falls back to vendored header" {
 
 fn moduleOutputName(target_os: std.Target.Os.Tag) []const u8 {
     return switch (target_os) {
-        .macos => "../ghostel-module.dylib",
-        .windows => "../ghostel-module.dll",
-        else => "../ghostel-module.so",
+        .macos => "bin/ghostel-module.dylib",
+        .windows => "bin/ghostel-module.dll",
+        else => "bin/ghostel-module.so",
     };
 }

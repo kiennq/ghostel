@@ -61,5 +61,6 @@ bench-quick:
 
 clean:
 	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f conpty-module.dll
 	rm -f ghostel.elc ghostel-debug.elc
 	rm -rf zig-out .zig-cache
