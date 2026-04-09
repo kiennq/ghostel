@@ -1745,16 +1745,18 @@ Do not overwrite a manual buffer rename."
 (defun ghostel--set-cursor-style (style visible)
   "Set the cursor style based on terminal state.
 STYLE is one of: 0=bar, 1=block, 2=underline, 3=hollow-block.
-VISIBLE is t or nil."
-  (setq cursor-type
-        (if visible
-            (pcase style
-              (0 '(bar . 2))       ; bar
-              (1 'box)             ; block
-              (2 '(hbar . 2))      ; underline
-              (3 'hollow)          ; hollow block
-              (_ 'box))
-          nil)))
+VISIBLE is t or nil.
+Skipped when copy mode is active because copy mode manages its own cursor."
+  (unless ghostel--copy-mode-active
+    (setq cursor-type
+          (if visible
+              (pcase style
+                (0 '(bar . 2))       ; bar
+                (1 'box)             ; block
+                (2 '(hbar . 2))      ; underline
+                (3 'hollow)          ; hollow block
+                (_ 'box))
+            nil))))
 
 (defun ghostel--update-directory (dir)
   "Update `default-directory' from terminal's OSC 7 report.
