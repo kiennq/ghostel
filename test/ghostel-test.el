@@ -1063,6 +1063,179 @@ cell, so the visual line width must equal the terminal column count."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: resize + app redraw produces correct buffer content
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-resize-redraw-alt-screen ()
+  "After resize on alt screen, the app's SIGWINCH-triggered redraw renders correctly.
+Simulates: alt-screen TUI fills screen → window resize → app redraws
+for new size inside BSU/ESU → verify buffer shows new content."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-redraw*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 100))
+                 (ghostel--term term)
+                 (ghostel--force-next-redraw nil)
+                 (inhibit-read-only t))
+            ;; 1) Enter alt screen and fill with "old" content using
+            ;;    cursor positioning (like a TUI app would).
+            (ghostel--write-input term "\e[?1049h")  ; alt screen on
+            (dotimes (i 10)
+              (ghostel--write-input term (format "\e[%d;1HOLD-LINE-%02d" (1+ i) i)))
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "OLD-LINE-00" content))
+              (should (string-match-p "OLD-LINE-09" content)))
+
+            ;; 2) Simulate what ghostel--window-adjust-process-window-size does:
+            ;;    resize VT, synchronous redraw, set force flag.
+            (ghostel--set-size term 6 40)
+            (ghostel--redraw term t)
+            (setq ghostel--force-next-redraw t)
+
+            ;; 3) Simulate the app's SIGWINCH-triggered redraw with BSU/ESU.
+            ;;    The app clears screen and redraws for the new 6-row size.
+            (ghostel--write-input term "\e[?2026h")     ; BSU
+            (ghostel--write-input term "\e[H\e[2J")     ; clear
+            (dotimes (i 6)
+              (ghostel--write-input term (format "\e[%d;1HNEW-LINE-%02d" (1+ i) i)))
+            (ghostel--write-input term "\e[?2026l")     ; ESU
+
+            ;; 4) Simulate what ghostel--delayed-redraw does:
+            ;;    check BSU gate, flush, redraw.
+            (ghostel--delayed-redraw buf)
+
+            ;; 5) Verify: buffer must show NEW content, not OLD.
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "NEW-LINE-00" content))
+              (should (string-match-p "NEW-LINE-05" content))
+              (should-not (string-match-p "OLD-LINE" content)))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: resize with real process — verify PTY and buffer content
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-resize-width-change-full-repaint ()
+  "After width change on alt screen, all rows repainted correctly.
+Matches the real htop scenario: width changes from wide to narrow,
+app redraws all rows at new width via the filter pipeline."
+  (let ((buf (generate-new-buffer " *ghostel-test-width-change*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq ghostel--term (ghostel--new 6 80 100))
+          (let* ((proc (start-process "ghostel-test-w" buf "sleep" "60"))
+                 (ghostel--process proc)
+                 (inhibit-read-only t))
+            (set-process-coding-system proc 'binary 'binary)
+            (set-process-window-size proc 6 80)
+            (set-process-query-on-exit-flag proc nil)
+            (unwind-protect
+                (progn
+                  ;; Alt screen, fill all rows at 80 columns.
+                  (ghostel--write-input ghostel--term "\e[?1049h\e[H\e[2J")
+                  (dotimes (i 6)
+                    (ghostel--write-input ghostel--term
+                                          (format "\e[%d;1H%-80s" (1+ i) (format "WIDE-R%02d" i))))
+                  (ghostel--redraw ghostel--term t)
+                  (let ((c (buffer-substring-no-properties (point-min) (point-max))))
+                    (should (string-match-p "WIDE-R00" c))
+                    ;; Verify rows are 80 chars wide.
+                    (should (= 80 (length (car (split-string c "\n"))))))
+
+                  ;; Simulate what the resize function does.
+                  (ghostel--set-size ghostel--term 6 40)
+                  (set-process-window-size proc 6 40)
+                  (setq ghostel--force-next-redraw t)
+
+                  ;; App redraws ALL rows at new width, through filter pipeline.
+                  (let ((response (concat
+                                   "\e[H\e[2J"
+                                   (mapconcat
+                                    (lambda (i) (format "\e[%d;1HNARROW-R%02d" (1+ i) i))
+                                    (number-sequence 0 5) ""))))
+                    (ghostel--filter proc response))
+                  (ghostel--delayed-redraw buf)
+
+                  (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+                    ;; All rows must have new narrow content.
+                    (should (string-match-p "NARROW-R00" content))
+                    (should (string-match-p "NARROW-R05" content))
+                    ;; No old wide content.
+                    (should-not (string-match-p "WIDE-R" content))
+                    ;; Rows should be 40 chars wide (new terminal width).
+                    (should (= 40 (length (car (split-string content "\n")))))))
+              (when (process-live-p proc)
+                (delete-process proc)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-resize-through-filter-pipeline ()
+  "Full pipeline test: resize, then app response goes through filter path.
+The app's output enters via `ghostel--filter' (pending-output) and is
+rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
+  (let ((buf (generate-new-buffer " *ghostel-test-pipeline*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq ghostel--term (ghostel--new 10 40 100))
+          (let* ((process-environment
+                  (append (list "TERM=xterm-256color" "COLUMNS=40" "LINES=10")
+                          process-environment))
+                 (proc (start-process "ghostel-test-pipe" buf "sleep" "60")))
+            (setq ghostel--process proc)
+            (set-process-coding-system proc 'binary 'binary)
+            (set-process-window-size proc 10 40)
+            (set-process-query-on-exit-flag proc nil)
+            (unwind-protect
+                (let ((inhibit-read-only t))
+                  ;; Initial content on alt screen (written directly to VT).
+                  (ghostel--write-input ghostel--term "\e[?1049h\e[H\e[2J")
+                  (dotimes (i 10)
+                    (ghostel--write-input ghostel--term
+                                          (format "\e[%d;1H%-40s" (1+ i) (format "OLD-%02d" i))))
+                  (ghostel--redraw ghostel--term t)
+                  (should (string-match-p "OLD-00"
+                                          (buffer-substring-no-properties (point-min) (point-max))))
+
+                  ;; Resize (as our resize function does).
+                  (ghostel--set-size ghostel--term 6 40)
+                  (set-process-window-size proc 6 40)
+                  (ghostel--redraw ghostel--term t)
+                  (setq ghostel--force-next-redraw t)
+
+                  ;; Simulate app's SIGWINCH response arriving through the filter.
+                  ;; This is the real pipeline: filter → pending-output → delayed-redraw.
+                  ;; Use BSU/ESU like htop does.
+                  (let ((response (concat
+                                   "\e[?2026h"      ; BSU
+                                   "\e[?25l"         ; hide cursor
+                                   "\e[H\e[2J"       ; clear
+                                   (mapconcat
+                                    (lambda (i)
+                                      (format "\e[%d;1HNEW-%02d%s" (1+ i) i
+                                              (make-string (- 40 6) ?\s)))
+                                    (number-sequence 0 5) "")
+                                   "\e[6;7H"         ; position cursor
+                                   "\e[?25h"         ; show cursor
+                                   "\e[?2026l")))    ; ESU
+                    ;; Feed through the filter to accumulate as pending output.
+                    (ghostel--filter proc response))
+
+                  ;; Now call delayed-redraw (as the timer would).
+                  (ghostel--delayed-redraw buf)
+
+                  (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+                    (should (string-match-p "NEW-00" content))
+                    (should (string-match-p "NEW-05" content))
+                    (should-not (string-match-p "OLD-" content))
+                    (should (equal 6 (count-lines (point-min) (point-max))))))
+              (when (process-live-p proc)
+                (delete-process proc)))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: theme synchronization
 ;; -----------------------------------------------------------------------
 
@@ -1840,7 +2013,7 @@ cell, so the visual line width must equal the terminal column count."
 (ert-deftest ghostel-test-send-next-key-meta-x ()
   "send-next-key routes M-x through the encoder with meta modifier."
   (let (captured-key captured-mods
-        (ghostel--term 'fake))
+                     (ghostel--term 'fake))
     (cl-letf (((symbol-function 'ghostel--send-encoded)
                (lambda (key mods &optional _utf8)
                  (setq captured-key key captured-mods mods))))
@@ -1852,7 +2025,7 @@ cell, so the visual line width must equal the terminal column count."
 (ert-deftest ghostel-test-send-next-key-function-key ()
   "send-next-key routes function keys through the encoder."
   (let (captured-key captured-mods
-        (ghostel--term 'fake))
+                     (ghostel--term 'fake))
     (cl-letf (((symbol-function 'ghostel--send-encoded)
                (lambda (key mods &optional _utf8)
                  (setq captured-key key captured-mods mods))))
@@ -1897,6 +2070,49 @@ cell, so the visual line width must equal the terminal column count."
   (let ((default-directory "/tmp/")
         (ghostel-shell "/bin/zsh"))
     (should (equal "/bin/zsh" (ghostel--get-shell)))))
+
+;; -----------------------------------------------------------------------
+;; Tests: window resize
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-resize-window-adjust ()
+  "Window adjust resizes the VT, marks redraw state, and returns dimensions."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--force-next-redraw nil)
+          (set-size-args nil)
+          (invalidate-called nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t)))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 40))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (equal '(120 . 40) result))
+            (should (equal '(40 120) set-size-args))
+            (should ghostel--force-next-redraw)
+            (should invalidate-called)))))))
+
+(ert-deftest ghostel-test-resize-nil-size ()
+  "When default function returns nil, no resize happens."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (set-size-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w) (setq set-size-called t)))
+                ((symbol-function 'process-buffer)
+                 (lambda (_proc) nil))
+                ((default-value 'window-adjust-process-window-size-function)
+                 (lambda (_proc _wins) nil)))
+        (let ((result (ghostel--window-adjust-process-window-size
+                       'fake-proc nil)))
+          (should (null result))
+          (should-not set-size-called))))))
 
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-raw-key-sequences
@@ -1946,7 +2162,9 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-send-next-key-function-key
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
-    ghostel-test-get-shell-local)
+    ghostel-test-get-shell-local
+    ghostel-test-resize-window-adjust
+    ghostel-test-resize-nil-size)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()
