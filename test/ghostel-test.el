@@ -177,6 +177,55 @@
        "}\n")
       lisp-name version (length version) module-id version))))
 
+(defun ghostel-test--write-custom-dyn-loader-fixture (path module-id lisp-name version export-id)
+  "Write a dyn-loader fixture module source to PATH with EXPORT-ID."
+  (with-temp-file path
+    (insert
+     (format
+      (concat
+       "const c = @cImport({\n"
+       "    @cInclude(\"emacs-module.h\");\n"
+       "});\n"
+       "const ExportDescriptor = extern struct {\n"
+       "    export_id: u32,\n"
+       "    kind: u32,\n"
+       "    lisp_name: [*:0]const u8,\n"
+       "    min_arity: i32,\n"
+       "    max_arity: i32,\n"
+       "    docstring: [*:0]const u8,\n"
+       "    flags: u32,\n"
+       "};\n"
+       "const GenericManifest = extern struct {\n"
+       "    loader_abi: u32,\n"
+       "    module_id: [*:0]const u8,\n"
+       "    module_version: [*:0]const u8,\n"
+       "    exports_len: u32,\n"
+       "    exports: [*]const ExportDescriptor,\n"
+       "    invoke: *const fn (u32, ?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "    get_variable: *const fn (u32, ?*c.emacs_env, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "    set_variable: *const fn (u32, ?*c.emacs_env, c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,\n"
+       "};\n"
+       "const exports = [_]ExportDescriptor{.{ .export_id = %d, .kind = 1, .lisp_name = \"%s\", .min_arity = 0, .max_arity = 0, .docstring = \"Return fixture version.\", .flags = 0 }};\n"
+       "fn invoke(export_id: u32, raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return switch (export_id) {\n"
+       "        %d => env.make_string.?(env, \"%s\", %d),\n"
+       "        else => env.intern.?(env, \"nil\"),\n"
+       "    };\n"
+       "}\n"
+       "fn getVariable(_: u32, raw_env: ?*c.emacs_env, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return env.intern.?(env, \"nil\");\n"
+       "}\n"
+       "fn setVariable(_: u32, raw_env: ?*c.emacs_env, _: c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {\n"
+       "    const env = raw_env.?;\n"
+       "    return env.intern.?(env, \"nil\");\n"
+       "}\n"
+       "export fn loader_module_init_generic(out: *GenericManifest) callconv(.c) void {\n"
+       "    out.* = .{ .loader_abi = 1, .module_id = \"%s\", .module_version = \"%s\", .exports_len = exports.len, .exports = exports[0..].ptr, .invoke = &invoke, .get_variable = &getVariable, .set_variable = &setVariable };\n"
+       "}\n")
+      export-id lisp-name export-id version (length version) module-id version))))
+
 (defun ghostel-test--build-dyn-loader-fixture (source output)
   "Compile a dyn-loader fixture from SOURCE to OUTPUT."
   (let ((include-dir (expand-file-name "include" (ghostel-test--repo-root))))
@@ -2946,6 +2995,57 @@ cell, so the visual line width must equal the terminal column count."
       (when (file-directory-p fixture-dir)
         (ignore-errors (delete-directory fixture-dir t))))))
 
+(ert-deftest ghostel-test-dyn-loader-stale-binding-signals-error ()
+  "Calling a stale binding after reload signals an error instead of escaping the loader."
+  (skip-unless (and (fboundp 'module-load)
+                    (executable-find "zig")
+                    (require 'comp-run nil t)
+                    (boundp 'comp-installed-trampolines-h)))
+  (let* ((suffix (format "%x%x" (emacs-pid) (random most-positive-fixnum)))
+         (module-id (format "ghostel-test-module-%s" suffix))
+         (old-name (format "ghostel-test--old-version-%s" suffix))
+         (new-name (format "ghostel-test--new-version-%s" suffix))
+         (fixture-dir (make-temp-file "ghostel-reload-fixture-" t))
+         (source-v1 (expand-file-name "sample-v1.zig" fixture-dir))
+         (source-v2 (expand-file-name "sample-v2.zig" fixture-dir))
+         (ext module-file-suffix)
+         (output-v1 (expand-file-name (concat "sample-v1" ext) fixture-dir))
+         (output-v2 (expand-file-name (concat "sample-v2" ext) fixture-dir))
+         (live-module (expand-file-name (concat "sample-live" ext) fixture-dir))
+         (manifest (expand-file-name "sample-module.json" fixture-dir))
+         (repo-root (ghostel-test--repo-root))
+         (loader-path (or (cl-find-if #'file-exists-p
+                                      (list (expand-file-name (concat "zig-out/bin/dyn-loader-module" ext)
+                                                              repo-root)
+                                            (expand-file-name (concat "dyn-loader-module" ext)
+                                                              repo-root)))
+                          ""))
+         (old-sym (intern old-name))
+         (new-sym (intern new-name)))
+    (unwind-protect
+        (progn
+          (skip-unless (file-exists-p loader-path))
+          (ghostel-test--write-custom-dyn-loader-fixture source-v1 module-id old-name "1.0" 1)
+          (ghostel-test--write-custom-dyn-loader-fixture source-v2 module-id new-name "2.0" 2)
+          (ghostel-test--build-dyn-loader-fixture source-v1 output-v1)
+          (ghostel-test--build-dyn-loader-fixture source-v2 output-v2)
+          (copy-file output-v1 live-module t)
+          (ghostel-test--write-loader-manifest manifest
+                                               (file-name-nondirectory live-module))
+          (unless (featurep 'dyn-loader-module)
+            (module-load loader-path))
+          (dyn-loader-load-manifest manifest)
+          (should (equal "1.0" (funcall old-sym)))
+          (rename-file live-module (concat live-module ".bak") t)
+          (copy-file output-v2 live-module t)
+          (dyn-loader-reload module-id)
+          (should (equal "2.0" (funcall new-sym)))
+          (should-error (funcall old-sym) :type 'error))
+      (ignore-errors (fmakunbound old-sym))
+      (ignore-errors (fmakunbound new-sym))
+      (when (file-directory-p fixture-dir)
+        (ignore-errors (delete-directory fixture-dir t))))))
+
 (ert-deftest ghostel-test-reload-module-refuses-with-live-terminals ()
   (cl-letf (((symbol-function 'ghostel--live-buffers)
              (lambda () '(live-buffer))))
@@ -3240,6 +3340,7 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-close-live-buffers-terminates-conpty-and-process
     ghostel-test-sentinel-kills-conpty-backend-on-exit
     ghostel-test-reload-module-refuses-with-live-terminals
+    ghostel-test-dyn-loader-stale-binding-signals-error
     ghostel-test-reload-module-swaps-generation-when-safe
     ghostel-test-reload-module-keeps-user-state-on-failure
     ghostel-test-reload-module-surfaces-abi-mismatch)
