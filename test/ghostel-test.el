@@ -86,6 +86,25 @@
     (or (locate-dominating-file source "ghostel.el")
         (error "Could not locate Ghostel repository root from %s" source))))
 
+(defun ghostel-test--run-child-emacs-script (script &optional repo-root)
+  "Run SCRIPT in a fresh batch Emacs from REPO-ROOT and capture the result."
+  (let* ((repo-root (file-name-as-directory
+                     (or repo-root (ghostel-test--repo-root))))
+         (script-file (make-temp-file "ghostel-child-" nil ".el"))
+         (emacs-bin (expand-file-name invocation-name invocation-directory)))
+    (unwind-protect
+        (progn
+          (with-temp-file script-file
+            (insert script))
+          (with-temp-buffer
+            (let ((status (process-file emacs-bin nil (current-buffer) nil
+                                        "--batch" "-Q" "-L" repo-root
+                                        "-l" script-file)))
+              (list :exit status
+                    :output (buffer-string)))))
+      (when (file-exists-p script-file)
+        (delete-file script-file)))))
+
 (ert-deftest ghostel-test-source-omits-removed-native-hooks ()
   "Removed native debug and metadata hooks stay absent from checked-in sources."
   (let* ((repo (ghostel-test--repo-root))
@@ -1945,6 +1964,56 @@ cell, so the visual line width must equal the terminal column count."
                      t)))
           (should (eq 'fake-proc (ghostel--start-process)))
           (should (equal '(32 119) captured-size)))))))
+
+(ert-deftest ghostel-test-zig-build-startup-does-not-crash-on-windows ()
+  "Fresh Windows artifacts from `zig build' should start Ghostel cleanly."
+  (skip-unless (eq system-type 'windows-nt))
+  (let* ((repo (ghostel-test--repo-root))
+         (module-dir (expand-file-name "zig-out/bin" repo))
+         (required-files (mapcar (lambda (name)
+                                   (expand-file-name name module-dir))
+                                 '("dyn-loader-module.dll"
+                                   "ghostel-module.dll"
+                                   "conpty-module.dll"
+                                   "ghostel-module.json"))))
+    (skip-unless (cl-every #'file-exists-p required-files))
+    (let* ((script
+            (format
+             (concat
+              "(setq default-directory %S)\n"
+              "(setq load-prefer-newer t\n"
+              "      ghostel-module-dir %S\n"
+              "      ghostel-shell \"cmd.exe\"\n"
+              "      ghostel-kill-buffer-on-exit nil)\n"
+              "(require 'ghostel)\n"
+              "(ghostel--initialize-native-modules)\n"
+              "(unless (ghostel--native-runtime-ready-p)\n"
+              "  (princ \"runtime-not-ready\\n\")\n"
+              "  (kill-emacs 21))\n"
+               "(ghostel)\n"
+               "(let ((buf (current-buffer)))\n"
+               "  (unwind-protect\n"
+               "      (with-current-buffer buf\n"
+               "        (princ (format \"process-live=%%S conpty=%%S\\n\"\n"
+              "                       (process-live-p ghostel--process)\n"
+              "                       (ghostel--conpty-active-p)))\n"
+              "        (sleep-for 0.2)\n"
+              "        (princ \"startup-ok\\n\"))\n"
+              "    (when (buffer-live-p buf)\n"
+              "      (with-current-buffer buf\n"
+              "        (when (process-live-p ghostel--process)\n"
+              "          (delete-process ghostel--process))\n"
+              "        (when (and (ghostel--conpty-active-p)\n"
+              "                   ghostel--term\n"
+              "                   (fboundp 'conpty--kill))\n"
+              "          (conpty--kill ghostel--term)))\n"
+              "      (kill-buffer buf))))\n")
+             repo
+             module-dir))
+           (result (ghostel-test--run-child-emacs-script script repo))
+           (output (plist-get result :output)))
+      (should (equal 0 (plist-get result :exit)))
+      (should (string-match-p "startup-ok" output)))))
 
 (ert-deftest ghostel-test-conpty-init-keeps-shell-alive-on-windows ()
   "Windows ConPTY init should keep the shell alive long enough to emit a prompt."
