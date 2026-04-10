@@ -530,6 +530,20 @@ When VERSION is nil, use the latest release download URL."
   "Ask dyn-loader-module to reload MODULE-ID from its stored manifest."
   (dyn-loader-reload module-id))
 
+(defun ghostel-reload-module (&optional close-live)
+  "Reload the Ghostel target native module from metadata on disk.
+
+With prefix argument CLOSE-LIVE, terminate live Ghostel terminals first."
+  (interactive "P")
+  (let ((live-buffers (ghostel--live-buffers)))
+    (when live-buffers
+      (if close-live
+          (ghostel--close-live-buffers live-buffers)
+        (user-error "Ghostel terminals are still running; close them before reloading"))))
+  (ghostel--loader-reload ghostel--module-id)
+  (message "ghostel: native module reloaded successfully (%s)"
+           ghostel--module-id))
+
 (defun ghostel--write-loader-metadata-atomically (dir metadata)
   "Write loader METADATA JSON into DIR using temp-file then rename semantics."
   (let* ((dir (ghostel--effective-module-dir dir))
