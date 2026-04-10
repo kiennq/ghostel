@@ -1563,11 +1563,108 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
 ;; Test: module version check
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-package-version ()
-  "Test that `ghostel--package-version' returns a version string."
-  (let ((ver (ghostel--package-version)))
-    (should (stringp ver))
-    (should (string-match-p "^[0-9]+\\.[0-9]+\\.[0-9]+" ver))))
+(ert-deftest ghostel-test-module-download-url-uses-minimum-version ()
+  "Module downloads pin to the minimum supported native module version."
+  (let ((ghostel-github-release-url "https://example.invalid/releases")
+        (ghostel--minimum-module-version "0.7.1"))
+    (cl-letf (((symbol-function 'ghostel--module-asset-name)
+               (lambda () "ghostel-module-x86_64-linux.tar.xz")))
+      (should (equal "https://example.invalid/releases/download/v0.7.1/ghostel-module-x86_64-linux.tar.xz"
+                     (ghostel--module-download-url ghostel--minimum-module-version))))))
+
+(ert-deftest ghostel-test-download-module-prefix-empty-uses-latest ()
+  "Prefix download prompts for a version and treats blank input as latest."
+  (let ((captured-version :unset)
+        (captured-latest nil)
+        (bootstrapped nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'ghostel--read-module-download-version)
+                 (lambda () nil))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (_dir &optional version latest-release)
+                   (setq captured-version version
+                         captured-latest latest-release)
+                   t))
+                ((symbol-function 'ghostel--ensure-loader-loaded)
+                 (lambda (&optional _path) t))
+                ((symbol-function 'ghostel--bootstrap-module)
+                 (lambda (&optional _dir)
+                   (setq bootstrapped t)
+                   t))
+                ((symbol-function 'ghostel--check-module-version)
+                 (lambda (&optional _dir) t))
+                ((symbol-function 'ghostel--ensure-conpty-loaded)
+                 (lambda (&optional _dir) t))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (ghostel-download-module t)
+        (should (null captured-version))
+        (should captured-latest)
+        (should bootstrapped)))))
+
+(ert-deftest ghostel-test-download-module-prefix-allows-non-semver-release-tag ()
+  "Prefix download accepts release tags that are not valid `version<' input."
+  (let ((captured-version :unset)
+        (captured-latest nil)
+        (bootstrapped nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _args) "0.8.0.16.2913fc"))
+                ((symbol-function 'version<)
+                 (lambda (_left _right) nil))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (_dir &optional version latest-release)
+                   (setq captured-version version
+                         captured-latest latest-release)
+                   t))
+                ((symbol-function 'ghostel--ensure-loader-loaded)
+                 (lambda (&optional _path) t))
+                ((symbol-function 'ghostel--bootstrap-module)
+                 (lambda (&optional _dir)
+                   (setq bootstrapped t)
+                   t))
+                ((symbol-function 'ghostel--check-module-version)
+                 (lambda (&optional _dir) t))
+                ((symbol-function 'ghostel--ensure-conpty-loaded)
+                 (lambda (&optional _dir) t))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (ghostel-download-module t)
+        (should (equal "0.8.0.16.2913fc" captured-version))
+        (should-not captured-latest)
+        (should bootstrapped)))))
+
+(ert-deftest ghostel-test-download-module-publishes-downloaded-archive ()
+  "Module downloads unpack the archive before reporting success."
+  (let* ((source-dir (file-name-as-directory (make-temp-file "ghostel-download-" t)))
+         (archive (expand-file-name "ghostel-module-x86_64-linux.tar.xz" source-dir))
+         (download-dest nil)
+         (published nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--module-download-url)
+                   (lambda (&optional _version)
+                     "https://example.invalid/releases/download/v0.7.1/ghostel-module-x86_64-linux.tar.xz"))
+                  ((symbol-function 'file-directory-p)
+                   (lambda (_path) t))
+                  ((symbol-function 'ghostel--download-file)
+                   (lambda (_url dest)
+                     (setq download-dest dest)
+                     t))
+                  ((symbol-function 'ghostel--publish-downloaded-module-archive)
+                   (lambda (downloaded-archive dir)
+                     (setq published (list downloaded-archive dir))
+                     t)))
+          (should (ghostel--download-module source-dir))
+          (should (ghostel--same-path-p archive download-dest))
+          (should (equal archive (car published)))
+          (should (ghostel--same-path-p source-dir (cadr published))))
+      (delete-directory source-dir t))))
 
 (ert-deftest ghostel-test-compile-module-invokes-zig-build ()
   "Source compilation runs zig build directly."
@@ -2428,7 +2525,10 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-copy-mode-load-all
     ghostel-test-copy-all
     ghostel-test-copy-mode-full-buffer-scroll
-    ghostel-test-package-version
+    ghostel-test-module-download-url-uses-minimum-version
+    ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-module-prefix-allows-non-semver-release-tag
+    ghostel-test-download-module-publishes-downloaded-archive
     ghostel-test-compile-module-invokes-zig-build
     ghostel-test-module-compile-command-uses-zig-build
     ghostel-test-module-version-match
