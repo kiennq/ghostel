@@ -79,6 +79,6 @@ bench-quick:
 	bash bench/run-bench.sh --quick
 
 clean:
-	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll conpty-module.dll ghostel-module.dylib ghostel-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache

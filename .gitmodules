@@ -1,3 +1,6 @@
 [submodule "vendor/ghostty"]
 	path = vendor/ghostty
 	url = https://github.com/ghostty-org/ghostty.git
+[submodule "vendor/emacs-util-mods"]
+	path = vendor/emacs-util-mods
+	url = https://github.com/kiennq/emacs-util-mods.git
