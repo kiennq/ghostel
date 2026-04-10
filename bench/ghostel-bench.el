@@ -18,6 +18,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 
 ;; ---------------------------------------------------------------------------
 ;; Configuration
@@ -54,6 +55,28 @@ Always available since term is built into Emacs.")
 
 (defvar ghostel-bench--results nil
   "List of result plists from benchmark runs.")
+
+(defvar ghostel-bench--module-dir nil
+  "Temporary Ghostel module directory used by the benchmark harness.")
+
+(defvar ghostel-enable-url-detection)
+(defvar ghostel-enable-file-detection)
+(defvar ghostel-full-redraw)
+(defvar ghostel-module-auto-install)
+(defvar ghostel-module-dir)
+
+(defun ghostel-bench--ghostel-scenario-label (prefix &optional renderer-or-suffix suffix)
+  "Build a Ghostel benchmark label from PREFIX and SUFFIX.
+Accepts the old three-argument call form and ignores the removed renderer slot."
+  (let ((suffix (or suffix
+                    (and (stringp renderer-or-suffix) renderer-or-suffix))))
+    (if suffix
+        (format "%s/ghostel-%s" prefix suffix)
+      (format "%s/ghostel" prefix))))
+
+(defun ghostel-bench--ghostel-redraw (term full-redraw)
+  "Redraw benchmark TERM with FULL-REDRAW."
+  (ghostel--redraw term full-redraw))
 
 ;; ---------------------------------------------------------------------------
 ;; Data generators
@@ -195,6 +218,19 @@ for reliable measurement."
   "Create a ghostel terminal for benchmarking."
   (ghostel--new rows cols ghostel-bench-scrollback))
 
+(defun ghostel-bench--cat-file-command (file)
+  "Return a command list that writes FILE to stdout."
+  (let ((path (expand-file-name file)))
+    (if (eq system-type 'windows-nt)
+        (list "cmd.exe" "/d" "/c" "type" (subst-char-in-string ?/ ?\\ path))
+      (list "cat" path))))
+
+(defun ghostel-bench--echo-command ()
+  "Return a command list for a process that echoes stdin to stdout."
+  (if (eq system-type 'windows-nt)
+      (list "cmd.exe" "/q" "/d" "/c" "more")
+    (list "cat")))
+
 (defun ghostel-bench--make-vterm (rows cols)
   "Create a vterm terminal for benchmarking."
   (vterm--new rows cols ghostel-bench-scrollback nil nil nil nil nil))
@@ -214,7 +250,9 @@ The caller must call `delete-process' when done."
   (setq term-width cols)
   (setq term-height rows)
   (setq term-buffer-maximum-size ghostel-bench-scrollback)
-  (let ((proc (start-process "term-bench" (current-buffer) "cat")))
+  (let* ((command (ghostel-bench--echo-command))
+         (proc (apply #'start-process "term-bench" (current-buffer)
+                      (car command) (cdr command))))
     (set-process-query-on-exit-flag proc nil)
     proc))
 
@@ -248,7 +286,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
            (proc (make-process
                   :name "ghostel-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -261,14 +299,15 @@ When NO-DETECT is non-nil, disable URL and file detection."
                                      (lambda ()
                                        (setq redraw-timer nil)
                                        (let ((inhibit-read-only t))
-                                         (when pending
-                                           (ghostel--write-input
-                                            term
-                                            (apply #'concat (nreverse pending)))
-                                           (setq pending nil))
-                                         (ghostel--redraw term full-redraw)))))))
-                  :sentinel (lambda (_proc _event)
-                              (setq done t)))))
+                                          (when pending
+                                            (ghostel--write-input
+                                             term
+                                             (apply #'concat (nreverse pending)))
+                                            (setq pending nil))
+                                           (ghostel-bench--ghostel-redraw
+                                            term full-redraw)))))))
+                   :sentinel (lambda (_proc _event)
+                               (setq done t)))))
       (set-process-window-size proc rows cols)
       ;; Run Emacs event loop until process exits
       (while (not done)
@@ -278,7 +317,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
       (when pending
         (ghostel--write-input term (apply #'concat (nreverse pending)))
         (setq pending nil))
-      (ghostel--redraw term full-redraw))))
+      (ghostel-bench--ghostel-redraw term full-redraw))))
 
 (defun ghostel-bench--pty-vterm (data-file)
   "Benchmark vterm processing `cat DATA-FILE' through a real PTY."
@@ -290,7 +329,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
            (proc (make-process
                   :name "vterm-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -322,7 +361,7 @@ When NO-DETECT is non-nil, disable URL and file detection."
            (proc (make-process
                   :name "eat-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -362,7 +401,7 @@ and render in a single call."
            (proc (make-process
                   :name "term-bench"
                   :buffer (current-buffer)
-                  :command (list "cat" (expand-file-name data-file))
+                   :command (ghostel-bench--cat-file-command data-file)
                   :connection-type 'pipe
                   :coding 'binary
                   :noquery t
@@ -385,22 +424,25 @@ and render in a single call."
                     #'ghostel-bench--gen-plain-ascii)))
     (unwind-protect
         (progn
-          (message "  [plain ASCII data]")
-          ;; ghostel incremental
-          (ghostel-bench--measure
-           "pty/plain/ghostel-incr" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--pty-ghostel data-file nil)))
-          ;; ghostel full
-          (ghostel-bench--measure
-           "pty/plain/ghostel-full" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--pty-ghostel data-file t)))
-          ;; ghostel default, no URL/file detection
-          (ghostel-bench--measure
-           "pty/plain/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--pty-ghostel data-file ghostel-full-redraw t)))
-          ;; vterm
-          (when ghostel-bench-include-vterm
-            (ghostel-bench--measure
+           (message "  [plain ASCII data]")
+           ;; ghostel incremental
+           (ghostel-bench--measure
+            (ghostel-bench--ghostel-scenario-label "pty/plain" nil "incr")
+            ghostel-bench-data-size ghostel-bench-iterations
+            (lambda () (ghostel-bench--pty-ghostel data-file nil)))
+           ;; ghostel full
+           (ghostel-bench--measure
+            (ghostel-bench--ghostel-scenario-label "pty/plain" nil "full")
+            ghostel-bench-data-size ghostel-bench-iterations
+            (lambda () (ghostel-bench--pty-ghostel data-file t)))
+           ;; ghostel default, no URL/file detection
+           (ghostel-bench--measure
+            (ghostel-bench--ghostel-scenario-label "pty/plain" nil "nodetect")
+            ghostel-bench-data-size ghostel-bench-iterations
+            (lambda () (ghostel-bench--pty-ghostel data-file ghostel-full-redraw t)))
+           ;; vterm
+           (when ghostel-bench-include-vterm
+             (ghostel-bench--measure
              "pty/plain/vterm" ghostel-bench-data-size ghostel-bench-iterations
              (lambda () (ghostel-bench--pty-vterm data-file))))
           ;; eat
@@ -419,18 +461,20 @@ and render in a single call."
                     #'ghostel-bench--gen-urls-and-paths)))
     (unwind-protect
         (progn
-          (message "  [URL & file-path heavy data]")
-          ;; ghostel default (detection on)
-          (ghostel-bench--measure
-           "pty/urls/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--pty-ghostel data-file ghostel-full-redraw)))
-          ;; ghostel no detection
-          (ghostel-bench--measure
-           "pty/urls/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--pty-ghostel data-file ghostel-full-redraw t)))
-          ;; vterm (baseline)
-          (when ghostel-bench-include-vterm
-            (ghostel-bench--measure
+           (message "  [URL & file-path heavy data]")
+           ;; ghostel default (detection on)
+           (ghostel-bench--measure
+            (ghostel-bench--ghostel-scenario-label "pty/urls")
+            ghostel-bench-data-size ghostel-bench-iterations
+            (lambda () (ghostel-bench--pty-ghostel data-file ghostel-full-redraw)))
+           ;; ghostel no detection
+           (ghostel-bench--measure
+            (ghostel-bench--ghostel-scenario-label "pty/urls" nil "nodetect")
+            ghostel-bench-data-size ghostel-bench-iterations
+            (lambda () (ghostel-bench--pty-ghostel data-file ghostel-full-redraw t)))
+           ;; vterm (baseline)
+           (when ghostel-bench-include-vterm
+             (ghostel-bench--measure
              "pty/urls/vterm" ghostel-bench-data-size ghostel-bench-iterations
              (lambda () (ghostel-bench--pty-vterm data-file))))
           ;; eat (baseline)
@@ -467,16 +511,17 @@ terminal engine with periodic redraws, all in a tight loop."
              (term (ghostel-bench--make-ghostel 24 80))
              (inhibit-read-only t))
         (ghostel-bench--measure
-         "stream/ghostel-incr" (string-bytes data) ghostel-bench-iterations
-         (lambda ()
-           (let ((offset 0) (chunk-count 0))
-             (while (< offset data-len)
+         (ghostel-bench--ghostel-scenario-label "stream" nil "incr")
+         (string-bytes data) ghostel-bench-iterations
+          (lambda ()
+            (let ((offset 0) (chunk-count 0))
+              (while (< offset data-len)
                (let ((end (min (+ offset chunk-size) data-len)))
-                 (ghostel--write-input term (substring data offset end))
-                 (setq offset end)
-                 (cl-incf chunk-count)
-                 (when (zerop (% chunk-count redraw-every))
-                   (ghostel--redraw term nil)))))))))
+                  (ghostel--write-input term (substring data offset end))
+                  (setq offset end)
+                  (cl-incf chunk-count)
+                  (when (zerop (% chunk-count redraw-every))
+                    (ghostel-bench--ghostel-redraw term nil)))))))))
     ;; ghostel full
     (with-temp-buffer
       (let* ((data (ghostel-bench--encode-for-backend raw-data 'ghostel))
@@ -484,16 +529,17 @@ terminal engine with periodic redraws, all in a tight loop."
              (term (ghostel-bench--make-ghostel 24 80))
              (inhibit-read-only t))
         (ghostel-bench--measure
-         "stream/ghostel-full" (string-bytes data) ghostel-bench-iterations
-         (lambda ()
-           (let ((offset 0) (chunk-count 0))
-             (while (< offset data-len)
+         (ghostel-bench--ghostel-scenario-label "stream" nil "full")
+         (string-bytes data) ghostel-bench-iterations
+          (lambda ()
+            (let ((offset 0) (chunk-count 0))
+              (while (< offset data-len)
                (let ((end (min (+ offset chunk-size) data-len)))
-                 (ghostel--write-input term (substring data offset end))
-                 (setq offset end)
-                 (cl-incf chunk-count)
-                 (when (zerop (% chunk-count redraw-every))
-                   (ghostel--redraw term t)))))))))
+                  (ghostel--write-input term (substring data offset end))
+                  (setq offset end)
+                  (cl-incf chunk-count)
+                  (when (zerop (% chunk-count redraw-every))
+                    (ghostel-bench--ghostel-redraw term t)))))))))
     ;; ghostel default, no detection
     (with-temp-buffer
       (let* ((data (ghostel-bench--encode-for-backend raw-data 'ghostel))
@@ -503,16 +549,17 @@ terminal engine with periodic redraws, all in a tight loop."
              (ghostel-enable-file-detection nil)
              (inhibit-read-only t))
         (ghostel-bench--measure
-         "stream/ghostel-nodetect" (string-bytes data) ghostel-bench-iterations
-         (lambda ()
-           (let ((offset 0) (chunk-count 0))
-             (while (< offset data-len)
+         (ghostel-bench--ghostel-scenario-label "stream" nil "nodetect")
+         (string-bytes data) ghostel-bench-iterations
+          (lambda ()
+            (let ((offset 0) (chunk-count 0))
+              (while (< offset data-len)
                (let ((end (min (+ offset chunk-size) data-len)))
-                 (ghostel--write-input term (substring data offset end))
-                 (setq offset end)
-                 (cl-incf chunk-count)
-                 (when (zerop (% chunk-count redraw-every))
-                   (ghostel--redraw term ghostel-full-redraw)))))))))
+                  (ghostel--write-input term (substring data offset end))
+                  (setq offset end)
+                  (cl-incf chunk-count)
+                  (when (zerop (% chunk-count redraw-every))
+                    (ghostel-bench--ghostel-redraw term ghostel-full-redraw)))))))))
     ;; vterm
     (when ghostel-bench-include-vterm
       (with-temp-buffer
@@ -589,25 +636,29 @@ content — relevant for apps like htop, vim, claude-code."
                 (term (ghostel-bench--make-ghostel rows cols))
                 (inhibit-read-only t))
             (let ((result
-                   (ghostel-bench--measure
-                    (format "tui-frame/ghostel-incr/%s" label)
-                    (string-bytes frame) tui-iterations
-                    (lambda ()
-                      (ghostel--write-input term frame)
-                      (ghostel--redraw term nil)))))
-              (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
+                    (ghostel-bench--measure
+                     (format "%s/%s"
+                             (ghostel-bench--ghostel-scenario-label "tui-frame" nil "incr")
+                             label)
+                     (string-bytes frame) tui-iterations
+                     (lambda ()
+                       (ghostel--write-input term frame)
+                       (ghostel-bench--ghostel-redraw term nil)))))
+               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; ghostel full
         (with-temp-buffer
           (let ((frame (ghostel-bench--encode-for-backend raw-frame 'ghostel))
                 (term (ghostel-bench--make-ghostel rows cols))
                 (inhibit-read-only t))
             (let ((result
-                   (ghostel-bench--measure
-                    (format "tui-frame/ghostel-full/%s" label)
-                    (string-bytes frame) tui-iterations
-                    (lambda ()
-                      (ghostel--write-input term frame)
-                      (ghostel--redraw term t)))))
+                    (ghostel-bench--measure
+                     (format "%s/%s"
+                             (ghostel-bench--ghostel-scenario-label "tui-frame" nil "full")
+                             label)
+                     (string-bytes frame) tui-iterations
+                     (lambda ()
+                       (ghostel--write-input term frame)
+                       (ghostel-bench--ghostel-redraw term t)))))
               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; vterm
         (when ghostel-bench-include-vterm
@@ -670,15 +721,15 @@ When RENDER-P is non-nil, also call redraw after write-input."
             (inhibit-read-only t)
             (counter 0))
         (ghostel-bench--measure
-         (format "%s/ghostel-incr/%s" name label)
+         (format "%s/%s" (ghostel-bench--ghostel-scenario-label name nil "incr") label)
          (string-bytes data) iters
-         (if render-p
-             (lambda ()
-               (setq counter (1+ counter))
-               (ghostel--write-input term (format "\e[H%d\r\n" counter))
-               (ghostel--write-input term data)
-               (ghostel--redraw term nil))
-           (lambda () (ghostel--write-input term data))))))
+          (if render-p
+              (lambda ()
+                (setq counter (1+ counter))
+                (ghostel--write-input term (format "\e[H%d\r\n" counter))
+                (ghostel--write-input term data)
+                (ghostel-bench--ghostel-redraw term nil))
+            (lambda () (ghostel--write-input term data))))))
     ;; ghostel full
     (when render-p
       (with-temp-buffer
@@ -686,14 +737,14 @@ When RENDER-P is non-nil, also call redraw after write-input."
               (term (ghostel-bench--make-ghostel rows cols))
               (inhibit-read-only t)
               (counter 0))
-          (ghostel-bench--measure
-           (format "%s/ghostel-full/%s" name label)
-           (string-bytes data) iters
-           (lambda ()
-             (setq counter (1+ counter))
-             (ghostel--write-input term (format "\e[H%d\r\n" counter))
-             (ghostel--write-input term data)
-             (ghostel--redraw term t))))))
+           (ghostel-bench--measure
+            (format "%s/%s" (ghostel-bench--ghostel-scenario-label name nil "full") label)
+            (string-bytes data) iters
+            (lambda ()
+              (setq counter (1+ counter))
+              (ghostel--write-input term (format "\e[H%d\r\n" counter))
+              (ghostel--write-input term data)
+              (ghostel-bench--ghostel-redraw term t))))))
     ;; vterm
     (when ghostel-bench-include-vterm
       (with-temp-buffer
@@ -820,9 +871,71 @@ real-world performance (see PTY and streaming benchmarks for that)."
 ;; Entry points
 ;; ---------------------------------------------------------------------------
 
+(defun ghostel-bench--package-dir ()
+  "Return the Ghostel checkout root for this benchmark file."
+  (let ((bench-file (or (locate-library "ghostel-bench.el" t)
+                        load-file-name
+                        buffer-file-name)))
+    (unless bench-file
+      (error "Unable to locate ghostel-bench.el on load-path"))
+    (file-name-directory
+     (directory-file-name
+      (file-name-directory bench-file)))))
+
+(defun ghostel-bench--copy-module-artifact (name source-dir dest-dir)
+  "Copy module artifact NAME from SOURCE-DIR into DEST-DIR."
+  (let ((source (expand-file-name name source-dir))
+        (dest (expand-file-name name dest-dir)))
+    (unless (file-exists-p source)
+      (error "Missing benchmark artifact: %s" source))
+    (copy-file source dest t)))
+
+(defun ghostel-bench--module-artifact-source-dir (package-dir name)
+  "Return the preferred source directory for artifact NAME under PACKAGE-DIR."
+  (let ((build-dir (expand-file-name "zig-out/bin" package-dir)))
+    (cond
+     ((file-exists-p (expand-file-name name build-dir)) build-dir)
+     ((file-exists-p (expand-file-name name package-dir)) package-dir)
+     (t package-dir))))
+
+(defun ghostel-bench--prepare-ghostel-module-dir ()
+  "Stage Ghostel native modules into a temporary directory for benchmarking."
+  (or ghostel-bench--module-dir
+      (let* ((package-dir (ghostel-bench--package-dir))
+              (module-dir (make-temp-file "ghostel-bench-modules-" t))
+              (suffix module-file-suffix)
+              (loader-name (concat "dyn-loader-module" suffix))
+              (target-name (concat "ghostel-module" suffix)))
+        (ghostel-bench--copy-module-artifact
+         loader-name
+         (ghostel-bench--module-artifact-source-dir package-dir loader-name)
+         module-dir)
+        (ghostel-bench--copy-module-artifact
+         target-name
+         (ghostel-bench--module-artifact-source-dir package-dir target-name)
+         module-dir)
+        (when (eq system-type 'windows-nt)
+          (let ((conpty-name (concat "conpty-module" suffix)))
+            (ghostel-bench--copy-module-artifact
+             conpty-name
+             (ghostel-bench--module-artifact-source-dir package-dir conpty-name)
+             module-dir)))
+        (with-temp-file (expand-file-name "ghostel-module.json" module-dir)
+          (set-buffer-multibyte nil)
+          (insert (json-encode
+                   `((loader_abi . 1)
+                     (module_path . ,target-name)))))
+        (setq ghostel-bench--module-dir module-dir))))
+
 (defun ghostel-bench--load-backends ()
   "Load available backends, adjusting include flags."
+  (setq load-prefer-newer t)
+  (setq ghostel-module-auto-install nil
+        ghostel-module-dir (ghostel-bench--prepare-ghostel-module-dir))
   (require 'ghostel)
+  (ghostel--initialize-native-modules)
+  (unless (ghostel--native-runtime-ready-p)
+    (error "ghostel benchmark runtime unavailable"))
   (when ghostel-bench-include-vterm
     (condition-case err
         (require 'vterm)
@@ -896,7 +1009,7 @@ Returns a list of (PTY-MS RENDER-MS TOTAL-MS) for each keystroke."
              (proc (make-process
                     :name "ghostel-typing-bench"
                     :buffer buf
-                    :command (list "cat")
+                    :command (ghostel-bench--echo-command)
                     :connection-type 'pty
                     :coding 'binary
                     :noquery t

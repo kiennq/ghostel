@@ -12,6 +12,14 @@
 
 (require 'ert)
 (require 'ghostel)
+(add-to-list
+ 'load-path
+ (expand-file-name
+  "bench"
+  (expand-file-name
+   ".."
+   (file-name-directory (or load-file-name buffer-file-name default-directory)))))
+(require 'ghostel-bench)
 
 (declare-function conpty--init "conpty-module")
 (declare-function conpty--kill "conpty-module")
@@ -1779,6 +1787,62 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (should-not warned))))
 
 ;; -----------------------------------------------------------------------
+;; Test: delayed redraw behavior
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled ()
+  "Redraw keeps point stable when cursor following is disabled."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--copy-mode-active nil)
+          (ghostel--redraw-timer 'fake-timer)
+          (ghostel--pending-output nil)
+          (ghostel--force-next-redraw nil)
+          (ghostel-full-redraw nil)
+          (ghostel-cursor-follow nil))
+      (insert "line 1\nline 2\nline 3")
+      (goto-char (point-min))
+      (forward-line 1)
+      (move-to-column 2)
+      (let ((original-point (point)))
+        (cl-letf (((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--redraw)
+                   (lambda (&rest _)
+                     (goto-char (point-max)))))
+          (ghostel--delayed-redraw (current-buffer))
+          (should (equal original-point (point))))))))
+
+(ert-deftest ghostel-test-delayed-redraw-resets-and-consumes-wide-char-flag ()
+  "Delayed redraw should clear and then consume the native wide-char flag."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--copy-mode-active nil)
+          (ghostel--redraw-timer 'fake-timer)
+          (ghostel--pending-output nil)
+          (ghostel--force-next-redraw nil)
+          (ghostel--has-wide-chars t)
+          (ghostel-cursor-follow t)
+          (redraw-saw-reset nil)
+          (compensated nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'ghostel--flush-pending-output)
+                   (lambda () nil))
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--redraw)
+                   (lambda (&rest _)
+                     (setq redraw-saw-reset (null ghostel--has-wide-chars))
+                     (setq ghostel--has-wide-chars t)))
+                  ((symbol-function 'ghostel--compensate-wide-chars)
+                   (lambda (&rest _) (setq compensated t))))
+          (ghostel--delayed-redraw (current-buffer))
+          (should redraw-saw-reset)
+          (should compensated))))))
+
+;; -----------------------------------------------------------------------
 ;; Test: immediate redraw for interactive echo
 ;; -----------------------------------------------------------------------
 
@@ -1961,9 +2025,32 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                 ((symbol-function 'process-send-string)
                  (lambda (_proc _str) nil)))
         (setq ghostel--process 'fake)
-        (ghostel--send-encoded "backspace" "")
-        ;; send-key sets last-send-time via the fallback path
-        (should ghostel--last-send-time)))))
+         (ghostel--send-encoded "backspace" "")
+         ;; send-key sets last-send-time via the fallback path
+         (should ghostel--last-send-time)))))
+
+(ert-deftest ghostel-test-send-key-dispatches-through-process-transport ()
+  "Immediate key sends should dispatch through the process transport helper."
+  (with-temp-buffer
+    (let* ((ghostel--process 'fake-process)
+           (ghostel--input-buffer nil)
+           (ghostel--input-timer nil)
+           (ghostel--last-send-time nil)
+           (ghostel-input-coalesce-delay 0)
+           (transport-send nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'ghostel--process-live-p) (lambda (&optional _) t))
+                  ((symbol-function 'ghostel--process-send)
+                   (lambda (proc str)
+                     (setq transport-send (cons proc str))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct process-send-string: %S"
+                              args)))))
+          (ghostel--send-key "a")
+          (should (equal '(fake-process . "a") transport-send)))))))
 
 (ert-deftest ghostel-test-scroll-on-input-self-insert ()
   "Self-insert scrolls to bottom when `ghostel-scroll-on-input' is non-nil."
@@ -2977,6 +3064,57 @@ while :; do sleep 0.1; done'\n")
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
+(ert-deftest ghostel-test-bench-load-backends-initializes-native-runtime ()
+  "Benchmark backend loading should make Ghostel's native runtime ready."
+  (let ((ghostel-bench-include-vterm nil)
+        (ghostel-bench-include-eat nil)
+        (ghostel-bench-include-term nil)
+        (ghostel-module-auto-install 'ask)
+        (module-dir "/tmp/ghostel-bench-modules")
+        (init-calls 0)
+        (prepare-calls 0))
+    (cl-letf (((symbol-function 'ghostel-bench--prepare-ghostel-module-dir)
+               (lambda ()
+                 (setq prepare-calls (1+ prepare-calls))
+                 module-dir))
+              ((symbol-function 'ghostel--initialize-native-modules)
+               (lambda () (setq init-calls (1+ init-calls))))
+              ((symbol-function 'ghostel--native-runtime-ready-p)
+               (lambda () (> init-calls 0))))
+      (ghostel-bench--load-backends)
+      (should (equal 1 prepare-calls))
+      (should (equal 1 init-calls))
+      (should (ghostel--native-runtime-ready-p)))))
+
+(ert-deftest ghostel-test-bench-prepare-module-dir-prefers-zig-out-artifacts ()
+  "Benchmark staging should prefer freshly built artifacts from zig-out/bin."
+  (let* ((package-dir (make-temp-file "ghostel-bench-package-" t))
+         (build-dir (expand-file-name "zig-out/bin" package-dir))
+         (suffix module-file-suffix)
+         (specs `((,(concat "dyn-loader-module" suffix) . "build-loader")
+                  (,(concat "ghostel-module" suffix) . "build-target")
+                  ,@(when (eq system-type 'windows-nt)
+                      `((,(concat "conpty-module" suffix) . "build-conpty")))))
+         (ghostel-bench--module-dir nil))
+    (unwind-protect
+        (progn
+          (make-directory build-dir t)
+          (dolist (spec specs)
+            (with-temp-file (expand-file-name (car spec) package-dir)
+              (insert (concat "root-" (car spec))))
+            (with-temp-file (expand-file-name (car spec) build-dir)
+              (insert (cdr spec))))
+          (cl-letf (((symbol-function 'ghostel-bench--package-dir)
+                     (lambda () package-dir)))
+            (let ((staged-dir (ghostel-bench--prepare-ghostel-module-dir)))
+              (dolist (spec specs)
+                (with-temp-buffer
+                  (insert-file-contents-literally
+                   (expand-file-name (car spec) staged-dir))
+                  (should (equal (cdr spec) (buffer-string))))))))
+      (when (file-directory-p package-dir)
+        (delete-directory package-dir t)))))
+
 
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-raw-key-sequences
@@ -3025,13 +3163,14 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output
     ghostel-test-immediate-redraw-skips-stale-send
-    ghostel-test-immediate-redraw-disabled-when-zero
-    ghostel-test-input-coalesce-buffers-single-chars
-    ghostel-test-input-coalesce-disabled
-    ghostel-test-input-flush-sends-buffered
-    ghostel-test-send-encoded-sets-send-time
-    ghostel-test-send-encoded-no-send-time-on-fallback
-    ghostel-test-scroll-on-input-self-insert
+     ghostel-test-immediate-redraw-disabled-when-zero
+     ghostel-test-input-coalesce-buffers-single-chars
+     ghostel-test-input-coalesce-disabled
+     ghostel-test-input-flush-sends-buffered
+     ghostel-test-send-encoded-sets-send-time
+     ghostel-test-send-encoded-no-send-time-on-fallback
+     ghostel-test-send-key-dispatches-through-process-transport
+     ghostel-test-scroll-on-input-self-insert
     ghostel-test-scroll-on-input-send-event
     ghostel-test-scroll-on-input-disabled
     ghostel-test-scroll-forwards-mouse-tracking
