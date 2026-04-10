@@ -150,7 +150,9 @@ jobs:
         shell: bash
         run: |
           files=(
+            dyn-loader-module${{ matrix.suffix }}
             ghostel-module${{ matrix.suffix }}
+            ghostel-module.json
           )
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             files+=(conpty-module${{ matrix.suffix }})
