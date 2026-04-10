@@ -2175,7 +2175,9 @@ on the remote host."
                       (t "erase '^?' iutf8")))
          (shell-command
           (list "/bin/sh" "-c"
-                (concat "stty " stty-flags " 2>/dev/null; "
+                (concat "stty " stty-flags
+                        (format " rows %d columns %d" height width)
+                        " 2>/dev/null; "
                         "printf '\\033[H\\033[2J'; exec "
                         (shell-quote-argument shell)
                         (and shell-args
@@ -2187,9 +2189,7 @@ on the remote host."
            (list
             "INSIDE_EMACS=ghostel"
             "TERM=xterm-256color"
-            "COLORTERM=truecolor"
-            (format "COLUMNS=%d" width)
-            (format "LINES=%d" height))
+            "COLORTERM=truecolor")
            (unless remote-p
              (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
            integration-env

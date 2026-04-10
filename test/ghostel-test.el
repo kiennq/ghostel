@@ -2093,6 +2093,42 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
         (ghostel-shell "/bin/zsh"))
     (should (equal "/bin/zsh" (ghostel--get-shell)))))
 
+(ert-deftest ghostel-test-start-process-sets-size-via-stty-not-env ()
+  "Initial terminal size must be baked into the `stty' wrapper, not
+into `LINES'/`COLUMNS' env vars.  Setting those env vars freezes
+ncurses apps like htop at start-up size and breaks live resize."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 43))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 137))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/sh")
+               (ghostel-shell-integration nil)
+               (default-directory "/tmp/")
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (let ((cmd (process-command proc)))
+                (should (equal #'ghostel--window-adjust-process-window-size
+                               (process-get proc 'adjust-window-size-function)))
+                (should (equal '("/bin/sh" "-c") (seq-take cmd 2)))
+                (should (string-match-p "stty .* rows 43 columns 137"
+                                        (nth 2 cmd)))
+                (should-not (seq-some (lambda (s) (string-prefix-p "LINES=" s))
+                                      captured-env))
+                (should-not (seq-some (lambda (s) (string-prefix-p "COLUMNS=" s))
+                                      captured-env))
+                (should (member "TERM=xterm-256color" captured-env))
+                (should (member "COLORTERM=truecolor" captured-env)))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
 ;; -----------------------------------------------------------------------
 ;; Tests: window resize
 ;; -----------------------------------------------------------------------
