@@ -71,7 +71,7 @@
 ;;
 ;; Building the native module:
 ;;
-;;   Run ./build.sh from the project root, or M-x ghostel-module-compile
+;;   Run zig build from the project root, or M-x ghostel-module-compile
 ;;   from within Emacs.  Requires Zig 0.14+ and the vendored ghostty
 ;;   submodule.
 
@@ -165,6 +165,12 @@ aggressive partial screen updates, but may use more CPU."
 (defcustom ghostel-buffer-name "*ghostel*"
   "Default buffer name for ghostel terminals."
   :type 'string)
+
+(defcustom ghostel-ignore-cursor-change nil
+  "When non-nil, ignore terminal requests to change cursor shape or visibility.
+Useful when editor-owned cursor behavior should take precedence over
+terminal-driven cursor changes.  Copy mode always forces a visible cursor."
+  :type 'boolean)
 
 (defcustom ghostel-kill-buffer-on-exit t
   "Kill the buffer when the shell process exits."
@@ -444,20 +450,21 @@ Returns non-nil on success."
 (defun ghostel--compile-module (dir)
   "Compile the native module from source in DIR.
 Runs synchronously and returns non-nil on success."
-  (let ((default-directory dir)
-        (script (expand-file-name "build.sh" dir)))
-    (if (file-executable-p script)
-        (progn
-          (message "ghostel: compiling native module (this may take a moment)...")
-          (let ((ret (call-process script nil "*ghostel-build*" nil)))
-            (if (eq ret 0)
-                (progn (message "ghostel: native module compiled successfully") t)
-              (display-warning 'ghostel
-                               "Module compilation failed.  See *ghostel-build* buffer for details.")
-              nil)))
-      (display-warning 'ghostel
-                       (format "build.sh not found in %s.\nClone with submodules and run ./build.sh manually." dir))
-      nil)))
+  (let ((default-directory dir))
+    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (condition-case err
+        (let ((ret (process-file "zig" nil "*ghostel-build*" nil
+                                 "build" "-Doptimize=ReleaseFast")))
+          (if (eq ret 0)
+              (progn (message "ghostel: native module compiled successfully") t)
+            (display-warning 'ghostel
+                             "Module compilation failed.  See *ghostel-build* buffer for details.")
+            nil))
+      (error
+       (display-warning 'ghostel
+                        (format "Failed to run zig build in %s: %s"
+                                dir (error-message-string err)))
+       nil))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -543,12 +550,12 @@ version to a date-based string."
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
 (defun ghostel-module-compile ()
-  "Compile the ghostel native module by running build.sh.
+  "Compile the ghostel native module by running zig build.
 The output is shown in a *ghostel-build* compilation buffer."
   (interactive)
   (let ((default-directory (file-name-directory (or (locate-library "ghostel")
                                                     default-directory))))
-    (compile (expand-file-name "build.sh") t)))
+    (compile "zig build -Doptimize=ReleaseFast" t)))
 
 
 (defun ghostel--check-module-version (dir)
@@ -1745,7 +1752,8 @@ Do not overwrite a manual buffer rename."
 STYLE is one of: 0=bar, 1=block, 2=underline, 3=hollow-block.
 VISIBLE is t or nil.
 Skipped when copy mode is active because copy mode manages its own cursor."
-  (unless ghostel--copy-mode-active
+  (unless (or ghostel--copy-mode-active
+              ghostel-ignore-cursor-change)
     (setq cursor-type
           (if visible
               (pcase style
