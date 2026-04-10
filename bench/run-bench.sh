@@ -84,14 +84,14 @@ done
 
 # Verify ghostel module exists
 MODULE=""
-for ext in dylib so; do
+for ext in dll dylib so; do
     if [ -f "$GHOSTEL_DIR/ghostel-module.$ext" ]; then
         MODULE="$GHOSTEL_DIR/ghostel-module.$ext"
         break
     fi
 done
 if [ -z "$MODULE" ]; then
-    echo "ERROR: ghostel native module not found. Run ./build.sh first."
+    echo "ERROR: ghostel native module not found. Run zig build -Doptimize=ReleaseFast first."
     exit 1
 fi
 echo "ghostel module: $MODULE"
@@ -117,7 +117,7 @@ if [ "$INCLUDE_EAT" = "t" ]; then
 fi
 
 # Build load-path
-LOAD_PATH="-L $GHOSTEL_DIR"
+LOAD_PATH="-L $GHOSTEL_DIR -L $SCRIPT_DIR"
 [ "$INCLUDE_VTERM" = "t" ] && LOAD_PATH="$LOAD_PATH -L $VTERM_DIR"
 [ "$INCLUDE_EAT" = "t" ] && LOAD_PATH="$LOAD_PATH -L $EAT_DIR"
 
