@@ -166,6 +166,12 @@ aggressive partial screen updates, but may use more CPU."
   "Default buffer name for ghostel terminals."
   :type 'string)
 
+(defcustom ghostel-cursor-follow t
+  "When non-nil, keep Emacs point following the terminal cursor on redraw.
+When nil, redraw updates terminal content while leaving the current Emacs
+point and window position unchanged."
+  :type 'boolean)
+
 (defcustom ghostel-ignore-cursor-change nil
   "When non-nil, ignore terminal requests to change cursor shape or visibility.
 Useful when editor-owned cursor behavior should take precedence over
@@ -1097,7 +1103,7 @@ of waiting for a continuation keystroke."
   "Send KEY string to the terminal process.
 Records the send time for immediate-redraw detection and optionally
 coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
-  (when (and ghostel--process (process-live-p ghostel--process))
+  (when (and ghostel--process (ghostel--process-live-p ghostel--process))
     (setq ghostel--last-send-time (current-time))
     (if (and (> ghostel-input-coalesce-delay 0)
              (= (length key) 1))
@@ -1114,10 +1120,10 @@ coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
         (setq ghostel--input-timer nil)
         ;; Flush any buffered input first
         (when ghostel--input-buffer
-          (process-send-string ghostel--process
-                               (apply #'concat (nreverse ghostel--input-buffer)))
+          (ghostel--process-send ghostel--process
+                                 (apply #'concat (nreverse ghostel--input-buffer)))
           (setq ghostel--input-buffer nil)))
-      (process-send-string ghostel--process key))))
+      (ghostel--process-send ghostel--process key))))
 
 (defun ghostel--flush-input (buffer)
   "Flush coalesced input in BUFFER to the PTY."
@@ -1125,9 +1131,9 @@ coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
     (with-current-buffer buffer
       (setq ghostel--input-timer nil)
       (when (and ghostel--input-buffer ghostel--process
-                 (process-live-p ghostel--process))
-        (process-send-string ghostel--process
-                             (apply #'concat (nreverse ghostel--input-buffer)))
+                 (ghostel--process-live-p ghostel--process))
+        (ghostel--process-send ghostel--process
+                               (apply #'concat (nreverse ghostel--input-buffer)))
         (setq ghostel--input-buffer nil)))))
 
 (defun ghostel--send-encoded (key-name mods &optional utf8)
@@ -1301,11 +1307,11 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
 
 (defun ghostel--paste-text (text)
   "Send TEXT to the terminal, using bracketed paste if the terminal wants it."
-  (when (and text ghostel--process (process-live-p ghostel--process))
-    (process-send-string ghostel--process
-                         (if (ghostel--bracketed-paste-p)
-                             (concat "\e[200~" text "\e[201~")
-                           text))))
+  (when (and text ghostel--process (ghostel--process-live-p ghostel--process))
+    (ghostel--process-send ghostel--process
+                           (if (ghostel--bracketed-paste-p)
+                               (concat "\e[200~" text "\e[201~")
+                             text))))
 
 (defun ghostel-paste ()
   "Paste text from the Emacs kill ring into the terminal.
@@ -1333,9 +1339,9 @@ Sends backspaces to erase the previous yank, then pastes the next entry."
          (prev-len (length prev-text)))
     (setq ghostel--yank-index (1+ ghostel--yank-index))
     ;; Erase previous paste: send backspaces
-    (when (and ghostel--process (process-live-p ghostel--process))
-      (process-send-string ghostel--process
-                           (make-string prev-len ?\x7f)))
+    (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+      (ghostel--process-send ghostel--process
+                             (make-string prev-len ?\x7f)))
     ;; Paste the next entry
     (ghostel--paste-text (current-kill ghostel--yank-index t))
     (setq this-command 'ghostel-yank-pop)))
@@ -1378,8 +1384,8 @@ pasted using bracketed paste."
     (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)
     ;; Send form-feed to the shell so it redraws its prompt.
-    (when (and ghostel--process (process-live-p ghostel--process))
-      (process-send-string ghostel--process "\f"))))
+    (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+      (ghostel--process-send ghostel--process "\f"))))
 
 (defun ghostel-clear ()
   "Clear the visible screen, preserving scrollback history."
@@ -1391,8 +1397,8 @@ pasted using bracketed paste."
     (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)
     ;; Send form-feed to the shell so it redraws its prompt.
-    (when (and ghostel--process (process-live-p ghostel--process))
-      (process-send-string ghostel--process "\f"))))
+    (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+      (ghostel--process-send ghostel--process "\f"))))
 
 (defun ghostel--forward-scroll-event (event button)
   "Try to forward a scroll EVENT as mouse BUTTON to the terminal.
@@ -2667,7 +2673,10 @@ frame after idle to improve interactive responsiveness."
           (let ((inhibit-read-only t)
                 (inhibit-redisplay t)
                 (inhibit-modification-hooks t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw))
+            (if ghostel-cursor-follow
+                (ghostel--redraw ghostel--term ghostel-full-redraw)
+              (save-excursion
+                (ghostel--redraw ghostel--term ghostel-full-redraw))))
           (when ghostel--has-wide-chars
             (ghostel--compensate-wide-chars)))))))
 
