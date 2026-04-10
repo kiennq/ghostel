@@ -68,6 +68,10 @@ jobs:
           - os: ubuntu-latest
             platform: x86_64-linux
             suffix: .so
+          - os: windows-latest
+            platform: x86_64-windows
+            suffix: .dll
+            target: x86_64-windows-gnu
           - os: macos-latest
             platform: aarch64-macos
             suffix: .dylib
@@ -98,15 +102,27 @@ jobs:
           version: 0.15.2
 
       - name: Build native module
+        shell: bash
         run: |
+          set -euo pipefail
           if [ -n "${{ matrix.target }}" ]; then
             zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
           else
             zig build -Doptimize=ReleaseFast
           fi
 
-      - name: Upload module artifact
+      - name: Upload Windows module artifact
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module${{ matrix.suffix }}
+          path: |
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/conpty-module${{ matrix.suffix }}
+
+      - name: Upload module artifact
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostel-module-${{ matrix.platform }}
+          path: zig-out/bin/ghostel-module${{ matrix.suffix }}
