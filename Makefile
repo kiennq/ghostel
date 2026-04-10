@@ -11,7 +11,7 @@ ELC := ghostel.elc ghostel-debug.elc
 all: build test-all test-evil lint
 
 build:
-	./build.sh
+	zig build
 
 check:
 	zig build check
@@ -79,6 +79,6 @@ bench-quick:
 	bash bench/run-bench.sh --quick
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache
