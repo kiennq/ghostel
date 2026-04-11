@@ -239,6 +239,15 @@ Set to t for all supported shells, or a list of symbols
                  (repeat :tag "Specific shells"
                          (choice (const bash) (const zsh) (const fish)))))
 
+(defcustom ghostel-tramp-default-method nil
+  "TRAMP method for constructing remote paths from OSC 7 directory reports.
+When directory tracking (OSC 7) reports a hostname that does not match
+the local machine and `default-directory' has no existing remote prefix,
+this method is used to build the TRAMP path (e.g. \"/ssh:host:/path\").
+When nil, falls back to `tramp-default-method'."
+  :type '(choice (const :tag "Use tramp-default-method" nil)
+                 string))
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -1775,7 +1784,10 @@ file:// URL does not match the local machine, construct a TRAMP path."
               (let ((prefix (file-remote-p default-directory)))
                 (setq path (if prefix
                                (concat prefix filename)
-                             (format "/ssh:%s:%s" host filename))))))
+                             (format "/%s:%s:%s"
+                                     (or ghostel-tramp-default-method
+                                         tramp-default-method)
+                                     host filename))))))
         (setq path dir))
       (when (and path (not (string= path "")))
         (if (file-remote-p path)

@@ -2180,11 +2180,20 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
 
 (ert-deftest ghostel-test-update-directory-remote ()
   "Test TRAMP path construction from remote OSC 7."
-  ;; Remote hostname -> TRAMP ssh path
+  ;; Remote hostname -> TRAMP path using tramp-default-method fallback
   (let ((ghostel--last-directory nil)
-        (default-directory "/tmp/"))
+        (default-directory "/tmp/")
+        (ghostel-tramp-default-method nil)
+        (tramp-default-method "ssh"))
     (ghostel--update-directory "file://remote-host/home/user")
     (should (equal "/ssh:remote-host:/home/user/" default-directory)))
+  ;; ghostel-tramp-default-method takes precedence over tramp-default-method
+  (let ((ghostel--last-directory nil)
+        (default-directory "/tmp/")
+        (ghostel-tramp-default-method "rsync")
+        (tramp-default-method "ssh"))
+    (ghostel--update-directory "file://remote-host/home/user")
+    (should (equal "/rsync:remote-host:/home/user/" default-directory)))
   ;; Preserves method from existing TRAMP default-directory
   (let ((ghostel--last-directory nil)
         (default-directory "/scp:server:/"))

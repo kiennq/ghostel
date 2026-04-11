@@ -271,6 +271,9 @@ login shell via `getent passwd`.  `FALLBACK` is used when detection fails.
 OSC 7 directory tracking is TRAMP-aware: when the shell reports a remote
 hostname, `default-directory` is set to the corresponding TRAMP path,
 reusing the existing TRAMP prefix (method, user, multi-hop) when available.
+When no prefix exists, the method defaults to `tramp-default-method`; set
+`ghostel-tramp-default-method` to override it for ghostel specifically
+(e.g. `"scp"`, or `"rpc"` with [emacs-tramp-rpc](https://github.com/ArthurHeymans/emacs-tramp-rpc)).
 
 #### Remote Shell Integration
 
@@ -389,6 +392,7 @@ individual faces with `M-x customize-face`.
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
 | `ghostel-shell-integration`      | `t`                  | Auto-inject shell integration                            |
+| `ghostel-tramp-default-method`   | `nil`                | TRAMP method for new remote paths from OSC 7 (nil uses `tramp-default-method`) |
 | `ghostel-tramp-shell-integration` | `nil`               | Auto-inject shell integration for remote TRAMP sessions  |
 | `ghostel-buffer-name`            | `"*ghostel*"`        | Default buffer name                                      |
 | `ghostel-max-scrollback`         | `20MB`               | Maximum scrollback size in bytes                         |
