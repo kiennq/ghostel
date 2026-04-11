@@ -160,6 +160,24 @@ pub fn getColorPalette(self: *Self, palette: *[256]gt.ColorRgb) bool {
     ) == gt.SUCCESS;
 }
 
+/// Get the effective foreground color (honouring any OSC 10 override).
+pub fn getColorForeground(self: *Self, out: *gt.ColorRgb) bool {
+    return gt.c.ghostty_terminal_get(
+        self.terminal,
+        gt.DATA_COLOR_FOREGROUND,
+        @ptrCast(out),
+    ) == gt.SUCCESS;
+}
+
+/// Get the effective background color (honouring any OSC 11 override).
+pub fn getColorBackground(self: *Self, out: *gt.ColorRgb) bool {
+    return gt.c.ghostty_terminal_get(
+        self.terminal,
+        gt.DATA_COLOR_BACKGROUND,
+        @ptrCast(out),
+    ) == gt.SUCCESS;
+}
+
 /// Feed VT data from the PTY into the terminal.
 pub fn vtWrite(self: *Self, data: []const u8) void {
     gt.c.ghostty_terminal_vt_write(self.terminal, data.ptr, data.len);

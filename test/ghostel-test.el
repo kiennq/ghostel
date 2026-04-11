@@ -718,6 +718,115 @@ Mirrors the real zsh case where the directory still contains a
       (should (equal nil kill-ring)))))                     ; osc52 query ignored
 
 ;; -----------------------------------------------------------------------
+;; Test: OSC 4/10/11 color query responses
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-osc-color-query ()
+  "Test that OSC 4/10/11 color queries get responses."
+  (let* ((term (ghostel--new 25 80 1000))
+         (sent-bytes nil))
+    (cl-letf (((symbol-function 'ghostel--flush-output)
+               (lambda (data)
+                 (setq sent-bytes (concat sent-bytes data)))))
+
+      ;; OSC 11 background query with ST terminator.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]11;?\e\\")
+      (should sent-bytes)
+      (should (string-match-p "\\`\e\\]11;rgb:[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}\e\\\\\\'"
+                              sent-bytes))
+
+      ;; OSC 10 foreground query with BEL terminator.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]10;?\a")
+      (should sent-bytes)
+      (should (string-match-p "\\`\e\\]10;rgb:[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}\a\\'"
+                              sent-bytes))
+
+      ;; OSC 4 palette query for index 1, after a prior set.  The extractor
+      ;; runs before vtWrite inside a single write-input, so the set must
+      ;; land in a previous call for the new value to be visible.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;1;rgb:11/22/33\e\\")
+      (should (equal nil sent-bytes))                   ; set: no reply
+      (ghostel--write-input term "\e]4;1;?\e\\")
+      (should (equal "\e]4;1;rgb:1111/2222/3333\e\\" sent-bytes))
+
+      ;; OSC 10 with a set value (not a query) — no response.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]10;rgb:aa/bb/cc\e\\")
+      (should (equal nil sent-bytes))
+
+      ;; OSC 4 set (not a query) — no response.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;2;rgb:44/55/66\e\\")
+      (should (equal nil sent-bytes))
+
+      ;; Malformed OSC 4 payloads — don't crash, don't reply.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;\e\\")           ; empty
+      (ghostel--write-input term "\e]4;xyz;?\e\\")     ; non-numeric index
+      (ghostel--write-input term "\e]4;999;?\e\\")     ; index out of range
+      (ghostel--write-input term "\e]4;0\e\\")         ; index without value
+      (ghostel--write-input term "\e]4;99999999999999999999;?\e\\") ; overflow
+      (should (equal nil sent-bytes))
+
+      ;; Multiple different-type queries in one write must reply in source
+      ;; order so termenv-style readers can match by position.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]11;?\e\\\e]10;?\e\\")
+      (should (string-match-p "\\`\e\\]11;rgb:.*?\e\\\\\e\\]10;rgb:.*?\e\\\\\\'"
+                              sent-bytes))
+
+      ;; Multi-pair OSC 4 with mixed set+query: the extractor runs before
+      ;; vtWrite, so the set is not yet visible to the query in the same
+      ;; payload — but the index=1 value seeded in the earlier write
+      ;; above is still there, and both indices get replied to in order.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;1;?;3;?\e\\")
+      (should (string-match-p
+               "\\`\e\\]4;1;rgb:1111/2222/3333\e\\\\\e\\]4;3;rgb:.*?\e\\\\\\'"
+               sent-bytes))
+
+      ;; Unterminated OSC query — reply is withheld until the terminator
+      ;; arrives.  (We don't buffer across write-input calls, so the
+      ;; terminator must be in the same call to get a reply.)
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]11;?")
+      (should (equal nil sent-bytes)))))
+
+(ert-deftest ghostel-test-osc-color-query-filter-flush ()
+  "The process filter must flush synchronously on a color query.
+Programs like `duf' read stdin with a short timeout and give up if
+the reply waits for the redraw timer."
+  (let ((buf (generate-new-buffer " *ghostel-osc-flush*"))
+        (fake-proc (make-symbol "fake-proc"))
+        (sent nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq ghostel--term (ghostel--new 25 80 1000))
+          (setq ghostel--process fake-proc)
+          (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                    ((symbol-function 'process-live-p) (lambda (_) t))
+                    ((symbol-function 'ghostel--flush-output)
+                     (lambda (data) (setq sent (concat sent data))))
+                    ((symbol-function 'ghostel--invalidate) #'ignore))
+            ;; OSC 11 query arrives — reply must be produced before
+            ;; `ghostel--filter' returns, not on a later timer tick.
+            (ghostel--filter fake-proc "\e]11;?\e\\")
+            (should sent)
+            (should (string-match-p "\\`\e\\]11;rgb:" sent))
+            (should (equal nil ghostel--pending-output))
+
+            ;; A non-query OSC 11 set must NOT trigger the sync flush,
+            ;; so the data stays pending for the redraw timer.
+            (setq sent nil)
+            (ghostel--filter fake-proc "\e]11;rgb:11/22/33\e\\")
+            (should (equal nil sent))
+            (should ghostel--pending-output)))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: focus events gated by mode 1004
 ;; -----------------------------------------------------------------------
 

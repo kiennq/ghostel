@@ -143,6 +143,14 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
     const raw = data.?;
 
+    // Respond to OSC 4/10/11 color queries BEFORE feeding libghostty.
+    // libghostty will synchronously emit responses for other queries in
+    // the same write (e.g. CSI 6n cursor-position report) via the
+    // write_pty callback, and termenv-based programs read only the first
+    // response chunk — so the color reply must be on the wire first or
+    // the program discards our reply as noise.
+    extractOscColorQueries(env, term, raw);
+
     // Count bare \n to determine output size.
     var extra_cr: usize = 0;
     for (0..raw.len) |i| {
@@ -317,6 +325,150 @@ fn extractOsc133(env: emacs.Env, data: []const u8) void {
             env.makeString(&type_str),
             param_val,
         );
+    }
+}
+
+/// Send `OSC N;rgb:RRRR/GGGG/BBBB <term>` for a dynamic color (OSC 10/11).
+fn sendDynamicColorReply(
+    env: emacs.Env,
+    osc_num: u8,
+    color: gt.ColorRgb,
+    term_bytes: []const u8,
+) void {
+    var buf: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(
+        &buf,
+        "\x1b]{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}",
+        .{
+            osc_num,
+            color.r, color.r,
+            color.g, color.g,
+            color.b, color.b,
+            term_bytes,
+        },
+    ) catch return;
+    _ = env.call1(emacs.sym.@"ghostel--flush-output", env.makeString(written));
+}
+
+/// Send `OSC 4;INDEX;rgb:RRRR/GGGG/BBBB <term>` for a palette entry.
+fn sendPaletteColorReply(
+    env: emacs.Env,
+    index: u16,
+    color: gt.ColorRgb,
+    term_bytes: []const u8,
+) void {
+    var buf: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(
+        &buf,
+        "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}",
+        .{
+            index,
+            color.r, color.r,
+            color.g, color.g,
+            color.b, color.b,
+            term_bytes,
+        },
+    ) catch return;
+    _ = env.call1(emacs.sym.@"ghostel--flush-output", env.makeString(written));
+}
+
+/// Parse a non-negative decimal integer.  Returns null on empty input,
+/// any non-digit byte, or numeric overflow of `u32`.
+fn parseDecimal(s: []const u8) ?u32 {
+    if (s.len == 0) return null;
+    return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+/// Scan data for OSC 4/10/11 color queries and emit responses in source
+/// order.  libghostty applies OSC 4/10/11 **sets** internally but silently
+/// drops the query form (`?` value), so ghostel scans the raw input and
+/// replies itself.
+///
+/// Colors come from the terminal's currently effective state, which reflects
+/// sets applied by earlier write-input calls — but NOT sets that appear
+/// earlier in *this* input buffer, because this extractor runs before
+/// `vtWrite` so the color reply is on the wire before any reply libghostty
+/// generates itself (e.g. the CSI 6n cursor-position reply some programs
+/// send in the same write).  Termenv-based readers consume the first chunk
+/// off stdin, so ordering matters more than same-chunk freshness.
+///
+/// Only fully-terminated OSC sequences produce a reply: a query split
+/// across two process-output chunks is ignored until a later call carries
+/// the terminator.
+fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) void {
+    var palette: [256]gt.ColorRgb = undefined;
+    var palette_loaded = false;
+
+    var pos: usize = 0;
+    while (pos + 1 < data.len) {
+        // Find next OSC introducer "ESC ]".
+        const osc_rel = std.mem.indexOfPos(u8, data, pos, "\x1b]") orelse break;
+        const code_start = osc_rel + 2;
+
+        // Read the decimal OSC code up to the first ';'.
+        var code_end = code_start;
+        while (code_end < data.len and data[code_end] >= '0' and data[code_end] <= '9') {
+            code_end += 1;
+        }
+        if (code_end == code_start or code_end >= data.len or data[code_end] != ';') {
+            pos = code_start;
+            continue;
+        }
+        const payload_start = code_end + 1;
+
+        // Find the terminator (BEL or ST).  Require a real one — partial OSCs
+        // split across chunks are left for the next call so we don't reply
+        // before the client has finished writing its query.
+        var end = payload_start;
+        var term_len: usize = 0;
+        while (end < data.len) : (end += 1) {
+            if (data[end] == 0x07) {
+                term_len = 1;
+                break;
+            }
+            if (data[end] == 0x1b and end + 1 < data.len and data[end + 1] == '\\') {
+                term_len = 2;
+                break;
+            }
+        }
+        if (term_len == 0) break;
+
+        const payload = data[payload_start..end];
+        const term_bytes = data[end .. end + term_len];
+        pos = end + term_len;
+
+        const code = parseDecimal(data[code_start..code_end]) orelse continue;
+        switch (code) {
+            10 => {
+                if (!std.mem.eql(u8, payload, "?")) continue;
+                var fg: gt.ColorRgb = undefined;
+                if (!term.getColorForeground(&fg)) continue;
+                sendDynamicColorReply(env, 10, fg, term_bytes);
+            },
+            11 => {
+                if (!std.mem.eql(u8, payload, "?")) continue;
+                var bg: gt.ColorRgb = undefined;
+                if (!term.getColorBackground(&bg)) continue;
+                sendDynamicColorReply(env, 11, bg, term_bytes);
+            },
+            4 => {
+                // Payload is a ';'-separated list of `index;value` pairs.
+                // Reply only to pairs whose value is literally "?".
+                var it = std.mem.splitScalar(u8, payload, ';');
+                while (it.next()) |index_tok| {
+                    const value_tok = it.next() orelse break;
+                    if (!std.mem.eql(u8, value_tok, "?")) continue;
+                    const idx = parseDecimal(index_tok) orelse continue;
+                    if (idx >= 256) continue;
+                    if (!palette_loaded) {
+                        if (!term.getColorPalette(&palette)) break;
+                        palette_loaded = true;
+                    }
+                    sendPaletteColorReply(env, @intCast(idx), palette[idx], term_bytes);
+                }
+            },
+            else => {},
+        }
     }
 }
 

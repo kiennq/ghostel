@@ -219,6 +219,7 @@ loaded scrollback.
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
 - 256-color and RGB (24-bit true color) support
+- **OSC 4 / 10 / 11 color queries** — TUI programs can query the current palette, foreground, and background colors, so tools like `duf`, `btop`, `delta`, and anything else using `termenv` auto-detect the right light/dark theme from the Emacs face colors
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
 - Cursor styles: block, bar, underline, hollow block
 - Alternate screen buffer (for TUI apps like htop, vim, etc.)
@@ -546,6 +547,7 @@ powering Neovim's built-in terminal.
 | Feature                       | ghostel   | vterm   |
 |-------------------------------|-----------|---------|
 | True color (24-bit)           | Yes       | Yes     |
+| OSC 4/10/11 color queries     | Yes       | No      |
 | Bold / italic / faint         | Yes       | Yes     |
 | Underline styles (5 types)    | Yes       | No      |
 | Underline color               | Yes       | No      |
