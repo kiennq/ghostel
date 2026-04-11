@@ -1,12 +1,14 @@
 name: Claude Code Review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled]
 
 jobs:
   claude-review:
-    if: github.event.label.name == 'claude-review'
+    if: |
+      github.event.label.name == 'claude-review' &&
+      github.event.sender.login == 'dakra'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -18,7 +20,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Run Claude Code Review
         id: claude-review
