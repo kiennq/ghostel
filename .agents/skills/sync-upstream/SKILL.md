@@ -42,12 +42,10 @@ Preserve those topics while also preserving new upstream behavior. Never solve a
 
 | Commit type | Required check |
 | --- | --- |
-| any replayed commit | run the smallest relevant tests before continuing |
-| touches `*.zig`, `build.zig`, or `build.zig.zon` | `zig build -Doptimize=ReleaseFast` at that commit |
-| changes runtime or test-sensitive Elisp | `emacs -Q --batch --eval "(setq load-prefer-newer t native-comp-jit-compilation nil native-comp-enable-subr-trampolines nil comp-enable-subr-trampolines nil)" -L . -l test/ghostel-test.el -f ghostel-test-run-elisp` or a focused ERT slice first |
-| final rewritten stack | `zig build test` and the full `ghostel-test-run-elisp` pass |
+| intermediate replayed commits | not required to build individually; supplementary changes from later topics are allowed |
+| final rewritten stack | `zig build -Doptimize=ReleaseFast` and the full `ghostel-test-run-elisp` pass; `zig build test` if Zig sources changed |
 
-If a Zig-touching commit does not build, stop and fix that commit before replaying anything else.
+Intermediate commits do not need to build individually. Supplementary changes (e.g. submodule added early, functions from later topics included as stubs) are acceptable as long as the final stack builds and passes tests.
 
 ## Conflict Rules That Matter In This Repo
 

@@ -323,9 +323,7 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const force_full = nargs > 1 and env.isNotNil(args[1]);
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
-    render.redraw(env, term, force_full, arena.allocator());
+    render.redraw(env, term, force_full);
     return env.nil();
 }
 
