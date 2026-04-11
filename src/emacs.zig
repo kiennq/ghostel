@@ -242,6 +242,14 @@ pub const Env = struct {
         _ = self.call4(sym.@"put-text-property", start, end, prop, value);
     }
 
+    pub fn bufferReadOnly(self: Env) bool {
+        return self.isNotNil(self.call1(sym.@"symbol-value", sym.@"buffer-read-only"));
+    }
+
+    pub fn setBufferReadOnly(self: Env, read_only: bool) void {
+        _ = self.call2(sym.@"set", sym.@"buffer-read-only", if (read_only) self.t() else self.nil());
+    }
+
     /// Signal an error with a message string.
     pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
@@ -285,7 +293,9 @@ pub const Sym = struct {
     // Built-in functions
     cons: Value,
     list: Value,
+    @"set": Value,
     @"symbol-value": Value,
+    @"buffer-read-only": Value,
     @"put-text-property": Value,
     @"goto-char": Value,
     point: Value,

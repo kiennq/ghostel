@@ -1438,13 +1438,12 @@ scroll event to the running application instead."
   (if ghostel--copy-mode-full-buffer
       (scroll-down 3)
     (when ghostel--term
-      (unless (ghostel--forward-scroll-event event 4) ; button 4 = scroll up
-        (ghostel--scroll ghostel--term -3)
-        (if ghostel--copy-mode-active
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))))
+        (unless (ghostel--forward-scroll-event event 4) ; button 4 = scroll up
+          (ghostel--scroll ghostel--term -3)
+          (if ghostel--copy-mode-active
+              (ghostel--redraw ghostel--term ghostel-full-redraw)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--invalidate))))))
 
 (defun ghostel--scroll-down (&optional event)
   "Scroll the terminal viewport down.
@@ -1454,13 +1453,12 @@ scroll event to the running application instead."
   (if ghostel--copy-mode-full-buffer
       (scroll-up 3)
     (when ghostel--term
-      (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
-        (ghostel--scroll ghostel--term 3)
-        (if ghostel--copy-mode-active
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))))
+        (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
+          (ghostel--scroll ghostel--term 3)
+          (if ghostel--copy-mode-active
+              (ghostel--redraw ghostel--term ghostel-full-redraw)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--invalidate))))))
 
 (defun ghostel-copy-mode-scroll-up ()
   "Scroll the terminal viewport up by a page in copy mode."
@@ -1471,8 +1469,7 @@ scroll event to the running application instead."
       (when ghostel--term
         (let ((height (count-lines (point-min) (point-max))))
           (ghostel--scroll ghostel--term (- 2 height))
-          (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw)))))
+          (ghostel--redraw ghostel--term ghostel-full-redraw))))
     (move-to-column col)))
 
 (defun ghostel-copy-mode-scroll-down ()
@@ -1484,8 +1481,7 @@ scroll event to the running application instead."
       (when ghostel--term
         (let ((height (count-lines (point-min) (point-max))))
           (ghostel--scroll ghostel--term (- height 2))
-          (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw)))))
+          (ghostel--redraw ghostel--term ghostel-full-redraw))))
     (move-to-column col)))
 
 (defun ghostel-copy-mode-previous-line ()
@@ -1497,8 +1493,7 @@ scroll event to the running application instead."
       (if (= (line-number-at-pos) 1)
           (when ghostel--term
             (ghostel--scroll ghostel--term -1)
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)
             (goto-char (point-min)))
         (forward-line -1)))
     (move-to-column col)))
@@ -1512,8 +1507,7 @@ scroll event to the running application instead."
       (if (>= (line-number-at-pos) (line-number-at-pos (point-max)))
           (when ghostel--term
             (ghostel--scroll ghostel--term 1)
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)
             (goto-char (point-max))
             (beginning-of-line))
         (forward-line 1)))
@@ -1526,8 +1520,7 @@ scroll event to the running application instead."
       (goto-char (point-min))
     (when ghostel--term
       (ghostel--scroll-top ghostel--term)
-      (let ((inhibit-read-only t))
-        (ghostel--redraw ghostel--term ghostel-full-redraw))
+      (ghostel--redraw ghostel--term ghostel-full-redraw)
       (goto-char (point-min)))))
 
 (defun ghostel-copy-mode-end-of-buffer ()
@@ -1539,8 +1532,7 @@ scroll event to the running application instead."
         (skip-chars-backward " \t\n"))
     (when ghostel--term
       (ghostel--scroll-bottom ghostel--term)
-      (let ((inhibit-read-only t))
-        (ghostel--redraw ghostel--term ghostel-full-redraw))
+      (ghostel--redraw ghostel--term ghostel-full-redraw)
       ;; The native redraw already positions point at the terminal cursor,
       ;; so no explicit goto-char needed here.
       )))
@@ -1568,8 +1560,7 @@ boundary (nothing to scroll into), does nothing."
           ;; Hash the buffer to detect whether the scroll was clamped.
           (let ((old-hash (buffer-hash)))
             (ghostel--scroll ghostel--term (- current-line center))
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)
             ;; If the buffer changed the viewport actually moved —
             ;; reposition point at center.  Otherwise the scroll was
             ;; clamped; restore point since redraw moved it to the
@@ -1729,16 +1720,16 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
       (use-local-map ghostel--saved-local-map)
       (when ghostel--saved-hl-line-mode
         (hl-line-mode -1))
-      (setq buffer-read-only nil)
+      (setq buffer-read-only t)
       (setq mode-line-process nil)
       (force-mode-line-update)
       (when ghostel--term
         (ghostel--scroll-bottom ghostel--term)
         (when was-full
-          ;; Erase stale full-scrollback content so normal redraw rebuilds
+          ;; Erase stale full-scrollback content so normal redraw rebuilds.
           (let ((inhibit-read-only t))
-            (erase-buffer)
-            (ghostel--redraw ghostel--term t))))
+            (erase-buffer))
+          (ghostel--redraw ghostel--term t)))
       (ghostel--invalidate)
       (message "Copy mode exited"))))
 
@@ -1791,9 +1782,8 @@ the full scrollback history."
              (not ghostel--copy-mode-full-buffer))
     (message "Loading scrollback...")
     (let* ((saved-line (1- (line-number-at-pos))) ; 0-based line within viewport
-           (saved-col (current-column))
-           (inhibit-read-only t)
-           (viewport-line (ghostel--redraw-full-scrollback ghostel--term)))
+            (saved-col (current-column))
+            (viewport-line (ghostel--redraw-full-scrollback ghostel--term)))
       (goto-char (point-min))
       (forward-line (+ (1- viewport-line) saved-line))
       (move-to-column saved-col)
@@ -2232,8 +2222,7 @@ Call this after changing the Emacs theme so terminals match."
       (when (and (derived-mode-p 'ghostel-mode) ghostel--term)
         (ghostel--apply-palette ghostel--term)
         (when (not ghostel--copy-mode-active)
-          (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term)))))))
+          (ghostel--redraw ghostel--term))))))
 
 (defun ghostel--on-theme-change (&rest _args)
   "Hook function to sync terminal colors after theme change."
@@ -2694,8 +2683,7 @@ frame after idle to improve interactive responsiveness."
                      (ghostel--mode-enabled ghostel--term 2026))
           (setq ghostel--force-next-redraw nil)
           (setq ghostel--has-wide-chars nil)
-          (let ((inhibit-read-only t)
-                (inhibit-redisplay t)
+          (let ((inhibit-redisplay t)
                 (inhibit-modification-hooks t))
             (if ghostel-cursor-follow
                 (ghostel--redraw ghostel--term ghostel-full-redraw)
@@ -2709,8 +2697,7 @@ frame after idle to improve interactive responsiveness."
   (interactive)
   (when ghostel--term
     (setq ghostel--has-wide-chars nil)
-    (let ((inhibit-read-only t))
-      (ghostel--redraw ghostel--term ghostel-full-redraw))
+    (ghostel--redraw ghostel--term ghostel-full-redraw)
     (when ghostel--has-wide-chars
       (ghostel--compensate-wide-chars))))
 
@@ -2753,7 +2740,7 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   "Major mode for Ghostel terminal emulator."
   (buffer-disable-undo)
   (font-lock-mode -1)
-  (setq buffer-read-only nil)
+  (setq buffer-read-only t)
   (setq-local scroll-margin 0)
   (setq-local hscroll-margin 0)
   (setq-local truncate-lines t)

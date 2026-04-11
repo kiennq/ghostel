@@ -1523,13 +1523,14 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
             (forward-line 1)
             (move-to-column 3)                              ; on 'X' in line 2
             ;; Stub the native function and recenter (no window in batch).
-            ;; The stub must NOT bind inhibit-read-only itself — the real
-            ;; native function doesn't, so the caller must have it set.
+            ;; The real native redraw now owns temporary writability, so the
+            ;; test double must mirror that behavior when mutating the buffer.
             ;; Returns viewport-line=3 (viewport starts at line 3 in full buffer)
             (cl-letf (((symbol-function 'ghostel--redraw-full-scrollback)
                        (lambda (_term)
-                         (erase-buffer)
-                         (insert "sb1\nsb2\naaa\nbbbXbb\nccc")
+                         (let ((inhibit-read-only t))
+                           (erase-buffer)
+                           (insert "sb1\nsb2\naaa\nbbbXbb\nccc"))
                          3))
                       ((symbol-function 'recenter) #'ignore))
               (ghostel-copy-mode-load-all)
@@ -2214,10 +2215,11 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                       ((symbol-function 'ghostel--redraw)
                        (lambda (_term _full)
                          (setq redraw-called t)
-                         (save-excursion
-                           (goto-char (point-min))
-                           (delete-char 1)
-                           (insert "!"))))
+                         (let ((inhibit-read-only t))
+                           (save-excursion
+                             (goto-char (point-min))
+                             (delete-char 1)
+                             (insert "!")))))
                       ((symbol-function 'window-body-height)
                        (lambda (&rest _) 20))
                       ((symbol-function 'recenter)
