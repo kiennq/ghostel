@@ -1454,6 +1454,48 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (should (car messages))
       (should (string-match-p "unknown eval command" (car messages))))))
 
+(ert-deftest ghostel-test-osc51-eval-catches-errors ()
+  "Errors signaled by a dispatched OSC 51;E function must not
+propagate out of `ghostel--osc51-eval' — otherwise they crash the
+process filter / redraw timer that invoked the native parser.
+Regression for a follow-up to #82 where `dow' with no args called
+`dired-other-window' with 0 arguments and signaled up through the
+filter."
+  (let* ((ghostel-eval-cmds
+          `(("boom" ,(lambda (&rest _) (error "kaboom")))))
+         (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      ;; Must not raise.
+      (ghostel--osc51-eval "\"boom\"")
+      (should (car messages))
+      (should (string-match-p "error calling boom" (car messages)))
+      (should (string-match-p "kaboom" (car messages))))))
+
+(ert-deftest ghostel-test-flush-pending-output-preserves-buffer ()
+  "Regression for #82: a buffer switch performed by a synchronous
+native callback (as OSC 51;E dispatch does when it calls
+`find-file-other-window') must not leak out of
+`ghostel--flush-pending-output'.  Otherwise callers such as
+`ghostel--delayed-redraw' read `ghostel--term' from the wrong
+buffer and hand nil to the native module."
+  (let ((ghostel-buf (generate-new-buffer " *ghostel-test-flush-buf*"))
+        (other-buf (generate-new-buffer " *ghostel-test-flush-other*")))
+    (unwind-protect
+        (with-current-buffer ghostel-buf
+          (setq-local ghostel--term 'fake-handle)
+          (setq-local ghostel--pending-output (list "payload"))
+          (cl-letf (((symbol-function 'ghostel--write-input)
+                     (lambda (_term _data)
+                       ;; Simulate `find-file-other-window' flipping
+                       ;; the current buffer via `select-window'.
+                       (set-buffer other-buf))))
+            (ghostel--flush-pending-output))
+          (should (eq (current-buffer) ghostel-buf))
+          (should (null ghostel--pending-output)))
+      (kill-buffer ghostel-buf)
+      (kill-buffer other-buf))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: copy-mode cursor visibility
 ;; -----------------------------------------------------------------------
@@ -2496,6 +2538,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-apply-palette-default-colors
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
+    ghostel-test-osc51-eval-catches-errors
+    ghostel-test-flush-pending-output-preserves-buffer
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
     ghostel-test-project-buffer-name

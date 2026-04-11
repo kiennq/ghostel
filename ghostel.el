@@ -1705,7 +1705,15 @@ Parses the command and arguments, looks up the command in
          (args (cdr parts))
          (entry (assoc command ghostel-eval-cmds)))
     (if entry
-        (apply (cadr entry) args)
+        ;; Catch errors from the dispatched function: this callback runs
+        ;; synchronously inside the native VT parser, so any unhandled
+        ;; error propagates back up through `ghostel--write-input' and
+        ;; crashes the process filter / redraw timer.
+        (condition-case err
+            (apply (cadr entry) args)
+          (error
+           (message "ghostel: error calling %s: %s"
+                    command (error-message-string err))))
       (message "ghostel: unknown eval command %S (add to `ghostel-eval-cmds' to allow)"
                command))))
 
@@ -2269,7 +2277,13 @@ frame after idle to improve interactive responsiveness."
   (when ghostel--pending-output
     (let ((combined (apply #'concat (nreverse ghostel--pending-output))))
       (setq ghostel--pending-output nil)
-      (ghostel--write-input ghostel--term combined))))
+      ;; An OSC 51;E callback dispatched synchronously from the native
+      ;; parser (e.g. `find-file-other-window') can change the current
+      ;; buffer via `select-window'.  Isolate that so callers keep
+      ;; reading buffer-locals — notably `ghostel--term' — from the
+      ;; ghostel buffer after this returns.
+      (save-current-buffer
+        (ghostel--write-input ghostel--term combined)))))
 
 (defun ghostel--delayed-redraw (buffer)
   "Perform the actual redraw in BUFFER."
@@ -2289,7 +2303,16 @@ frame after idle to improve interactive responsiveness."
                 (inhibit-modification-hooks t))
             (ghostel--redraw ghostel--term ghostel-full-redraw))
           (when ghostel--has-wide-chars
-            (ghostel--compensate-wide-chars)))))))
+            (ghostel--compensate-wide-chars))
+          ;; Native redraw updates buffer-point via `goto-char', which
+          ;; only propagates to `window-point' for the selected window.
+          ;; If an OSC 51;E callback moved selection elsewhere (e.g.
+          ;; `find-file-other-window'), the ghostel window's
+          ;; window-point is stale and the terminal cursor will display
+          ;; at the wrong place when the user reselects it.  Sync it.
+          (let ((pt (point)))
+            (dolist (win (get-buffer-window-list buffer nil t))
+              (set-window-point win pt))))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
