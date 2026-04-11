@@ -8,7 +8,7 @@
 /// - DIRTY_FULL: erase buffer and redraw everything
 /// - DIRTY_PARTIAL: only update dirty rows in-place
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Terminal = @import("terminal.zig");
 

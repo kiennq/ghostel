@@ -395,107 +395,6 @@ cell, so the visual line width must equal the terminal column count."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
-;; Test: title change (OSC 2)
-;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-title ()
-  "Test OSC 2 title change."
-  (let ((term (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "\e]2;My Title\e\\")
-    (should (equal "My Title" (ghostel--get-title term))))) ; title set via OSC 2
-
-(ert-deftest ghostel-test-title-does-not-overwrite-manual-rename ()
-  "Test that title updates do not overwrite a manual buffer rename."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _args) 'fake-term))
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _args) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (let ((ghostel--buffer-counter 0))
-            (ghostel)
-            (setq buf (current-buffer)))
-          (with-current-buffer buf
-            (should (equal "*ghostel*" (buffer-name)))
-            (should (equal "*ghostel*" ghostel--managed-buffer-name))
-            (ghostel--set-title "Title A")
-            (should (equal "*ghostel: Title A*" (buffer-name)))
-            (should (equal "*ghostel: Title A*" ghostel--managed-buffer-name))
-            (ghostel--set-title "Title A2")
-            (should (equal "*ghostel: Title A2*" (buffer-name)))
-            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))
-            (rename-buffer "ghostel manual title test" t)
-            (ghostel--set-title "Title B")
-            (should (equal "ghostel manual title test" (buffer-name)))
-            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-(ert-deftest ghostel-test-title-tracking-disabled ()
-  "Test that title updates are ignored when `ghostel-enable-title-tracking' is nil."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _args) 'fake-term))
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _args) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (let ((ghostel--buffer-counter 0)
-                (ghostel-enable-title-tracking nil))
-            (ghostel)
-            (setq buf (current-buffer))
-            (with-current-buffer buf
-              (should (equal "*ghostel*" (buffer-name)))
-              (ghostel--set-title "Ignored Title")
-              (should (equal "*ghostel*" (buffer-name)))
-              (should (equal "*ghostel*" ghostel--managed-buffer-name)))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-;; -----------------------------------------------------------------------
-||||||| parent of 3df4198 (Remove build.sh and switch to zig build)
-;; Test: title change (OSC 2)
-;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-title ()
-  "Test OSC 2 title change."
-  (let ((term (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "\e]2;My Title\e\\")
-    (should (equal "My Title" (ghostel--get-title term))))) ; title set via OSC 2
-
-(ert-deftest ghostel-test-title-does-not-overwrite-manual-rename ()
-  "Test that title updates do not overwrite a manual buffer rename."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _args) 'fake-term))
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _args) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (let ((ghostel--buffer-counter 0))
-            (ghostel)
-            (setq buf (current-buffer)))
-          (with-current-buffer buf
-            (should (equal "*ghostel*" (buffer-name)))
-            (should (equal "*ghostel*" ghostel--managed-buffer-name))
-            (ghostel--set-title "Title A")
-            (should (equal "*ghostel: Title A*" (buffer-name)))
-            (should (equal "*ghostel: Title A*" ghostel--managed-buffer-name))
-            (ghostel--set-title "Title A2")
-            (should (equal "*ghostel: Title A2*" (buffer-name)))
-            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))
-            (rename-buffer "ghostel manual title test" t)
-            (ghostel--set-title "Title B")
-            (should (equal "ghostel manual title test" (buffer-name)))
-            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-;; -----------------------------------------------------------------------
 ;; Test: CRLF normalization in Zig
 ;; -----------------------------------------------------------------------
 
@@ -1416,94 +1315,6 @@ for new size inside BSU/ESU → verify buffer shows new content."
               (should (string-match-p "NEW-LINE-00" content))
               (should (string-match-p "NEW-LINE-05" content))
               (should-not (string-match-p "OLD-LINE" content)))))
-      (kill-buffer buf))))
-
-;; -----------------------------------------------------------------------
-;; Test: resize preserves old frame until redraw replaces it
-;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-resize-no-blank-flash ()
-  "Buffer keeps old content after resize; redraw replaces it atomically.
-Regression test: fnSetSize used to call erase-buffer synchronously,
-leaving the buffer visibly empty until the next timer-driven redraw.
-Now the erasure is deferred into redraw() under inhibit-redisplay."
-  (let ((buf (generate-new-buffer " *ghostel-test-resize-no-blank*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 100))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            ;; Fill the viewport with identifiable content.
-            (dotimes (i 10)
-              (ghostel--write-input term (format "LINE-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (let ((pre-content (buffer-substring-no-properties
-                                (point-min) (point-max))))
-              (should (string-match-p "LINE-00" pre-content))
-              (should (string-match-p "LINE-09" pre-content))
-
-              ;; Resize — old content must survive in the buffer.
-              (ghostel--set-size term 6 40)
-              (setq ghostel--term-rows 6)
-              (let ((mid-content (buffer-substring-no-properties
-                                  (point-min) (point-max))))
-                (should (> (length mid-content) 0))
-                (should (string-match-p "LINE-" mid-content)))
-
-              ;; Redraw rebuilds the buffer from the new terminal state.
-              (ghostel--redraw term t)
-              (let ((post-content (buffer-substring-no-properties
-                                   (point-min) (point-max))))
-                (should (> (length post-content) 0))
-                ;; Viewport should have the new row count; extra lines
-                ;; above are scrollback from the old viewport rows.
-                (should (>= (count-lines (point-min) (point-max)) 6))))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-resize-redraw-anchors-window-start ()
-  "After resize + redraw, window-start is at the viewport origin.
-Without explicit anchoring, erase+rebuild inside redraw() clamps
-window-start to 1 (top of scrollback), causing a visible jump when
-Emacs auto-scrolls to make point visible."
-  (let ((buf (generate-new-buffer " *ghostel-test-resize-anchor*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (ghostel--force-next-redraw nil)
-                 (inhibit-read-only t))
-            ;; Build up scrollback so the viewport is not at buffer start.
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--write-input term "prompt> ")
-            (ghostel--redraw term t)
-            (should (> (line-number-at-pos (point-max)) 10))
-
-            ;; Display in a real window so we can test window-start.
-            (set-window-buffer (selected-window) buf)
-
-            ;; Resize + redraw via delayed-redraw (simulates the real path).
-            (ghostel--set-size term 6 40)
-            (setq ghostel--term-rows 6)
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; window-start should be at the viewport, not at buffer start.
-            (let* ((ws (window-start (selected-window)))
-                   (wp (window-point (selected-window)))
-                   (vp-start (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -5)
-                               (line-beginning-position))))
-              (should (= ws vp-start))
-              (should (>= wp vp-start)))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -3332,12 +3143,12 @@ ncurses apps like htop at start-up size and breaks live resize."
     (let ((ghostel--term 'fake)
           (ghostel--force-next-redraw nil)
           (set-size-args nil)
-          (redraw-called nil))
+          (invalidate-called nil))
       (let ((cur-buf (current-buffer)))
         (cl-letf (((symbol-function 'ghostel--set-size)
                    (lambda (_term h w) (setq set-size-args (list h w))))
-                  ((symbol-function 'ghostel--delayed-redraw)
-                   (lambda (_buf) (setq redraw-called t)))
+                  ((symbol-function 'ghostel--invalidate)
+                   (lambda () (setq invalidate-called t)))
                   ((symbol-function 'process-buffer)
                    (lambda (_proc) cur-buf))
                   ((default-value 'window-adjust-process-window-size-function)
@@ -3347,7 +3158,7 @@ ncurses apps like htop at start-up size and breaks live resize."
             (should (equal '(119 . 40) result))
             (should (equal '(40 119) set-size-args))
             (should ghostel--force-next-redraw)
-            (should redraw-called)))))))
+            (should invalidate-called)))))))
 
 (ert-deftest ghostel-test-resize-nil-size ()
   "When default function returns nil, no resize happens."
@@ -3498,7 +3309,7 @@ while :; do sleep 0.1; done'\n")
             (let ((ghostel--term 'fake-term))
               (cl-letf (((symbol-function 'ghostel--set-size)
                          (lambda (_t _h _w) nil))
-                        ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                        ((symbol-function 'ghostel--invalidate) #'ignore)
                         ((default-value 'window-adjust-process-window-size-function)
                          (lambda (_p _w) (cons 120 30))))
                 ;; Invoke the handler as Emacs would.
@@ -3580,6 +3391,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-ghostel-reuses-default-buffer
     ghostel-test-project-buffer-name
     ghostel-test-project-universal-arg
+    ghostel-test-copy-mode-load-all
     ghostel-test-copy-all
     ghostel-test-copy-mode-full-buffer-scroll
     ghostel-test-module-platform-tag-windows
@@ -3598,8 +3410,6 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
-    ghostel-test-title-does-not-overwrite-manual-rename
-    ghostel-test-title-tracking-disabled
     ghostel-test-delayed-redraw-keeps-point-when-cursor-follow-disabled
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output
@@ -3636,6 +3446,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local
+    ghostel-test-resize-window-adjust
     ghostel-test-resize-nil-size
     ghostel-test-sigwinch-reaches-shell-basic
     ghostel-test-sigwinch-reaches-shell-ghostel-style

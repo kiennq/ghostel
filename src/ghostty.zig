@@ -113,6 +113,14 @@ pub const SCROLL_TOP: c_int = c.GHOSTTY_SCROLL_VIEWPORT_TOP;
 pub const SCROLL_BOTTOM: c_int = c.GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
 pub const SCROLL_DELTA: c_int = c.GHOSTTY_SCROLL_VIEWPORT_DELTA;
 
+// Point types
+pub const Point = c.GhosttyPoint;
+pub const PointTag = c.GhosttyPointTag;
+pub const PointCoordinate = c.GhosttyPointCoordinate;
+pub const PointValue = c.GhosttyPointValue;
+pub const GridRef = c.GhosttyGridRef;
+pub const OUT_OF_SPACE = c.GHOSTTY_OUT_OF_SPACE;
+
 // Point tag constants
 pub const POINT_TAG_VIEWPORT: c_int = c.GHOSTTY_POINT_TAG_VIEWPORT;
 
