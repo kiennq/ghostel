@@ -643,6 +643,12 @@ fn insertAndStyle(
     }
 }
 
+fn temporarilyWritableBuffer(env: emacs.Env) bool {
+    const was_read_only = env.bufferReadOnly();
+    if (was_read_only) env.setBufferReadOnly(false);
+    return was_read_only;
+}
+
 /// Render the entire scrollback + active screen into the Emacs buffer.
 /// Returns the 1-based buffer line number corresponding to the original viewport top.
 pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
@@ -658,6 +664,8 @@ pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
     if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
         return 1;
     }
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
     var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
     var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
@@ -798,6 +806,9 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool, allocator: std.
     var has_wide_chars: bool = false;
 
     if (dirty != gt.DIRTY_FALSE) {
+        const was_read_only = temporarilyWritableBuffer(env);
+        defer if (was_read_only) env.setBufferReadOnly(true);
+
         // Get default colors
         var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
         var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
@@ -932,23 +943,21 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool, allocator: std.
         // Reset dirty state
         const dirty_false: c_int = gt.DIRTY_FALSE;
         _ = gt.c.ghostty_render_state_set(term.render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
-    }
 
-    // Scan for hyperlinks and apply text properties (before cursor positioning).
-    // Only run the expensive HTML formatter when a viewport row actually has
-    // a hyperlink — this avoids formatting the entire terminal (including
-    // scrollback) on every redraw.
-    if (dirty != gt.DIRTY_FALSE and has_hyperlinks) {
-        var hl_spans: [128]HyperlinkSpan = undefined;
-        var hl_uri_buf: [8192]u8 = undefined;
-        const hl = scanHyperlinks(allocator, term, &hl_spans, &hl_uri_buf);
-        if (hl.count > 0) {
-            applyHyperlinks(env, &hl_spans, hl.count, &hl_uri_buf);
+        // Scan for hyperlinks and apply text properties (before cursor positioning).
+        // Only run the expensive HTML formatter when a viewport row actually has
+        // a hyperlink — this avoids formatting the entire terminal (including
+        // scrollback) on every redraw.
+        if (has_hyperlinks) {
+            var hl_spans: [128]HyperlinkSpan = undefined;
+            var hl_uri_buf: [8192]u8 = undefined;
+            const hl = scanHyperlinks(allocator, term, &hl_spans, &hl_uri_buf);
+            if (hl.count > 0) {
+                applyHyperlinks(env, &hl_spans, hl.count, &hl_uri_buf);
+            }
         }
-    }
 
-    // Auto-detect plain-text URLs
-    if (dirty != gt.DIRTY_FALSE) {
+        // Auto-detect plain-text URLs
         _ = env.call0(emacs.sym.@"ghostel--detect-urls");
         if (has_wide_chars) {
             _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());

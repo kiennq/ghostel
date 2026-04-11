@@ -44,6 +44,12 @@ Uses mocks for native functions."
      (ghostel-evil-mode 1)
      ,@body))
 
+(defun ghostel-evil-test--insert (&rest strings)
+  "Insert STRINGS while bypassing `buffer-read-only' during test setup."
+  (let ((inhibit-read-only t))
+    (dolist (string strings)
+      (insert string))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: mode activation
 ;; -----------------------------------------------------------------------
@@ -205,7 +211,7 @@ Uses mocks for native functions."
   "Test that `ghostel-evil--before-append' fires on `evil-append'."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(5 . 0))))
      (evil-normal-state)
@@ -319,7 +325,7 @@ Uses mocks for native functions."
   "Test that `evil-delete' advice sends backspace keys via PTY."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0)))
@@ -338,7 +344,7 @@ Uses mocks for native functions."
   "Test that line-type `evil-delete' sends Ctrl+U to clear line."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0))))
      (evil-normal-state)
@@ -377,7 +383,7 @@ so calls from `evil-delete-char' (which passes only 4 args to
   "Test that `evil-change' advice deletes via PTY and enters insert state."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0)))
@@ -397,7 +403,7 @@ so calls from `evil-delete-char' (which passes only 4 args to
 Regression: delete-func arg was not optional in advice signature."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0)))
@@ -415,7 +421,7 @@ Regression: delete-func arg was not optional in advice signature."
   "Test that `evil-replace' deletes then inserts replacement text."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0)))
@@ -441,7 +447,7 @@ Regression: delete-func arg was not optional in advice signature."
   "Test that `evil-paste-after' pastes via PTY."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (kill-new "world")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0)))
@@ -462,7 +468,7 @@ Regression: delete-func arg was not optional in advice signature."
   "Test that Ctrl keys in insert state are sent to the terminal."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(11 . 0))))
      (evil-insert-state)
@@ -484,7 +490,7 @@ Regression: delete-func arg was not optional in advice signature."
 Prevents up/down arrows being sent as history navigation."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "line one\nline two\nline three")
+   (ghostel-evil-test--insert "line one\nline two\nline three")
    ;; Terminal cursor on row 2 (last line), col 5
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(5 . 2))))
@@ -510,7 +516,7 @@ Prevents up/down arrows being sent as history navigation."
   "Test that entering insert on the same row syncs column position."
   (ghostel-evil-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    ;; Terminal cursor on row 0, col 0
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ((symbol-function 'ghostel--cursor-position) (lambda (_) '(0 . 0))))
