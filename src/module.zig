@@ -486,9 +486,9 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
         env.signalError("ghostel: resize failed");
         return env.nil();
     };
-    // Reflow invalidates the materialized scrollback region — wipe the
-    // buffer so the next full redraw rebuilds it from libghostty state.
-    env.eraseBuffer();
+    // Reflow invalidates the materialized scrollback — terminal.resize()
+    // sets resize_pending so the next redraw() erases and rebuilds under
+    // inhibit-redisplay, avoiding a visible blank frame.
 
     return env.nil();
 }

@@ -781,6 +781,17 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         return;
     }
 
+    // ---- Deferred resize buffer reset ----------------------------------------
+    // terminal.resize() sets resize_pending instead of immediately erasing the
+    // buffer, so the old frame stays visible until this redraw replaces it
+    // (the caller binds inhibit-redisplay around us).  Erase now and force a
+    // full rebuild of scrollback + viewport.
+    if (term.resize_pending) {
+        env.eraseBuffer();
+        term.resize_pending = false;
+        force_full = true;
+    }
+
     // Resolve default colors once — used for both the scrollback append
     // path and the viewport render path.
     var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
