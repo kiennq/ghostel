@@ -750,6 +750,70 @@ fn insertScrollbackRange(
 }
 
 
+/// Convert a terminal column to an Emacs character offset by iterating
+/// the row's cells.  Returns `true` and positions point on success;
+/// `false` if the cell data is unavailable (caller should fall back to
+/// `move-to-column`).
+///
+/// This avoids relying on Emacs' `char-width`, which can disagree with
+/// the terminal's column width for certain characters (e.g. box-drawing
+/// glyphs on CJK/pgtk systems where `char-width` returns 2 but the
+/// terminal treats them as single-width).
+fn positionCursorByCell(env: emacs.Env, term: *Terminal, cx: u16, cy: u16) bool {
+    if (cx == 0) return true; // already at column 0
+
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+        return false;
+    }
+
+    // Advance iterator to cursor row cy.
+    {
+        var ri: u16 = 0;
+        while (ri <= cy) : (ri += 1) {
+            if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+                return false;
+            }
+        }
+    }
+
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+        return false;
+    }
+
+    // Walk cells 0..cx-1, counting Emacs characters.
+    var col: u16 = 0;
+    var char_count: i64 = 0;
+    while (col < cx) : (col += 1) {
+        if (!gt.c.ghostty_render_state_row_cells_next(term.row_cells)) break;
+
+        var graphemes_len: u32 = 0;
+        _ = gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len));
+
+        if (graphemes_len == 0) {
+            // Spacer tails produce no Emacs character.
+            var raw_cell: gt.c.GhosttyCell = undefined;
+            var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
+            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell)) == gt.SUCCESS) {
+                _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            }
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
+                continue;
+            }
+            char_count += 1; // empty cell → space
+        } else {
+            char_count += @intCast(@min(graphemes_len, 16));
+        }
+    }
+
+    // Cap at end of line so we never jump past it into the next row
+    // (can happen when cursor is on a trimmed trailing blank).
+    const pt = env.extractInteger(env.point());
+    const eol = env.extractInteger(env.lineEndPosition());
+    const max_chars = eol - pt;
+    env.gotoCharN(pt + @min(char_count, max_chars));
+    return true;
+}
+
 /// Redraw the terminal into the current Emacs buffer.
 ///
 /// Maintains a "growing buffer" model where the Emacs buffer contains
@@ -1129,7 +1193,9 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
 
         env.gotoCharN(viewport_start_int);
         _ = env.forwardLine(@as(i64, cy));
-        env.moveToColumn(@as(i64, cx));
+        if (!positionCursorByCell(env, term, cx, cy)) {
+            env.moveToColumn(@as(i64, cx));
+        }
     }
 
     // Update cursor style
