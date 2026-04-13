@@ -8,11 +8,11 @@ pub fn build(b: *std.Build) void {
     const is_release = optimize != .Debug;
     const target_os = target.result.os.tag;
     const emacs_module_dir = resolveEmacsModuleDir(b);
-    const ghostty_dep = b.lazyDependency("ghostty", .{
+    const ghostty_dep = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
         .@"emit-lib-vt" = true,
-    }) orelse @panic("ghostty dependency unavailable; run: zig build --fetch");
+    });
 
     const ghostty_lib = ghostty_dep.artifact("ghostty-vt-static");
 
