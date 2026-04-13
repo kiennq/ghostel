@@ -397,9 +397,7 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--mouse-event "ghostel-module")
 (declare-function ghostel--new "ghostel-module")
 (declare-function ghostel--redraw "ghostel-module" (term &optional full))
-(declare-function ghostel--scroll "ghostel-module")
 (declare-function ghostel--scroll-bottom "ghostel-module")
-(declare-function ghostel--scroll-top "ghostel-module")
 (declare-function ghostel--set-default-colors "ghostel-module")
 (declare-function ghostel--set-palette "ghostel-module")
 (declare-function ghostel--set-size "ghostel-module")
@@ -1129,15 +1127,6 @@ scroll event to the running application instead."
   (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
     (scroll-up 3)))
 
-(defun ghostel-copy-mode-scroll-up ()
-  "Scroll the Emacs window up by a page in copy mode."
-  (interactive)
-  (scroll-down-command))
-
-(defun ghostel-copy-mode-scroll-down ()
-  "Scroll the Emacs window down by a page in copy mode."
-  (interactive)
-  (scroll-up-command))
 
 (defun ghostel-copy-mode-previous-line ()
   "Move to the previous line in copy mode."
@@ -1256,14 +1245,13 @@ scroll event to the running application instead."
     (define-key map (kbd "<mouse-5>")       #'ghostel--scroll-down)
     (define-key map (kbd "<wheel-up>")      #'ghostel--scroll-up)
     (define-key map (kbd "<wheel-down>")    #'ghostel--scroll-down)
-    (define-key map (kbd "M-v")             #'ghostel-copy-mode-scroll-up)
-    (define-key map (kbd "C-v")             #'ghostel-copy-mode-scroll-down)
     (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
     (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
     (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
     (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
+    (define-key map (kbd "C-c C-l")         #'ghostel-copy-mode-exit-and-clear)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
@@ -1322,6 +1310,12 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
     (goto-char (point-max))
     (ghostel--invalidate)
     (message "Copy mode exited")))
+
+(defun ghostel-copy-mode-exit-and-clear ()
+  "Exit copy mode and clear the scrollback."
+  (interactive)
+  (ghostel-copy-mode-exit)
+  (ghostel-clear-scrollback))
 
 (defun ghostel-copy-mode-exit-and-send ()
   "Exit copy mode and send the key that triggered exit to the terminal."

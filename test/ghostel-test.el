@@ -176,21 +176,6 @@ succeeds."
       (should (string-match-p "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" state))))) ; 40 x's on row
 
 ;; -----------------------------------------------------------------------
-;; Test: scrollback
-;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-scrollback ()
-  "Test scrollback by overflowing visible rows."
-  (let ((term (ghostel--new 5 80 100)))
-    (dotimes (i 10)
-      (ghostel--write-input term (format "line %d\r\n" i)))
-    (let ((state (ghostel--debug-state term)))
-      (should (string-match-p "line [6-9]" state)))       ; recent lines visible
-    (ghostel--scroll term -5)
-    (let ((state (ghostel--debug-state term)))
-      (should (string-match-p "line [0-4]" state)))))     ; scrollback shows earlier lines
-
-;; -----------------------------------------------------------------------
 ;; Test: scrollback is materialized into the Emacs buffer (vterm parity)
 ;; -----------------------------------------------------------------------
 
@@ -427,25 +412,21 @@ scrolling libghostty's viewport."
         (with-current-buffer buf
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 5 80 100))
-          ;; Fill screen + scrollback with 10 lines
-          (dotimes (i 10)
-            (ghostel--write-input ghostel--term (format "line %d\r\n" i)))
-          ;; Verify content on screen and in scrollback
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should (string-match-p "line [6-9]" state)))      ; recent lines on screen
-          (ghostel--scroll ghostel--term -5)
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should (string-match-p "line [0-4]" state)))      ; early lines in scrollback
-          ;; Return to bottom and call the actual function
-          (ghostel--scroll-bottom ghostel--term)
-          (ghostel-clear-scrollback)
-          ;; Screen should be empty
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should-not (string-match-p "line [6-9]" state)))  ; screen cleared
-          ;; Scrollback should also be empty
-          (ghostel--scroll ghostel--term -10)
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should-not (string-match-p "line [0-4]" state)))) ; scrollback cleared
+          (let ((inhibit-read-only t))
+            ;; Fill screen + scrollback with 10 lines
+            (dotimes (i 10)
+              (ghostel--write-input ghostel--term (format "line %d\r\n" i)))
+            (ghostel--redraw ghostel--term t)
+            ;; Verify lines materialized in the buffer
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "line 0" content))
+              (should (string-match-p "line 9" content)))
+            ;; Clear scrollback (sends CSI 3J to libghostty)
+            (ghostel-clear-scrollback)
+            (ghostel--redraw ghostel--term t)
+            ;; Screen and scrollback should be empty
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should-not (string-match-p "line [0-9]" content)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
