@@ -2609,6 +2609,42 @@ buffer and hand nil to the native module."
   (should (eq (lookup-key ghostel-mode-map (kbd "M-y")) #'ghostel-yank-pop)))
 
 ;; -----------------------------------------------------------------------
+;; Test: ghostel-yank-pop DWIM
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-yank-pop-after-yank ()
+  "yank-pop after yank should cycle the kill ring."
+  (let* ((pasted nil)
+         (erased nil)
+         (kill-ring '("first" "second" "third"))
+         (kill-ring-yank-pointer kill-ring)
+         (ghostel--yank-index 0)
+         (last-command 'ghostel-yank)
+         (ghostel--process (start-process "true" nil "true")))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'process-send-string)
+               (lambda (_proc str) (setq erased str))))
+      (ghostel-yank-pop)
+      ;; Should have erased the previous paste (5 backspaces for "first")
+      (should (= (length erased) 5))
+      ;; Should have pasted the next kill ring entry
+      (should (equal (car pasted) "second")))))
+
+(ert-deftest ghostel-test-yank-pop-no-preceding-yank ()
+  "yank-pop without preceding yank should use completing-read."
+  (let* ((pasted nil)
+         (kill-ring '("alpha" "beta"))
+         (last-command 'ghostel--self-insert))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt coll &rest _) (car coll))))
+      (ghostel-yank-pop)
+      (should (equal (car pasted) "alpha")))))
+
+;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-mode-recenter
 ;; -----------------------------------------------------------------------
 
@@ -3076,6 +3112,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-c-g-exits-copy-mode
     ghostel-test-inhibit-quit
     ghostel-test-meta-key-bindings
+    ghostel-test-yank-pop-after-yank
+    ghostel-test-yank-pop-no-preceding-yank
     ghostel-test-copy-mode-recenter
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h

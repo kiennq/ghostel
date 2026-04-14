@@ -1108,21 +1108,26 @@ Use `ghostel-yank-pop' afterwards to cycle through older kills."
 
 (defun ghostel-yank-pop ()
   "Replace the just-yanked text with the next kill ring entry.
-Must be called after `ghostel-yank' or `ghostel-yank-pop'.
-Sends backspaces to erase the previous yank, then pastes the next entry."
+After `ghostel-yank' or `ghostel-yank-pop', cycles through the
+kill ring by erasing the previous paste and inserting the next entry.
+Otherwise, opens a `completing-read' browser over `kill-ring' and
+pastes the selected entry into the terminal."
   (interactive)
-  (unless (memq last-command '(ghostel-yank ghostel-yank-pop))
-    (user-error "Previous command was not a yank"))
-  (let* ((prev-text (current-kill ghostel--yank-index t))
-         (prev-len (length prev-text)))
-    (setq ghostel--yank-index (1+ ghostel--yank-index))
-    ;; Erase previous paste: send backspaces
-    (when (and ghostel--process (process-live-p ghostel--process))
-      (process-send-string ghostel--process
-                           (make-string prev-len ?\x7f)))
-    ;; Paste the next entry
-    (ghostel--paste-text (current-kill ghostel--yank-index t))
-    (setq this-command 'ghostel-yank-pop)))
+  (if (memq last-command '(ghostel-yank ghostel-yank-pop))
+      (let* ((prev-text (current-kill ghostel--yank-index t))
+             (prev-len (length prev-text)))
+        (setq ghostel--yank-index (1+ ghostel--yank-index))
+        ;; Erase previous paste: send backspaces
+        (when (and ghostel--process (process-live-p ghostel--process))
+          (process-send-string ghostel--process
+                               (make-string prev-len ?\x7f)))
+        ;; Paste the next entry
+        (ghostel--paste-text (current-kill ghostel--yank-index t))
+        (setq this-command 'ghostel-yank-pop))
+    ;; No preceding yank: browse kill ring and paste selection
+    (when-let* ((text (completing-read "Paste from kill ring: "
+                                       kill-ring nil t)))
+      (ghostel--paste-text text))))
 
 
 ;;; Drag and drop
