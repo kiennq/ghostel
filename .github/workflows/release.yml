@@ -4,30 +4,131 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest release
+        continue-on-error: true
+        id: cur_release
+        uses: pozetroninc/github-action-get-latest-release@master
+        with:
+          repository: ${{ github.repository }}
+          excludes: draft
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_ver="$(grep -Po '^;; Version: \K[\d.]+' ghostel.el)"
+          sha="${GITHUB_SHA::6}"
+          should_release=true
+          latest_tag=$([[ "${{ steps.cur_release.outcome }}" == "failure" ]] && echo "" || echo "${{ steps.cur_release.outputs.release }}")
+
+            if [[ -n "$latest_tag" ]] && git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null; then
+              if git diff --quiet "$latest_tag"...HEAD -- \
+                ghostel.el \
+                build.zig \
+                build.zig.zon \
+                .github/workflows/release.yml \
+                .github/workflows/ci.yml \
+                include \
+                src
+            then
+              should_release=false
+            fi
+          fi
+
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            version="${base_ver}.${GITHUB_RUN_NUMBER}.${sha}"
+            tag="v${version}"
+          fi
+
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.version.outputs.should_release == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
-          - os: macos-latest
-            platform: aarch64-macos
-            suffix: .dylib
+          - os: ubuntu-latest
+            platform: aarch64-linux
+            target: aarch64-linux-gnu
+            suffix: .so
+          - os: windows-latest
+            platform: x86_64-windows
+            target: x86_64-windows-gnu
+            suffix: .dll
+          - os: windows-latest
+            platform: aarch64-windows
+            target: aarch64-windows-gnu
+            suffix: .dll
           - os: macos-latest
             platform: x86_64-macos
             suffix: .dylib
             target: x86_64-macos
-          - os: ubuntu-latest
-            platform: aarch64-linux
-            suffix: .so
-            target: aarch64-linux-gnu
+          - os: macos-latest
+            platform: aarch64-macos
+            target: aarch64-macos
+            suffix: .dylib
     runs-on: ${{ matrix.os }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache Zig build state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+            ${{ env.ZIG_LOCAL_CACHE_DIR }}
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'include/**', '.github/workflows/release.yml') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ matrix.platform }}-
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -35,41 +136,32 @@ jobs:
           version: 0.15.2
 
       - name: Build native module
+        shell: bash
         run: |
-          if [ -n "${{ matrix.target }}" ]; then
-            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=baseline
-          else
-            zig build -Doptimize=ReleaseFast -Dcpu=baseline
+          set -euo pipefail
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=baseline
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          files=(
+            dyn-loader-module${{ matrix.suffix }}
+            ghostel-module${{ matrix.suffix }}
+            ghostel-module.json
+          )
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            files+=(conpty-module${{ matrix.suffix }})
           fi
+          tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
-      - name: Strip non-exported symbols (macOS)
-        if: runner.os == 'macOS'
-        run: strip -x ghostel-module${{ matrix.suffix }}
-
-      - name: Rename artifact for release
-        run: |
-          mv ghostel-module${{ matrix.suffix }} \
-             ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload artifact to release
+        uses: ncipollo/release-action@v1
         with:
-          name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: artifacts/**/*
+          tag: ${{ needs.prepare-release.outputs.tag }}
+          allowUpdates: true
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          omitDraftDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
+          artifacts: ghostel-module-${{ matrix.platform }}.tar.xz
+          token: ${{ secrets.GITHUB_TOKEN }}
