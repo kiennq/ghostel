@@ -7,7 +7,7 @@ description: Use when replaying or rebasing the Ghostel fork onto upstream/main,
 
 ## Overview
 
-Treat Ghostel as a small topic stack on top of `upstream/main`, not as a single merge blob. Rebuild that stack on top of new upstream, make the currently replayed commit own its conflict resolution, and always start from the new upstream file shape so new upstream behavior is not dropped by accident.
+Treat Ghostel as a small topic stack on top of `upstream/main`, not as a single merge blob. The fork carries substantial value — dyn-loader ABI, ConPTY runtime, readonly-safe rendering, performance tuning — that **must survive every resync**. A replay that silently drops fork content is worse than no replay at all.
 
 ## When to Use
 
@@ -33,24 +33,27 @@ Preserve those topics while also preserving new upstream behavior. Never solve a
 1. Start from a clean throwaway branch or worktree based on `upstream/main`; keep the old branch untouched as the reference stack.
 2. Inspect the old stack with `git log --oneline --reverse upstream/main..main`.
 3. Replay the stack in topic order. If a commit mixes multiple topics, split it before or during replay.
-4. The commit currently being replayed owns the conflict. Resolve by reading the new upstream file first, then reapplying only the minimal fork delta that still belongs to that commit.
-5. If upstream already covers the intent, drop the commit or shrink it. If only part of the commit still belongs, split it and keep each resulting commit clean.
-6. After every replayed commit, run the required checks for that commit class before moving on.
-7. After the full replay, compare the old and new stacks with `git range-diff <old-base>..<old-head> <new-base>..<new-head>` and confirm both upstream changes and fork-only topics are still present.
+4. **Resolve conflicts by starting from the old fork file** and merging upstream's new additions into it — not the other way around. The fork's content is the known-good behavior; upstream additions are the delta to integrate. Never default to "take HEAD" or "take ours" in a conflict block without verifying the fork side has no unique content.
+5. If upstream already covers the intent of a fork commit, drop or shrink it. If only part of the commit still belongs, split it and keep each resulting commit clean.
+6. Keep the replay moving; run spot checks only when they help resolve a conflict, and treat the final rewritten stack as the required validation point.
+7. **After the full replay, diff every key file** (`module.zig`, `render.zig`, `ghostel.el`, `test/ghostel-test.el`) between the old fork tip and the new replay tip. Any fork-only additions that disappeared are regressions that must be restored before pushing.
+8. Compare the old and new stacks with `git range-diff <old-base>..<old-head> <new-base>..<new-head>` and confirm both upstream changes and fork-only topics are still present.
 
 ## Validation Matrix
 
 | Commit type | Required check |
 | --- | --- |
-| any replayed commit | run the smallest relevant tests before continuing |
-| touches `*.zig`, `build.zig`, or `build.zig.zon` | `zig build -Doptimize=ReleaseFast` at that commit |
-| changes runtime or test-sensitive Elisp | `emacs -Q --batch --eval "(setq load-prefer-newer t native-comp-jit-compilation nil native-comp-enable-subr-trampolines nil comp-enable-subr-trampolines nil)" -L . -l test/ghostel-test.el -f ghostel-test-run-elisp` or a focused ERT slice first |
-| final rewritten stack | `zig build test` and the full `ghostel-test-run-elisp` pass |
+| intermediate replayed commits | not required to build individually; supplementary changes from later topics are allowed |
+| final rewritten stack | `zig build -Doptimize=ReleaseFast` and the full `ghostel-test-run-elisp` pass; `zig build test` if Zig sources changed |
 
-If a Zig-touching commit does not build, stop and fix that commit before replaying anything else.
+Intermediate commits do not need to build individually. Supplementary changes (e.g. submodule added early, functions from later topics included as stubs) are acceptable as long as the final stack builds and passes tests.
 
 ## Conflict Rules That Matter In This Repo
 
+- **Default to fork content in conflicts.** The fork's files contain the working runtime (dyn-loader ABI, ConPTY, performance, readonly rendering). When a conflict block has fork-only content on one side, that content must be preserved unless upstream explicitly obsoleted it. "Taking HEAD" in a conflict block that contains fork-only functions, export tables, or runtime helpers silently drops working behavior.
+- **module.zig owns the dyn-loader ABI.** The fork replaces upstream's direct `env.bindFunction` registration with a loader export table (`ExportId` enum, export manifest array, loader dispatch switch). This is the entire point of the dyn-loader topic. Never resolve a module.zig conflict by keeping the upstream registration style.
+- **render.zig owns readonly-safe rendering.** The fork wraps buffer mutations in `(let ((inhibit-read-only t)) ...)` and adds `ghostel-full-redraw` support. These are the readonly and scrollback-viewport features. Never drop them during a conflict.
+- **ghostel.el owns ConPTY coalescing and runtime helpers.** The fork adds `ghostel--conpty-active-p`, `conpty--read-pending`, `ghostel--coalesce-*`, and the loader bootstrap chain. These are not optional — they are the Windows runtime.
 - Workflow files: keep the fork's workflow removal intentionally, but do not delete new upstream workflow behavior unless the fork still means to remove it.
 - Shared test files: keep newer upstream tests and helper changes, then reapply the fork delta. Old whole-file resolutions are how upstream-safe tests get regressed.
 - Performance work stays in the performance commit unless upstream made it obsolete.
@@ -61,8 +64,10 @@ If a Zig-touching commit does not build, stop and fix that commit before replayi
 
 ## Common Mistakes
 
-- taking `--ours` or `--theirs` for an entire conflicted file
+- **Starting from upstream and cherry-picking fork commits** — this inverts the conflict bias and silently drops fork content. Always merge upstream INTO the fork, or if replaying, start from the fork file and merge upstream additions into it.
+- taking `--ours` or `--theirs` for an entire conflicted file without checking both sides
+- defaulting to "take HEAD" in conflict blocks that contain fork-only functions, export tables, or runtime helpers
 - fixing a replay mistake in a later commit instead of the commit that introduced it
 - preserving the fork stack while accidentally removing new upstream code or tests
-- leaving Zig-touching commits unbuildable in the middle of the replay
+- treating intermediate replay breakage as a blocker when only the final rewritten stack must validate
 - folding performance tuning into Windows support or dyn-loader commits
