@@ -2,6 +2,6 @@ zig-out/
 .zig-cache/
 *.dylib
 *.so
+*.dll
+*.bak
 *.elc
-ghostel-module.*
-!ghostel-module.zig
