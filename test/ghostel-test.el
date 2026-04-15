@@ -1968,20 +1968,43 @@ consumers (notably `ghostel-compile') depend on it."
             ghostel-compile--scan-marker (copy-marker (point-max)))
       (insert "/tmp/x.c:42:5: error: bad\n"))
     (ghostel-compile--finalize buf 1 (current-time))
+    ;; The file-name region should carry either a `compilation-message'
+    ;; text property or `compilation-error' face via font-lock-face.
+    ;; Scan the whole `/tmp/x.c' match instead of pinning a point,
+    ;; since compile.el's exact boundaries differ across Emacs versions.
     (goto-char (point-min))
-    (search-forward "/tmp/x.c")
-    (let ((props (text-properties-at (1- (point)))))
-      (should (or (memq 'compilation-error props)
-                  (memq 'compilation-error
-                        (ensure-list
-                         (plist-get props 'font-lock-face)))
-                  (plist-member props 'compilation-message))))
+    (re-search-forward "\\(/tmp/x\\.c\\):")
+    (let ((file-start (match-beginning 1))
+          (file-end (match-end 1))
+          (ok nil))
+      (save-excursion
+        (goto-char file-start)
+        (while (and (not ok) (< (point) file-end))
+          (when (or (get-text-property (point) 'compilation-message)
+                    (memq 'compilation-error
+                          (ensure-list (get-text-property
+                                        (point) 'font-lock-face))))
+            (setq ok t))
+          (forward-char 1)))
+      (should ok))
+    ;; Find the `42' (line-number) digits and check any position in
+    ;; that range carries `compilation-line-number' via font-lock-face.
+    ;; The exact boundary compile.el uses for line-number face has
+    ;; wobbled across Emacs versions (29.x vs master), so scan the
+    ;; region instead of pinning a single position.
     (goto-char (point-min))
-    (search-forward ":42")
-    (let ((line-face (get-text-property (1- (point)) 'font-lock-face)))
-      (should (or (eq line-face 'compilation-line-number)
-                  (memq 'compilation-line-number
-                        (ensure-list line-face)))))))
+    (re-search-forward ":\\(42\\):")
+    (let ((ln-start (match-beginning 1))
+          (ln-end (match-end 1))
+          (found nil))
+      (save-excursion
+        (goto-char ln-start)
+        (while (and (not found) (< (point) ln-end))
+          (let ((face (ensure-list (get-text-property (point) 'font-lock-face))))
+            (when (memq 'compilation-line-number face)
+              (setq found t)))
+          (forward-char 1)))
+      (should found))))
 
 (ert-deftest ghostel-test-compile-spurious-d-without-c-is-ignored ()
   "Regression: a D marker without a preceding C must not finalize.
