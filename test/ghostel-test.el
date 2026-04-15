@@ -3703,12 +3703,16 @@ buffer and hand nil to the native module."
                (lambda (_term) (setq scroll-bottom-called t)))
               ((symbol-function 'ghostel--send-key)
                (lambda (str) (setq sent-key str))))
-      (let ((last-command-event ?a))
-        (cl-letf (((symbol-function 'this-command-keys) (lambda () "a")))
-          (ghostel--self-insert)))
-      (should scroll-bottom-called)
-      (should ghostel--force-next-redraw)
-      (should (equal "a" sent-key)))))
+      (with-temp-buffer
+        (insert "scrollback\nscrollback\nscrollback\n")
+        (goto-char (point-min))
+        (let ((last-command-event ?a))
+          (cl-letf (((symbol-function 'this-command-keys) (lambda () "a")))
+            (ghostel--self-insert)))
+        (should scroll-bottom-called)
+        (should ghostel--force-next-redraw)
+        (should (equal "a" sent-key))
+        (should (= (point) (point-max)))))))
 
 (ert-deftest ghostel-test-scroll-on-input-send-event ()
   "Send-event scrolls to bottom when `ghostel-scroll-on-input' is non-nil."
@@ -3720,10 +3724,14 @@ buffer and hand nil to the native module."
                (lambda (_term) (setq scroll-bottom-called t)))
               ((symbol-function 'ghostel--send-encoded)
                (lambda (_key _mods &optional _utf8) nil)))
-      (let ((last-command-event (aref (kbd "<return>") 0)))
-        (ghostel--send-event))
-      (should scroll-bottom-called)
-      (should ghostel--force-next-redraw))))
+      (with-temp-buffer
+        (insert "scrollback\nscrollback\nscrollback\n")
+        (goto-char (point-min))
+        (let ((last-command-event (aref (kbd "<return>") 0)))
+          (ghostel--send-event))
+        (should scroll-bottom-called)
+        (should ghostel--force-next-redraw)
+        (should (= (point) (point-max)))))))
 
 (ert-deftest ghostel-test-scroll-on-input-disabled ()
   "Self-insert does not scroll when `ghostel-scroll-on-input' is nil."
@@ -3735,11 +3743,41 @@ buffer and hand nil to the native module."
                (lambda (_term) (setq scroll-bottom-called t)))
               ((symbol-function 'ghostel--send-key)
                (lambda (_str) nil)))
-      (cl-letf (((symbol-function 'this-command-keys) (lambda () "a")))
-        (let ((last-command-event ?a))
-          (ghostel--self-insert)))
-      (should-not scroll-bottom-called)
-      (should-not ghostel--force-next-redraw))))
+      (with-temp-buffer
+        (insert "scrollback\nscrollback\nscrollback\n")
+        (goto-char (point-min))
+        (let ((start (point)))
+          (cl-letf (((symbol-function 'this-command-keys) (lambda () "a")))
+            (let ((last-command-event ?a))
+              (ghostel--self-insert)))
+          (should-not scroll-bottom-called)
+          (should-not ghostel--force-next-redraw)
+          (should (= (point) start)))))))
+
+(ert-deftest ghostel-test-scroll-on-input-paste ()
+  "Paste via `ghostel--paste-text' snaps point to the prompt."
+  (let ((ghostel--term 'fake)
+        (ghostel--process 'fake-proc)
+        (ghostel--force-next-redraw nil)
+        (ghostel-scroll-on-input t)
+        (scroll-bottom-called nil)
+        (sent-text nil))
+    (cl-letf (((symbol-function 'ghostel--scroll-bottom)
+               (lambda (_term) (setq scroll-bottom-called t)))
+              ((symbol-function 'ghostel--bracketed-paste-p)
+               (lambda () nil))
+              ((symbol-function 'process-live-p)
+               (lambda (_p) t))
+              ((symbol-function 'process-send-string)
+               (lambda (_p s) (setq sent-text s))))
+      (with-temp-buffer
+        (insert "scrollback\nscrollback\nscrollback\n")
+        (goto-char (point-min))
+        (ghostel--paste-text "hello")
+        (should scroll-bottom-called)
+        (should ghostel--force-next-redraw)
+        (should (equal "hello" sent-text))
+        (should (= (point) (point-max)))))))
 
 (ert-deftest ghostel-test-scroll-intercept-forwards-mouse-tracking ()
   "Scroll intercept forwards events when mouse tracking is active."
@@ -4349,6 +4387,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-scroll-on-input-self-insert
     ghostel-test-scroll-on-input-send-event
     ghostel-test-scroll-on-input-disabled
+    ghostel-test-scroll-on-input-paste
     ghostel-test-scroll-intercept-forwards-mouse-tracking
     ghostel-test-scroll-intercept-fallthrough
     ghostel-test-control-key-bindings

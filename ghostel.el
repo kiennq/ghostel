@@ -1057,12 +1057,24 @@ Returns the sequence string, or nil for unknown keys."
       (format "\e[%d;%d~" param (1+ mod-num))
     (format "\e[%d~" param)))
 
+(defun ghostel--snap-to-input ()
+  "Return the window to the live viewport on user input.
+Resets the terminal engine's viewport out of scrollback and moves
+Emacs point to `point-max' so the delayed redraw anchors
+`window-start' to the viewport and clears any pixel vscroll left
+by `pixel-scroll-precision-mode' or similar scrollers.  No-op
+when `ghostel-scroll-on-input' is nil.  Call from any path where
+the user's action implies \"show me the prompt\" — typed input,
+paste, yank, drop."
+  (when (and ghostel-scroll-on-input ghostel--term)
+    (ghostel--scroll-bottom ghostel--term)
+    (goto-char (point-max))
+    (setq ghostel--force-next-redraw t)))
+
 (defun ghostel--self-insert ()
   "Send the last typed character to the terminal."
   (interactive)
-  (when (and ghostel-scroll-on-input ghostel--term)
-    (ghostel--scroll-bottom ghostel--term)
-    (setq ghostel--force-next-redraw t))
+  (ghostel--snap-to-input)
   (let* ((keys (this-command-keys))
          (char (aref keys (1- (length keys))))
          (str (if (and (characterp char) (< char 128))
@@ -1076,9 +1088,7 @@ Extracts the base key name and modifiers from `last-command-event'
 and routes through the ghostty key encoder, which respects terminal
 modes (application cursor keys, Kitty keyboard protocol, etc.)."
   (interactive)
-  (when (and ghostel-scroll-on-input ghostel--term)
-    (ghostel--scroll-bottom ghostel--term)
-    (setq ghostel--force-next-redraw t))
+  (ghostel--snap-to-input)
   (let* ((event last-command-event)
          (base (event-basic-type event))
          (mods (event-modifiers event))
@@ -1155,6 +1165,7 @@ Clears `quit-flag' which Emacs sets when \\`C-g' is pressed with
 (defun ghostel--paste-text (text)
   "Send TEXT to the terminal, using bracketed paste if the terminal wants it."
   (when (and text ghostel--process (process-live-p ghostel--process))
+    (ghostel--snap-to-input)
     (process-send-string ghostel--process
                          (if (ghostel--bracketed-paste-p)
                              (concat "\e[200~" text "\e[201~")
