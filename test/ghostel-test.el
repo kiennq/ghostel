@@ -709,6 +709,8 @@ than the full terminal `cols'."
         (sim (aref (kbd "<return>") 0)    "return"    "")
         (sim (aref (kbd "<tab>") 0)       "tab"       "")
         (sim (aref (kbd "<backspace>") 0) "backspace" "")
+        ;; Terminal mode sends ASCII 127 for backspace
+        (sim ?\d                          "backspace" "")
         (sim (aref (kbd "<escape>") 0)    "escape"    "")
         (sim (aref (kbd "<up>") 0)        "up"        "")
         (sim (aref (kbd "<f1>") 0)        "f1"        "")

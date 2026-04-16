@@ -1095,6 +1095,8 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
          (key-name (cond
                     ;; backtab is Emacs's name for S-TAB
                     ((eq base 'backtab) "tab")
+                    ;; Terminal mode sends ASCII 127 for the backspace key
+                    ((and (integerp base) (= base 127)) "backspace")
                     ;; Integer base (character key)
                     ((integerp base)
                      (and (< base 128) (string base)))
