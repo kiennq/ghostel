@@ -158,6 +158,7 @@ jobs:
           )
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             files+=(conpty-module${{ matrix.suffix }})
+            files+=(conpty-module.json)
           fi
           tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
