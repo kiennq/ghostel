@@ -6,12 +6,15 @@ EVIL_DIR       ?= $(XDG_CACHE_HOME)/evil
 
 ELC := ghostel.elc ghostel-debug.elc ghostel-compile.elc ghostel-eshell.elc
 
-.PHONY: all build test test-native test-all test-evil lint melpazoid byte-compile bench bench-quick clean regen-terminfo
+.PHONY: all build check test test-native test-all test-evil lint melpazoid byte-compile bench bench-quick clean regen-terminfo
 
 all: build test-all test-evil lint
 
 build:
-	zig build -Doptimize=ReleaseFast -Dcpu=baseline
+	zig build
+
+check:
+	zig build check
 
 # Pattern rule: rebuild .elc whenever its .el source is newer.
 # Make's timestamp tracking keeps the byte-compiled files in sync, so
@@ -33,7 +36,7 @@ test-evil:
 		git clone --depth 1 https://github.com/emacs-evil/evil.git "$(EVIL_DIR)"; \
 	fi
 	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L . \
-		-l ert -l test/evil-ghostel-test.el -f evil-ghostel-test-run
+		-l ert -l test/ghostel-evil-test.el -f ghostel-evil-test-run
 
 byte-compile: $(ELC)
 
@@ -78,7 +81,8 @@ bench-quick:
 	bash bench/run-bench.sh --quick
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f conpty-module.dll conpty-module.dylib conpty-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache
 
