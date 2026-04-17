@@ -141,9 +141,6 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         defer vt_log_env = null;
     }
 
-    // Normalize CRLF: Emacs PTYs lack ONLCR, so bare \n arrives
-    // without \r.  Insert \r before every bare \n.
-    // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
     const raw = data.?;
 
     // Respond to OSC 4/10/11 color queries BEFORE feeding libghostty.
@@ -154,44 +151,26 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // the program discards our reply as noise.
     extractOscColorQueries(env, term, raw);
 
-    // Count bare \n to determine output size.
-    var extra_cr: usize = 0;
-    for (0..raw.len) |i| {
-        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-            extra_cr += 1;
+    // Normalize CRLF by streaming directly into libghostty's parser.
+    // Emacs PTYs lack ONLCR, so bare \n arrives without \r — insert
+    // one before each bare \n by feeding the preceding segment verbatim
+    // and then "\r\n".  libghostty's VT state machine handles arbitrary
+    // chunking (that's how the process filter already works), so no
+    // scratch buffer, no allocation, no truncation fallback.
+    var seg_start: usize = 0;
+    var prev_was_cr: bool = false;
+    for (raw, 0..) |ch, i| {
+        if (ch == '\n' and !prev_was_cr) {
+            if (i > seg_start) term.vtWrite(raw[seg_start..i]);
+            term.vtWrite("\r\n");
+            seg_start = i + 1;
+            prev_was_cr = false;
+        } else {
+            prev_was_cr = (ch == '\r');
         }
     }
-
-    if (extra_cr == 0) {
-        // No normalization needed — feed raw data directly.
-        term.vtWrite(raw);
-    } else {
-        // Need to insert \r before bare \n.
-        const out_len = raw.len + extra_cr;
-        var norm_stack: [131072]u8 = undefined;
-        var norm_heap: ?[]u8 = null;
-        defer if (norm_heap) |nh| std.heap.c_allocator.free(nh);
-
-        const norm_buf: []u8 = if (out_len <= norm_stack.len)
-            &norm_stack
-        else blk: {
-            norm_heap = std.heap.c_allocator.alloc(u8, out_len) catch {
-                // Fall back to stack buffer, truncating if needed.
-                break :blk &norm_stack;
-            };
-            break :blk norm_heap.?;
-        };
-
-        var npos: usize = 0;
-        for (0..raw.len) |i| {
-            if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-                norm_buf[npos] = '\r';
-                npos += 1;
-            }
-            norm_buf[npos] = raw[i];
-            npos += 1;
-        }
-        term.vtWrite(norm_buf[0..npos]);
+    if (seg_start < raw.len) {
+        term.vtWrite(raw[seg_start..]);
     }
 
     // Scan for OSC sequences that libghostty-vt discards (7, 51, 52, 133).
