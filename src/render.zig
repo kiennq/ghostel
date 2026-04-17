@@ -86,6 +86,29 @@ fn formatColor(color: gt.ColorRgb, buf: *[7]u8) []const u8 {
     return buf[0..7];
 }
 
+/// Tri-state cache of the per-cell raw handle. Used by `buildRowContent`
+/// so cells that need both the semantic-content check (in-prompt) and
+/// the wide-spacer check (empty grapheme) only pay for one
+/// `cells_get(RAW)` call.
+const RawTag = enum { unset, loaded, failed };
+
+/// Lazily populate `out` with the raw cell; memoizes success/failure
+/// in `tag` so repeated calls within one cell do not re-issue the get.
+fn loadRawCell(cells: gt.RenderStateRowCells, out: *gt.c.GhosttyCell, tag: *RawTag) bool {
+    switch (tag.*) {
+        .unset => {
+            if (gt.c.ghostty_render_state_row_cells_get(cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(out)) == gt.SUCCESS) {
+                tag.* = .loaded;
+                return true;
+            }
+            tag.* = .failed;
+            return false;
+        },
+        .loaded => return true,
+        .failed => return false,
+    }
+}
+
 /// Read the style for the current cell from the render state.
 fn readCellStyle(cells: gt.RenderStateRowCells) CellStyle {
     var style: CellStyle = .{};
@@ -493,16 +516,19 @@ fn buildRowContent(
             continue;
         }
 
+        // Raw cell handle, fetched lazily for the semantic-content and
+        // wide-spacer checks that each need it. Without the shared slot,
+        // empty prompt padding would pay for two cells_get(RAW) calls.
+        var raw_cell: gt.c.GhosttyCell = undefined;
+        var raw_tag: RawTag = .unset;
+
         // Track leading prompt characters via cell-level semantic content.
         if (in_prompt) {
-            var raw_cell: gt.c.GhosttyCell = undefined;
             var semantic: c_int = 0; // GHOSTTY_CELL_SEMANTIC_OUTPUT
-            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell)) == gt.SUCCESS) {
+            if (loadRawCell(term.row_cells, &raw_cell, &raw_tag)) {
                 _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, @ptrCast(&semantic));
             }
-            if (semantic == gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
-                // Will be updated below after chars are counted
-            } else {
+            if (semantic != gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
                 in_prompt = false;
             }
         }
@@ -529,10 +555,9 @@ fn buildRowContent(
             // Wide-character spacer tails occupy a terminal cell but must
             // not produce output — the preceding wide cell already accounts
             // for 2 visual columns in Emacs.
-            var raw_cell_wide: gt.c.GhosttyCell = undefined;
             var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
-            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell_wide)) == gt.SUCCESS) {
-                _ = gt.c.ghostty_cell_get(raw_cell_wide, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            if (loadRawCell(term.row_cells, &raw_cell, &raw_tag)) {
+                _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
             }
             if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
                 has_wide = true;
