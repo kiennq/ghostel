@@ -157,8 +157,14 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // and then "\r\n".  libghostty's VT state machine handles arbitrary
     // chunking (that's how the process filter already works), so no
     // scratch buffer, no allocation, no truncation fallback.
+    //
+    // `prev_was_cr` is seeded from `term.last_input_was_cr` so a CRLF
+    // pair split across two writes — chunk A ending with \r, chunk B
+    // starting with \n — is not mis-normalized into \r\r\n.  The final
+    // value is persisted back for the next call. An empty input
+    // round-trips the flag unchanged.
     var seg_start: usize = 0;
-    var prev_was_cr: bool = false;
+    var prev_was_cr: bool = term.last_input_was_cr;
     for (raw, 0..) |ch, i| {
         if (ch == '\n' and !prev_was_cr) {
             if (i > seg_start) term.vtWrite(raw[seg_start..i]);
@@ -172,6 +178,7 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     if (seg_start < raw.len) {
         term.vtWrite(raw[seg_start..]);
     }
+    term.last_input_was_cr = prev_was_cr;
 
     // Scan for OSC sequences that libghostty-vt discards (7, 51, 52, 133).
     // One pass, dispatched by code in document order.
@@ -191,14 +198,22 @@ const OscEntry = struct {
     /// Payload bytes between the code's trailing `;` and the terminator.
     payload: []const u8,
     /// Terminator bytes (BEL or ESC \) — forwarded back on replies.
-    term: []const u8,
+    terminator: []const u8,
 };
 
 /// Single-pass iterator over well-formed OSC sequences in a byte slice.
 /// Advances past `ESC ]`, parses the decimal code up to `;`, locates the
-/// BEL/ST terminator, and yields `(code, payload, term)`. Partial
-/// sequences at the end of the buffer stop iteration so the caller
-/// doesn't act on half-received data.
+/// BEL/ST terminator, and yields `(code, payload, terminator)`.
+///
+/// An OSC payload is bounded by a real terminator (BEL or ESC \) OR by
+/// the next OSC introducer (ESC ]).  Stopping at a following introducer
+/// handles malformed input where one OSC is missing its terminator
+/// before the next begins — otherwise the partial OSC would cannibalize
+/// the following OSC's bytes (including its terminator) as its own
+/// payload, producing a garbage dispatch AND starving the next OSC.
+/// On partial detection we advance past the current introducer and let
+/// iteration continue, so well-formed OSCs later in the same buffer
+/// still dispatch.
 const OscIterator = struct {
     data: []const u8,
     pos: usize = 0,
@@ -222,24 +237,36 @@ const OscIterator = struct {
             }
             const payload_start = code_end + 1;
 
-            // Terminator search. A partial OSC (no terminator before EOF)
-            // stops iteration entirely: bytes after an unterminated payload
-            // are opaque, so there's no safe way to continue scanning.
+            // Scan for a terminator (BEL or ESC \) or the next OSC
+            // introducer (ESC ]), whichever comes first. An intervening
+            // introducer means the current OSC is partial.
             var end = payload_start;
             var term_len: usize = 0;
             while (end < self.data.len) : (end += 1) {
-                if (self.data[end] == 0x07) {
+                const ch = self.data[end];
+                if (ch == 0x07) {
                     term_len = 1;
                     break;
                 }
-                if (self.data[end] == 0x1b and end + 1 < self.data.len and self.data[end + 1] == '\\') {
-                    term_len = 2;
-                    break;
+                if (ch == 0x1b and end + 1 < self.data.len) {
+                    const next_ch = self.data[end + 1];
+                    if (next_ch == '\\') {
+                        term_len = 2;
+                        break;
+                    }
+                    if (next_ch == ']') {
+                        // Next introducer — current OSC is partial.
+                        break;
+                    }
                 }
             }
             if (term_len == 0) {
-                self.pos = self.data.len;
-                return null;
+                // Partial OSC: skip past the current introducer (which
+                // we already parsed) and resume scanning. If `end` is
+                // still `self.data.len` there were no more introducers,
+                // and the next indexOfPos call will terminate iteration.
+                self.pos = if (end > code_start) end else code_start;
+                continue;
             }
 
             self.pos = end + term_len;
@@ -247,7 +274,7 @@ const OscIterator = struct {
             return .{
                 .code = code,
                 .payload = self.data[payload_start..end],
-                .term = self.data[end .. end + term_len],
+                .terminator = self.data[end .. end + term_len],
             };
         }
         return null;
@@ -255,10 +282,12 @@ const OscIterator = struct {
 };
 
 /// Dispatch OSC 7 / 51 / 52 / 133 from `data` in document order.
-/// These are the sequences that libghostty-vt discards, so ghostel
-/// has to scan for them itself.  All four used to scan the buffer
-/// independently; one unified pass is strictly less work for bulk
-/// output and preserves source-order dispatch.
+/// These are the post-vtWrite sequences that libghostty-vt discards,
+/// so ghostel has to scan for them itself.  All four used to scan the
+/// buffer independently; one unified pass is strictly less work for
+/// bulk output and preserves source-order dispatch.  (OSC 4/10/11
+/// color queries use the same iterator but run before vtWrite — see
+/// `extractOscColorQueries`.)
 ///
 /// Runs AFTER `vtWrite` so libghostty has already seen the bytes —
 /// OSC 7 calls back into libghostty (`setPwd`) and the others call
@@ -388,13 +417,13 @@ fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) voi
                 if (!std.mem.eql(u8, osc.payload, "?")) continue;
                 var fg: gt.ColorRgb = undefined;
                 if (!term.getColorForeground(&fg)) continue;
-                sendDynamicColorReply(env, 10, fg, osc.term);
+                sendDynamicColorReply(env, 10, fg, osc.terminator);
             },
             11 => {
                 if (!std.mem.eql(u8, osc.payload, "?")) continue;
                 var bg: gt.ColorRgb = undefined;
                 if (!term.getColorBackground(&bg)) continue;
-                sendDynamicColorReply(env, 11, bg, osc.term);
+                sendDynamicColorReply(env, 11, bg, osc.terminator);
             },
             4 => {
                 // Payload is a ';'-separated list of `index;value` pairs.
@@ -409,7 +438,7 @@ fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) voi
                         if (!term.getColorPalette(&palette)) break;
                         palette_loaded = true;
                     }
-                    sendPaletteColorReply(env, @intCast(idx), palette[idx], osc.term);
+                    sendPaletteColorReply(env, @intCast(idx), palette[idx], osc.terminator);
                 }
             },
             else => {},

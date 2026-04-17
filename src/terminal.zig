@@ -49,6 +49,18 @@ wrote_since_redraw: bool = false,
 /// into the redraw pass where `inhibit-redisplay` prevents flicker.
 resize_pending: bool = false,
 
+/// True iff the last byte of the previous `fnWriteInput` input was
+/// `\r`. Carries the bare-LF detection state across write-input calls
+/// so that a CR at the tail of one write and an LF at the head of the
+/// next don't get normalized into an extra `\r` (producing `\r\r\n`).
+///
+/// Named after the input stream rather than what was fed to libghostty
+/// because the two only differ in that the normalizer may insert a
+/// `\r` before a bare LF — it never drops or rewrites a trailing CR.
+/// Reset by `resize` since a reflow means the stream is effectively
+/// new.
+last_input_was_cr: bool = false,
+
 /// Hash of the first scrollback row's content, sampled at the end of
 /// each redraw that touched scrollback. Used to detect rotation
 /// (libghostty evicting the oldest row in lockstep with new ones being
@@ -226,6 +238,7 @@ pub fn resize(self: *Self, cols: u16, rows: u16) !void {
     self.scrollback_in_buffer = 0;
     self.first_scrollback_row_hash = 0;
     self.resize_pending = true;
+    self.last_input_was_cr = false;
 }
 
 /// Scroll the viewport.

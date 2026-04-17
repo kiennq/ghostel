@@ -94,6 +94,12 @@ const RawTag = enum { unset, loaded, failed };
 
 /// Lazily populate `out` with the raw cell; memoizes success/failure
 /// in `tag` so repeated calls within one cell do not re-issue the get.
+///
+/// The cache assumes `cells_get(RAW)` is idempotent for a given
+/// iterator position (which it is in libghostty today — it returns a
+/// handle into already-materialized cell data).  If that ever
+/// changes, a failed first call would become sticky for the rest of
+/// the current cell.
 fn loadRawCell(cells: gt.RenderStateRowCells, out: *gt.c.GhosttyCell, tag: *RawTag) bool {
     switch (tag.*) {
         .unset => {
@@ -1291,8 +1297,18 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     // rotation check. Reuse the start-of-redraw hash when it's still
     // valid (no rotation, no trim) — avoids a second scroll-to-top +
     // render_state_update round trip per redraw.
+    //
+    // If nothing was written AND we didn't populate `cached_row0_hash`
+    // at the top, row 0 cannot have moved since the previous redraw
+    // set `first_scrollback_row_hash`, so skip the compute entirely.
+    // This covers cursor-only redraws and idle-timer fires.
     if (term.scrollback_in_buffer > 0) {
-        term.first_scrollback_row_hash = cached_row0_hash orelse computeFirstScrollbackRowHash(term);
+        if (cached_row0_hash) |h| {
+            term.first_scrollback_row_hash = h;
+        } else if (term.wrote_since_redraw) {
+            term.first_scrollback_row_hash = computeFirstScrollbackRowHash(term);
+        }
+        // else: no writes, no cached hash → existing value is still current.
     } else {
         term.first_scrollback_row_hash = 0;
     }

@@ -643,6 +643,50 @@ than the full terminal `cols'."
       (should (equal 6 (car cur)))                          ; cursor col after LF
       (should (> (cdr cur) 0)))))                           ; cursor moved to row 1+
 
+(ert-deftest ghostel-test-crlf-split-across-writes ()
+  "CRLF pair split across two write-input calls must not double-insert \\r.
+Chunk A ends with \\r, chunk B starts with \\n.  Without cross-call
+state the normalizer would treat the leading \\n as bare and emit
+\\r\\r\\n to libghostty.  Visible effect: cursor lands on row 1 col 6
+after \"first\\r\" + \"\\nsecond\", exactly as if the pair were sent in
+one call; a bug would leave it on row 2 or otherwise desynced."
+  (let ((term (ghostel--new 25 80 1000))
+        (term-single (ghostel--new 25 80 1000)))
+    (ghostel--write-input term "first\r")
+    (ghostel--write-input term "\nsecond")
+    (ghostel--write-input term-single "first\r\nsecond")
+    (should (equal (ghostel-test--cursor term)
+                   (ghostel-test--cursor term-single)))))
+
+(ert-deftest ghostel-test-crlf-split-with-empty-chunk ()
+  "An empty write between \\r and \\n preserves the cross-call CR flag.
+Regression guard for a naive implementation that resets `last_input_was_cr'
+on every entry rather than only when input was consumed."
+  (let ((term (ghostel--new 25 80 1000))
+        (term-single (ghostel--new 25 80 1000)))
+    (ghostel--write-input term "first\r")
+    (ghostel--write-input term "")          ; empty chunk must not clear flag
+    (ghostel--write-input term "\nsecond")
+    (ghostel--write-input term-single "first\r\nsecond")
+    (should (equal (ghostel-test--cursor term)
+                   (ghostel-test--cursor term-single)))))
+
+(ert-deftest ghostel-test-crlf-standalone-cr-then-crlf ()
+  "A lone CR followed by a complete CRLF stays two logical line-endings.
+The normalizer must not collapse the trailing CR of write A and the
+leading \\r of write B's \\r\\n into a single sequence: the input
+\"a\\r\" + \"\\r\\nb\" is equivalent to sending \"a\\r\\r\\nb\" in one
+call.  (Bare \\n comes from Emacs PTYs lacking ONLCR; bare \\r from
+programs that explicitly emit a carriage return — both must be passed
+through without cross-call munging.)"
+  (let ((term (ghostel--new 25 80 1000))
+        (term-single (ghostel--new 25 80 1000)))
+    (ghostel--write-input term "a\r")
+    (ghostel--write-input term "\r\nb")
+    (ghostel--write-input term-single "a\r\r\nb")
+    (should (equal (ghostel-test--cursor term)
+                   (ghostel-test--cursor term-single)))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: raw key sequence fallback
 ;; -----------------------------------------------------------------------
@@ -992,6 +1036,25 @@ Mirrors the real zsh case where the directory still contains a
           (kill-ring nil))
       (ghostel--write-input term "\e]52;c;?\e\\")
       (should (equal nil kill-ring)))))                     ; osc52 query ignored
+
+(ert-deftest ghostel-test-osc-partial-does-not-starve-later ()
+  "A partial OSC must not cannibalize or starve a following complete OSC.
+Input \"\\e]7;PARTIAL\\e]52;c;aGVsbG8=\\a\" would, under a naive
+single-pass scanner, let the OSC 7 payload absorb the OSC 52's BEL
+terminator — yielding a garbage PWD dispatch and no clipboard.  The
+iterator must treat the intervening \\e] as a partial-OSC boundary,
+skip the OSC 7, and still dispatch the OSC 52."
+  (let ((term (ghostel--new 25 80 1000))
+        (ghostel-enable-osc52 t)
+        (kill-ring nil)
+        (pwd-before (ghostel--get-pwd (ghostel--new 25 80 1000))))
+    (ghostel--write-input term "\e]7;PARTIAL\e]52;c;aGVsbG8=\a")
+    ;; OSC 52 dispatched: "hello" in kill-ring.
+    (should kill-ring)
+    (should (equal "hello" (car kill-ring)))
+    ;; OSC 7 NOT dispatched with the garbage payload "PARTIAL\e]52;c;aGVsbG8="
+    ;; — the PWD should still be whatever a fresh terminal reports (nil).
+    (should (equal pwd-before (ghostel--get-pwd term)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: OSC 4/10/11 color query responses

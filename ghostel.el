@@ -675,8 +675,13 @@ When the module file is missing, trigger `ghostel-module-auto-install'.
 When PROMPT-USER is non-nil (called from an interactive command like
 `ghostel'), failures signal `user-error' so the calling flow aborts.
 Otherwise (load time), failures `display-warning' instead so the user
-can still compile ghostel, read docs, and so on."
-  (unless (featurep 'ghostel-module)
+can still compile ghostel, read docs, and so on.
+
+The guard also honours `ghostel--new' being already `fboundp', which
+covers the pure-Elisp test path where `cl-letf' stubs the native
+entry points so tests run without the module present."
+  (unless (or (featurep 'ghostel-module)
+              (fboundp 'ghostel--new))
     (let* ((dir (file-name-directory (or load-file-name
                                          (locate-library "ghostel")
                                          buffer-file-name)))

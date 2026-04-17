@@ -646,11 +646,11 @@ Emacs 31.0.50:
 
 | Backend              | Plain ASCII | URL-heavy |
 |----------------------|------------:|----------:|
-| ghostel              |    70 MB/s  |  56 MB/s  |
-| ghostel (no detect)  |    70 MB/s  |  70 MB/s  |
-| vterm                |    34 MB/s  |  27 MB/s  |
-| eat                  |   4.4 MB/s  | 3.5 MB/s  |
-| term                 |   5.6 MB/s  | 4.7 MB/s  |
+| ghostel              |    87 MB/s  |  64 MB/s  |
+| ghostel (no detect)  |    86 MB/s  |  86 MB/s  |
+| vterm                |    35 MB/s  |  27 MB/s  |
+| eat                  |   4.7 MB/s  | 3.5 MB/s  |
+| term                 |   5.7 MB/s  | 4.7 MB/s  |
 
 Ghostel scans terminal output for URLs and file paths, making them clickable.
 The "no detect" row shows throughput with this detection disabled
