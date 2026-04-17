@@ -4571,31 +4571,134 @@ redraw and produce visible flicker, so point is left alone."
 
 (ert-deftest ghostel-test-scroll-intercept-fallthrough ()
   "Scroll intercept re-dispatches when mouse tracking is off."
-  (let ((ghostel--term 'fake)
-        (ghostel--process 'fake)
-        (ghostel--copy-mode-active nil)
-        (ghostel--scroll-intercept-active t)
-        (fake-up-event `(wheel-up (,(selected-window) 1 (10 . 5) 0)))
-        (fake-down-event `(wheel-down (,(selected-window) 1 (10 . 5) 0))))
-    ;; Mouse tracking off: ghostel--mouse-event returns nil
-    (cl-letf (((symbol-function 'ghostel--mouse-event)
-               (lambda (_term _action _button _row _col _mods) nil))
-              ((symbol-function 'process-live-p) (lambda (_p) t)))
-      ;; Test wheel-up re-dispatch
-      (ghostel--scroll-intercept-up fake-up-event)
-      ;; Intercept should be disabled so the event loop skips our map
-      (should-not ghostel--scroll-intercept-active)
-      ;; Event should be pushed back for re-processing
-      (should (equal fake-up-event (car unread-command-events)))
-      ;; Clean up for next assertion
-      (setq unread-command-events nil)
-      (ghostel--reenable-scroll-intercept)
-      ;; Test wheel-down re-dispatch
-      (ghostel--scroll-intercept-down fake-down-event)
-      (should-not ghostel--scroll-intercept-active)
-      (should (equal fake-down-event (car unread-command-events)))
-      (setq unread-command-events nil)
-      (ghostel--reenable-scroll-intercept))))
+  (let* ((event-buf (window-buffer (selected-window)))
+         (fake-up-event `(wheel-up (,(selected-window) 1 (10 . 5) 0)))
+         (fake-down-event `(wheel-down (,(selected-window) 1 (10 . 5) 0)))
+         (unread-command-events nil))
+    (with-current-buffer event-buf
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (setq-local ghostel--copy-mode-active nil)
+      (setq-local ghostel--scroll-intercept-active t)
+      (setq-local pre-command-hook nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--mouse-event)
+                   (lambda (_term _action _button _row _col _mods) nil))
+                  ((symbol-function 'process-live-p) (lambda (_p) t)))
+          ;; Test wheel-up re-dispatch
+          (ghostel--scroll-intercept-up fake-up-event)
+          (should-not (buffer-local-value
+                       'ghostel--scroll-intercept-active event-buf))
+          (should (equal fake-up-event (car unread-command-events)))
+          ;; Running the buffer-local pre-command-hook in event-buf
+          ;; re-enables the intercept and removes the one-shot hook.
+          (with-current-buffer event-buf
+            (run-hooks 'pre-command-hook))
+          (should (buffer-local-value
+                   'ghostel--scroll-intercept-active event-buf))
+          (should-not (buffer-local-value 'pre-command-hook event-buf))
+          (setq unread-command-events nil)
+          ;; Test wheel-down re-dispatch
+          (ghostel--scroll-intercept-down fake-down-event)
+          (should-not (buffer-local-value
+                       'ghostel--scroll-intercept-active event-buf))
+          (should (equal fake-down-event (car unread-command-events)))
+          (with-current-buffer event-buf
+            (run-hooks 'pre-command-hook))
+          (should (buffer-local-value
+                   'ghostel--scroll-intercept-active event-buf)))
+      (with-current-buffer event-buf
+        (kill-local-variable 'ghostel--term)
+        (kill-local-variable 'ghostel--process)
+        (kill-local-variable 'ghostel--copy-mode-active)
+        (kill-local-variable 'ghostel--scroll-intercept-active)
+        (kill-local-variable 'pre-command-hook)))))
+
+(ert-deftest ghostel-test-scroll-intercept-unselected-window ()
+  "Wheel events on an unselected ghostel window must not loop.
+
+Regression test: previously `ghostel--redispatch-scroll-event' set
+the buffer-local intercept flag in `current-buffer', which for wheel
+events on an unselected window is the *selected* window's buffer —
+not the ghostel buffer.  The flag therefore stayed `t' in the ghostel
+buffer and the re-dispatched event was intercepted again, hanging
+Emacs until `C-g'."
+  (let ((ghostel-buf (generate-new-buffer " *ghostel-test-unsel*"))
+        (other-buf (generate-new-buffer " *other-test-unsel*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((ghostel-win (split-window))
+                 (_ (set-window-buffer ghostel-win ghostel-buf))
+                 (_ (with-current-buffer ghostel-buf
+                      (setq-local ghostel--term 'fake)
+                      (setq-local ghostel--process 'fake)
+                      (setq-local ghostel--copy-mode-active nil)
+                      (setq-local ghostel--scroll-intercept-active t)))
+                 ;; Simulate a wheel event on an unselected ghostel window:
+                 ;; current-buffer is the *other* buffer while the event's
+                 ;; posn-window points at the ghostel window.
+                 (fake-event `(wheel-up (,ghostel-win 1 (10 . 5) 0)))
+                 (unread-command-events nil))
+            (set-buffer other-buf)
+            (cl-letf (((symbol-function 'ghostel--mouse-event)
+                       (lambda (_term _action _button _row _col _mods) nil))
+                      ((symbol-function 'process-live-p) (lambda (_p) t)))
+              (ghostel--scroll-intercept-up fake-event)
+              ;; Flag must be cleared in the *ghostel* buffer — otherwise
+              ;; the next key lookup in that buffer loops.
+              (should-not (buffer-local-value
+                           'ghostel--scroll-intercept-active ghostel-buf))
+              ;; Event pushed back for the user's scroll handler.
+              (should (equal fake-event (car unread-command-events)))
+              ;; The re-enable hook lives on the ghostel buffer's
+              ;; pre-command-hook; running it there flips the flag back.
+              (with-current-buffer ghostel-buf
+                (run-hooks 'pre-command-hook))
+              (should (buffer-local-value
+                       'ghostel--scroll-intercept-active ghostel-buf)))))
+      (kill-buffer ghostel-buf)
+      (kill-buffer other-buf))))
+
+(ert-deftest ghostel-test-scroll-intercept-forwards-from-unselected-window ()
+  "Terminal mouse tracking must receive wheel events from an unselected window.
+`ghostel--forward-scroll-event' reads buffer-local `ghostel--term'
+and friends, which requires the command to run in the event's buffer
+rather than the selected window's buffer."
+  (let ((ghostel-buf (generate-new-buffer " *ghostel-test-fwd-unsel*"))
+        (other-buf (generate-new-buffer " *other-test-fwd-unsel*"))
+        (mouse-event-args nil))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((ghostel-win (split-window))
+                 (_ (set-window-buffer ghostel-win ghostel-buf))
+                 (_ (with-current-buffer ghostel-buf
+                      (setq-local ghostel--term 'fake)
+                      (setq-local ghostel--process 'fake)
+                      (setq-local ghostel--copy-mode-active nil)
+                      (setq-local ghostel--scroll-intercept-active t)))
+                 (fake-event `(wheel-up (,ghostel-win 1 (10 . 5) 0)))
+                 (unread-command-events nil))
+            (set-buffer other-buf)
+            ;; Sanity: in `other-buf' these are all nil — the bug was
+            ;; that forward-scroll read them from current-buffer.
+            (should-not ghostel--term)
+            (cl-letf (((symbol-function 'ghostel--mouse-event)
+                       (lambda (_term action button row col mods)
+                         (setq mouse-event-args
+                               (list action button row col mods))
+                         t))
+                      ((symbol-function 'process-live-p) (lambda (_p) t)))
+              (ghostel--scroll-intercept-up fake-event)
+              ;; Mouse event should have been forwarded using the
+              ;; ghostel buffer's state, not the other buffer's.
+              (should mouse-event-args)
+              (should (equal 4 (nth 1 mouse-event-args))) ; button 4
+              ;; Not re-dispatched.
+              (should-not unread-command-events))))
+      (kill-buffer ghostel-buf)
+      (kill-buffer other-buf))))
 
 (ert-deftest ghostel-test-control-key-bindings ()
   "All non-exception C-<letter> keys should be bound in ghostel-mode-map."
@@ -5141,6 +5244,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-scroll-on-input-paste
     ghostel-test-scroll-intercept-forwards-mouse-tracking
     ghostel-test-scroll-intercept-fallthrough
+    ghostel-test-scroll-intercept-unselected-window
+    ghostel-test-scroll-intercept-forwards-from-unselected-window
     ghostel-test-control-key-bindings
     ghostel-test-c-g-binding
     ghostel-test-c-g-exits-copy-mode

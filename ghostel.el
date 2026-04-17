@@ -795,8 +795,14 @@ If the terminal is tracking mouse events, forward as button 4.
 Otherwise, re-dispatch EVENT through the normal event loop so the
 user's scroll package handles it."
   (interactive "e")
-  (unless (ghostel--forward-scroll-event event 4)
-    (ghostel--redispatch-scroll-event event)))
+  ;; Wheel events on an unselected window are dispatched with
+  ;; `current-buffer' set to the selected window's buffer.  Run the
+  ;; intercept in the event's own buffer so buffer-local state
+  ;; (`ghostel--term', `ghostel--scroll-intercept-active', the
+  ;; `pre-command-hook' re-enable) lands in the ghostel buffer.
+  (with-current-buffer (window-buffer (posn-window (event-start event)))
+    (unless (ghostel--forward-scroll-event event 4)
+      (ghostel--redispatch-scroll-event event))))
 
 (defun ghostel--scroll-intercept-down (event)
   "Intercept wheel-down EVENT for terminal mouse tracking.
@@ -804,8 +810,9 @@ If the terminal is tracking mouse events, forward as button 5.
 Otherwise, re-dispatch EVENT through the normal event loop so the
 user's scroll package handles it."
   (interactive "e")
-  (unless (ghostel--forward-scroll-event event 5)
-    (ghostel--redispatch-scroll-event event)))
+  (with-current-buffer (window-buffer (posn-window (event-start event)))
+    (unless (ghostel--forward-scroll-event event 5)
+      (ghostel--redispatch-scroll-event event))))
 
 (defun ghostel--redispatch-scroll-event (event)
   "Re-dispatch scroll EVENT through the event loop without our intercept.
