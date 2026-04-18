@@ -738,6 +738,16 @@ Updated whenever the terminal is created or resized.")
 (defvar-local ghostel--force-next-redraw nil
   "When non-nil, redraw regardless of synchronized output mode.")
 
+(defvar ghostel--redraw-resize-active nil
+  "Dynamically bound to t inside a resize-triggered `ghostel--delayed-redraw'.
+Read by `ghostel--window-anchored-p' so the redraw keeps auto-following
+windows anchored even when Emacs redisplay drifted `window-start' below
+the anchor between redraws (e.g. via `keep-point-visible' when the
+minibuffer shrinks the window).  Not set for output-driven redraws,
+clear-scrollback, copy-exit, or snap-to-input — those either reset
+`ghostel--scroll-positions' or set `ghostel--snap-requested', both of
+which already produce the intended anchoring.")
+
 (defvar-local ghostel--snap-requested nil
   "When non-nil, the next redraw should anchor `window-start' to the viewport.
 Set by `ghostel--snap-to-input' on user-initiated input (typing, paste,
@@ -2642,11 +2652,18 @@ position COL columns into the first matched line."
   "Non-nil if WIN is auto-following the viewport.
 A window counts as anchored when `ghostel--snap-requested' is set
 \(the user just typed), when no anchor has been recorded yet (first
-redraw), or when its `window-start' is at or past the prior anchor."
+redraw), or when its `window-start' is at or past the prior anchor.
+During a resize-triggered redraw, a window absent from
+`ghostel--scroll-positions' also counts as anchored: the prior redraw
+left it following the viewport, so a drifted `window-start' below the
+anchor is Emacs redisplay (e.g. `keep-point-visible' when the
+minibuffer shrinks the window), not a user scroll."
   (let ((anchor ghostel--last-anchor-position))
     (or ghostel--snap-requested
         (null anchor)
-        (>= (window-start win) anchor))))
+        (>= (window-start win) anchor)
+        (and ghostel--redraw-resize-active
+             (not (assq win ghostel--scroll-positions))))))
 
 (defun ghostel--capture-window-state (win)
   "Return (WIN WS-KEY WP-KEY WP-COL) for WIN.
@@ -2806,7 +2823,12 @@ PROCESS is the shell process, WINDOWS is the list of windows."
           (when ghostel--redraw-timer
             (cancel-timer ghostel--redraw-timer)
             (setq ghostel--redraw-timer nil))
-          (ghostel--delayed-redraw buffer))))
+          ;; `ghostel--redraw-resize-active' lets `ghostel--window-anchored-p'
+          ;; treat Emacs-induced `window-start' drift (from `keep-point-visible'
+          ;; when a minibuffer-triggered resize shrinks the body) as drift,
+          ;; not as a user scroll.
+          (let ((ghostel--redraw-resize-active t))
+            (ghostel--delayed-redraw buffer)))))
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
     ;; after this function returns, matching eat/vterm timing.
     size))

@@ -3091,6 +3091,15 @@ viewport.  After the fix, the scrolled-up view is preserved."
             (set-window-start (selected-window) (point-min) t)
             (goto-char (point-min))
             (set-window-point (selected-window) (point-min))
+            ;; Real-world flow: some PTY output arrives between the
+            ;; wheel-up and `M-x', so an output-driven redraw captures
+            ;; the scrolled window into `ghostel--scroll-positions'
+            ;; before the resize fires.  Without this intermediate
+            ;; capture the resize redraw's drift heuristic would
+            ;; (correctly, by that heuristic) classify this window as
+            ;; drifted-but-anchored and snap it back.
+            (ghostel--delayed-redraw buf)
+            (should (assq (selected-window) ghostel--scroll-positions))
             (let ((ws-before (window-start (selected-window)))
                   (wp-before (window-point (selected-window))))
 
@@ -3121,6 +3130,86 @@ viewport.  After the fix, the scrolled-up view is preserved."
               ;; The user's scrolled-up view must be preserved.
               (should (= ws-before (window-start (selected-window))))
               (should (= wp-before (window-point (selected-window)))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-redraw-resize-preserves-anchor-when-emacs-drifts-ws ()
+  "Resize keeps the window anchored when Emacs drifted `window-start' below it.
+Regression test for issue #127: in TUIs whose cursor sits above the
+viewport bottom, opening the minibuffer shrinks the window body and
+Emacs's `keep-point-visible' moves `window-start' forward so the TUI
+cursor stays on screen.  The resulting `ws < anchor' looked identical
+to a real user scroll, so the force redraw captured a blank-row key,
+found it at `point-min', and jumped `window-start' to 1.
+
+With the fix, a force redraw classifies a window as anchored when it
+wasn't recorded in `ghostel--scroll-positions' at the prior redraw —
+so an Emacs-driven drift is treated as drift, not a scroll."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-anchor-drift*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t))
+            ;; Write enough blank-terminated lines that a drifted
+            ;; ws-key would ambiguously match near `point-min'.
+            (dotimes (i 30)
+              (ghostel--write-input term (format "row-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (set-window-buffer (selected-window) buf)
+            ;; Steady-state auto-follow; prior redraw seeds the anchor.
+            (goto-char (point-max))
+            (set-window-point (selected-window) (point-max))
+            (let ((vp (save-excursion
+                        (goto-char (point-max))
+                        (forward-line -9)
+                        (line-beginning-position))))
+              (set-window-start (selected-window) vp t))
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            (should ghostel--last-anchor-position)
+            (should-not ghostel--scroll-positions)
+
+            ;; Simulate Emacs drift: `keep-point-visible' on a
+            ;; minibuffer-triggered resize slides `window-start' a
+            ;; couple rows below the anchor.  Point stays in the live
+            ;; viewport (TUI cursor on a row above the bottom).
+            (let ((drifted-ws (save-excursion
+                                (goto-char ghostel--last-anchor-position)
+                                (forward-line -2)
+                                (line-beginning-position))))
+              (should (< drifted-ws ghostel--last-anchor-position))
+              (set-window-start (selected-window) drifted-ws t))
+            ;; Window is NOT in `ghostel--scroll-positions' — it was
+            ;; auto-following, not user-scrolled.
+            (should-not ghostel--scroll-positions)
+
+            ;; Resize path (same harness as the scrolled-view test).
+            (cl-letf (((default-value 'window-adjust-process-window-size-function)
+                       (lambda (&rest _) (cons 40 6)))
+                      ((symbol-function 'set-process-window-size) #'ignore))
+              (setq ghostel--process
+                    (make-pipe-process :name "ghostel-test-fake"
+                                       :buffer buf
+                                       :noquery t
+                                       :filter #'ignore
+                                       :sentinel #'ignore))
+              (unwind-protect
+                  (ghostel--window-adjust-process-window-size
+                   ghostel--process
+                   (list (selected-window)))
+                (delete-process ghostel--process)
+                (setq ghostel--process nil)))
+
+            ;; Window must be re-anchored to the live viewport, NOT
+            ;; yanked to `point-min'.
+            (should (= (ghostel--viewport-start)
+                       (window-start (selected-window))))
+            (should (> (window-start (selected-window)) 1))))
       (when (buffer-live-p orig-buf)
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
