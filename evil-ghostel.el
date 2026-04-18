@@ -80,9 +80,13 @@ placement math the native module performs in `src/render.zig'."
   "Preserve Emacs point during redraws in evil normal state.
 ORIG-FN is the advised `ghostel--redraw' called with TERM and FULL.
 Without this, the ~30fps redraw timer would snap point back to
-the terminal cursor, undoing any evil `normal-mode' navigation."
+the terminal cursor, undoing any evil `normal-mode' navigation.
+`emacs-state' is evil's vanilla-Emacs escape hatch; point should
+follow the terminal cursor there just like it does in insert-state,
+otherwise the cursor gets stuck wherever it was on state entry while
+the TUI keeps redrawing elsewhere."
   (if (and evil-ghostel-mode
-           (not (eq evil-state 'insert))
+           (not (memq evil-state '(insert emacs)))
            (not (ghostel--mode-enabled term 1049)))
       (let ((saved-point (point)))
         (funcall orig-fn term full)
@@ -117,7 +121,7 @@ Set by the `I'/`A' advice which send Home/End directly.")
     (evil-ghostel--reset-cursor-point)))
 
 (defun evil-ghostel--insert-state-entry ()
-  "Sync terminal cursor to Emacs point when entering insert state.
+  "Sync terminal cursor to Emacs point when entering `emacs-state'.
 Skipped when `evil-ghostel--sync-inhibit' is set (by I/A advice
 which already sent Ctrl-a/Ctrl-e).
 When point is on a different row from the terminal cursor, snap
@@ -336,6 +340,10 @@ state transitions."
                   #'evil-ghostel--normal-state-entry nil t)
         (add-hook 'evil-insert-state-entry-hook
                   #'evil-ghostel--insert-state-entry nil t)
+        ;; Reuse the insert-state sync when entering emacs-state — both
+        ;; states expect point to follow the terminal cursor.
+        (add-hook 'evil-emacs-state-entry-hook
+                  #'evil-ghostel--insert-state-entry nil t)
         (advice-add 'evil-insert-line :before #'evil-ghostel--before-insert-line)
         (advice-add 'evil-append-line :before #'evil-ghostel--before-append-line)
         (advice-add 'evil-delete :around #'evil-ghostel--around-delete)
@@ -352,6 +360,8 @@ state transitions."
     (remove-hook 'evil-normal-state-entry-hook
                  #'evil-ghostel--normal-state-entry t)
     (remove-hook 'evil-insert-state-entry-hook
+                 #'evil-ghostel--insert-state-entry t)
+    (remove-hook 'evil-emacs-state-entry-hook
                  #'evil-ghostel--insert-state-entry t)
     (advice-remove 'evil-insert-line #'evil-ghostel--before-insert-line)
     (advice-remove 'evil-append-line #'evil-ghostel--before-append-line)

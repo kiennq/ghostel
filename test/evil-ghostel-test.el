@@ -233,6 +233,21 @@ point in the scrollback region instead of the visible viewport."
                                     (ghostel--redraw term t))
                                   (should (= 11 (current-column)))))
 
+(ert-deftest evil-ghostel-test-redraw-moves-point-emacs-state ()
+  "Test that redraws follow terminal cursor in evil emacs-state.
+Emacs-state is evil's vanilla-Emacs escape hatch; point should track
+the terminal cursor there just like in insert-state.  Otherwise the
+cursor freezes wherever it was on state entry while TUIs keep
+redrawing elsewhere."
+  (evil-ghostel-test--with-buffer 5 40 "hello world"
+                                  (evil-emacs-state)
+                                  ;; Move point away from terminal cursor
+                                  (goto-char (point-min))
+                                  ;; Redraw — should snap point to terminal cursor (col 11)
+                                  (let ((inhibit-read-only t))
+                                    (ghostel--redraw term t))
+                                  (should (= 11 (current-column)))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: advice fires on evil-insert / evil-append
 ;; -----------------------------------------------------------------------
