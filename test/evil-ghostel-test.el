@@ -28,6 +28,11 @@ Requires the native module."
      (with-temp-buffer
        (ghostel-mode)
        (setq-local ghostel--term term)
+       ;; Production wires `ghostel--term-rows' via `ghostel--resize';
+       ;; tests that drive the module directly must set it themselves so
+       ;; viewport-aware helpers (e.g. `evil-ghostel--reset-cursor-point')
+       ;; can translate viewport rows into buffer lines.
+       (setq-local ghostel--term-rows ,rows)
        (evil-local-mode 1)
        (evil-ghostel-mode 1)
        (let ((inhibit-read-only t))
@@ -40,6 +45,12 @@ Uses mocks for native functions."
   (declare (indent 0) (debug t))
   `(with-temp-buffer
      (ghostel-mode)
+     ;; Mock tests don't go through `ghostel--resize', so
+     ;; `ghostel--term-rows' stays nil by default.  Pick a value large
+     ;; enough that the viewport covers whatever text a mock test
+     ;; `insert's — the scrollback-offset computation then collapses to
+     ;; zero and matches pre-scrollback-fix behaviour.
+     (setq-local ghostel--term-rows 100)
      (evil-local-mode 1)
      (evil-ghostel-mode 1)
      ,@body))
@@ -105,6 +116,44 @@ Uses mocks for native functions."
                                   (goto-char (point-min))
                                   (evil-ghostel--reset-cursor-point)
                                   (should (= 2 (line-number-at-pos)))))
+
+(ert-deftest evil-ghostel-test-reset-cursor-point-with-scrollback ()
+  "Regression: reset-cursor-point must anchor to the viewport, not point-min.
+`ghostel--cursor-position' returns the row within the viewport (the
+last `ghostel--term-rows' lines of the buffer).  With scrollback
+present, interpreting the row as an offset from `point-min' lands
+point in the scrollback region instead of the visible viewport."
+  (let ((term (ghostel--new 5 40 1000)))
+    ;; Overflow a 5-row viewport with 12 lines so 7 scroll off.  The
+    ;; final row ("last-11") is in the viewport; earlier rows live in
+    ;; scrollback above.
+    (dotimes (i 12)
+      (ghostel--write-input term (format "row-%02d\r\n" i)))
+    (ghostel--write-input term "last-11")
+    (with-temp-buffer
+      (ghostel-mode)
+      (setq-local ghostel--term term)
+      (setq-local ghostel--term-rows 5)
+      (evil-local-mode 1)
+      (evil-ghostel-mode 1)
+      (let ((inhibit-read-only t))
+        (ghostel--redraw term t))
+      ;; Walk point back into the scrollback region.
+      (goto-char (point-min))
+      (should (string-match-p "row-00" (buffer-substring-no-properties
+                                         (line-beginning-position)
+                                         (line-end-position))))
+      ;; Reset must snap point into the viewport, not to scrollback row N.
+      (evil-ghostel--reset-cursor-point)
+      ;; The landing line is the one that contains the terminal cursor —
+      ;; "last-11" (the last written row before the trailing cursor).
+      (let ((line-text (buffer-substring-no-properties
+                        (line-beginning-position)
+                        (line-end-position))))
+        (should (string-match-p "last-11" line-text)))
+      ;; And the landing column matches the terminal cursor column.
+      (should (= (car (ghostel--cursor-position term))
+                 (current-column))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: cursor-to-point (arrow key sending)

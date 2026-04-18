@@ -43,13 +43,19 @@
 ;; ---------------------------------------------------------------------------
 
 (defun evil-ghostel--reset-cursor-point ()
-  "Move Emacs point to the terminal cursor position."
-  (when ghostel--term
+  "Move Emacs point to the terminal cursor position.
+`ghostel--cursor-position' returns row relative to the viewport
+(the last `ghostel--term-rows' lines of the buffer), so the row
+must be offset by the scrollback line count.  Mirrors the
+placement math the native module performs in `src/render.zig'."
+  (when (and ghostel--term ghostel--term-rows)
     (let ((pos (ghostel--cursor-position ghostel--term)))
       (when pos
-        (goto-char (point-min))
-        (forward-line (cdr pos))
-        (move-to-column (car pos))))))
+        (let ((scrollback (max 0 (- (line-number-at-pos (point-max))
+                                    ghostel--term-rows))))
+          (goto-char (point-min))
+          (forward-line (+ scrollback (cdr pos)))
+          (move-to-column (car pos)))))))
 
 (defun evil-ghostel--cursor-to-point ()
   "Move the terminal cursor to Emacs point by sending arrow keys."
