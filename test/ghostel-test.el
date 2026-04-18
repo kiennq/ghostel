@@ -4361,7 +4361,7 @@ hand nil to the native module."
                    ;; Return a fake timer but call function for test
                    'fake-timer)))
         (setq ghostel--process 'fake)
-        (ghostel--send-key "a")
+        (ghostel--send-string "a")
         ;; Should be buffered, not sent
         (should (equal ghostel--input-buffer '("a")))
         (should-not sent)))))
@@ -4379,7 +4379,7 @@ hand nil to the native module."
                 ((symbol-function 'process-send-string)
                  (lambda (_proc str) (push str sent))))
         (setq ghostel--process 'fake)
-        (ghostel--send-key "a")
+        (ghostel--send-string "a")
         (should (member "a" sent))
         (should-not ghostel--input-buffer)))))
 
@@ -4447,7 +4447,7 @@ redraw and produce visible flicker, so point is left alone."
         (sent-key nil))
     (cl-letf (((symbol-function 'ghostel--scroll-bottom)
                (lambda (_term) (setq scroll-bottom-called t)))
-              ((symbol-function 'ghostel--send-key)
+              ((symbol-function 'ghostel--send-string)
                (lambda (str) (setq sent-key str))))
       (with-temp-buffer
         (insert "scrollback\nscrollback\nscrollback\n")
@@ -4488,7 +4488,7 @@ redraw and produce visible flicker, so point is left alone."
         (scroll-bottom-called nil))
     (cl-letf (((symbol-function 'ghostel--scroll-bottom)
                (lambda (_term) (setq scroll-bottom-called t)))
-              ((symbol-function 'ghostel--send-key)
+              ((symbol-function 'ghostel--send-string)
                (lambda (_str) nil)))
       (with-temp-buffer
         (insert "scrollback\nscrollback\nscrollback\n")
@@ -4796,7 +4796,7 @@ rather than the selected window's buffer."
 (ert-deftest ghostel-test-send-next-key-control-x ()
   "Send-next-key sends the prefix key as raw byte 24 (not intercepted by Emacs)."
   (let (sent-key)
-    (cl-letf (((symbol-function 'ghostel--send-key)
+    (cl-letf (((symbol-function 'ghostel--send-string)
                (lambda (str) (setq sent-key str))))
       (let ((unread-command-events (list ?\C-x)))
         (ghostel-send-next-key))
@@ -4805,7 +4805,7 @@ rather than the selected window's buffer."
 (ert-deftest ghostel-test-send-next-key-control-h ()
   "Send-next-key sends the help key as raw byte 8."
   (let (sent-key)
-    (cl-letf (((symbol-function 'ghostel--send-key)
+    (cl-letf (((symbol-function 'ghostel--send-string)
                (lambda (str) (setq sent-key str))))
       (let ((unread-command-events (list ?\C-h)))
         (ghostel-send-next-key))
@@ -4814,7 +4814,7 @@ rather than the selected window's buffer."
 (ert-deftest ghostel-test-send-next-key-regular-char ()
   "Send-next-key sends a regular character as-is."
   (let (sent-key)
-    (cl-letf (((symbol-function 'ghostel--send-key)
+    (cl-letf (((symbol-function 'ghostel--send-string)
                (lambda (str) (setq sent-key str))))
       (let ((unread-command-events (list ?a)))
         (ghostel-send-next-key))
@@ -4843,6 +4843,63 @@ rather than the selected window's buffer."
         (ghostel-send-next-key))
       (should (equal "up" captured-key))
       (should (equal "" captured-mods)))))
+
+;; -----------------------------------------------------------------------
+;; Test: public send-string / send-key API
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-send-string-routes-to-send-string ()
+  "`ghostel-send-string' forwards its argument to `ghostel--send-string'."
+  (with-temp-buffer
+    (ghostel-mode)
+    (let (sent)
+      (cl-letf (((symbol-function 'ghostel--send-string)
+                 (lambda (str) (setq sent str))))
+        (ghostel-send-string "hello")
+        (should (equal sent "hello"))))))
+
+(ert-deftest ghostel-test-send-string-errors-outside-ghostel-buffer ()
+  "`ghostel-send-string' signals `user-error' when not in a ghostel buffer."
+  (with-temp-buffer
+    (should-error (ghostel-send-string "x") :type 'user-error)))
+
+(ert-deftest ghostel-test-send-key-routes-to-send-encoded ()
+  "`ghostel-send-key' forwards key-name and mods to `ghostel--send-encoded'."
+  (with-temp-buffer
+    (ghostel-mode)
+    (let (captured-key captured-mods)
+      (cl-letf (((symbol-function 'ghostel--send-encoded)
+                 (lambda (key mods &optional _utf8)
+                   (setq captured-key key captured-mods mods))))
+        (ghostel-send-key "return" "ctrl")
+        (should (equal captured-key "return"))
+        (should (equal captured-mods "ctrl"))))))
+
+(ert-deftest ghostel-test-send-key-nil-mods-becomes-empty-string ()
+  "`ghostel-send-key' passes an empty string when MODS is omitted."
+  (with-temp-buffer
+    (ghostel-mode)
+    (let (captured-mods)
+      (cl-letf (((symbol-function 'ghostel--send-encoded)
+                 (lambda (_key mods &optional _utf8)
+                   (setq captured-mods mods))))
+        (ghostel-send-key "up")
+        (should (equal captured-mods ""))))))
+
+(ert-deftest ghostel-test-send-key-errors-outside-ghostel-buffer ()
+  "`ghostel-send-key' signals `user-error' when not in a ghostel buffer."
+  (with-temp-buffer
+    (should-error (ghostel-send-key "a") :type 'user-error)))
+
+(ert-deftest ghostel-test-send-key-obsolete-alias-still-works ()
+  "The obsolete `ghostel--send-key' alias routes to `ghostel--send-string'.
+External packages may still call the old internal name."
+  (let (sent)
+    (cl-letf (((symbol-function 'ghostel--send-string)
+               (lambda (str) (setq sent str))))
+      (with-no-warnings
+        (ghostel--send-key "payload"))
+      (should (equal sent "payload")))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: TRAMP integration
@@ -5342,6 +5399,12 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-send-next-key-regular-char
     ghostel-test-send-next-key-meta-x
     ghostel-test-send-next-key-function-key
+    ghostel-test-send-string-routes-to-send-string
+    ghostel-test-send-key-obsolete-alias-still-works
+    ghostel-test-send-string-errors-outside-ghostel-buffer
+    ghostel-test-send-key-routes-to-send-encoded
+    ghostel-test-send-key-nil-mods-becomes-empty-string
+    ghostel-test-send-key-errors-outside-ghostel-buffer
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local

@@ -52,7 +52,7 @@ Logs filter calls, key sends, resize events, redraw decisions
     (insert "=== Ghostel Debug Log ===\n\n"))
   ;; Data path
   (advice-add 'ghostel--filter :before #'ghostel-debug--log-filter)
-  (advice-add 'ghostel--send-key :before #'ghostel-debug--log-send)
+  (advice-add 'ghostel--send-string :before #'ghostel-debug--log-send)
   (advice-add 'ghostel--send-encoded :before #'ghostel-debug--log-encoded)
   ;; Render path
   (advice-add 'ghostel--delayed-redraw :around #'ghostel-debug--log-redraw)
@@ -66,7 +66,7 @@ Logs filter calls, key sends, resize events, redraw decisions
   "Stop logging."
   (interactive)
   (advice-remove 'ghostel--filter #'ghostel-debug--log-filter)
-  (advice-remove 'ghostel--send-key #'ghostel-debug--log-send)
+  (advice-remove 'ghostel--send-string #'ghostel-debug--log-send)
   (advice-remove 'ghostel--send-encoded #'ghostel-debug--log-encoded)
   (advice-remove 'ghostel--delayed-redraw #'ghostel-debug--log-redraw)
   (advice-remove 'ghostel--window-adjust-process-window-size
@@ -239,7 +239,7 @@ The latency breakdown shows:
       (erase-buffer)
       (insert "=== Ghostel Typing Latency Measurement ===\n")
       (insert (format "Type %d characters to collect measurements...\n\n" n)))
-    (advice-add 'ghostel--send-key :before #'ghostel-debug--latency-on-send)
+    (advice-add 'ghostel--send-string :before #'ghostel-debug--latency-on-send)
     (advice-add 'ghostel--filter :before #'ghostel-debug--latency-on-echo)
     (advice-add 'ghostel--delayed-redraw :after #'ghostel-debug--latency-on-render)
     (message "ghostel-debug: type %d characters to measure latency" n)))
@@ -275,7 +275,7 @@ The latency breakdown shows:
 
 (defun ghostel-debug--latency-report ()
   "Generate and display the latency report."
-  (advice-remove 'ghostel--send-key #'ghostel-debug--latency-on-send)
+  (advice-remove 'ghostel--send-string #'ghostel-debug--latency-on-send)
   (advice-remove 'ghostel--filter #'ghostel-debug--latency-on-echo)
   (advice-remove 'ghostel--delayed-redraw #'ghostel-debug--latency-on-render)
   (setq ghostel-debug--latency-active nil)

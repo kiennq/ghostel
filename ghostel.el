@@ -151,7 +151,7 @@ Set to 0 to disable immediate redraws."
 
 (defcustom ghostel-immediate-redraw-interval 0.05
   "Maximum seconds since last keystroke for immediate redraw.
-Output arriving within this interval of a `ghostel--send-key'
+Output arriving within this interval of a `ghostel--send-string'
 call is considered interactive echo and redrawn immediately
 when the output size is below `ghostel-immediate-redraw-threshold'."
   :type 'number)
@@ -784,7 +784,7 @@ pixel-based trailing-space compensation is needed.")
 
 
 (defvar-local ghostel--last-send-time nil
-  "Time of the last `ghostel--send-key' call, for immediate-redraw detection.")
+  "Time of the last `ghostel--send-string' call, for immediate-redraw detection.")
 
 (defvar-local ghostel--input-buffer nil
   "Accumulated keystrokes waiting to be flushed to the PTY.")
@@ -917,7 +917,7 @@ is non-nil.")
             (define-key map (kbd key-str)
                         (let ((code (- c 96)))
                           (lambda () (interactive)
-                            (ghostel--send-key (string code)))))))))
+                            (ghostel--send-string (string code)))))))))
     ;; Meta keys — bind all M-<letter> so they reach the terminal
     ;; instead of running Emacs commands like forward-word.
     (dolist (c (number-sequence ?a ?z))
@@ -926,7 +926,7 @@ is non-nil.")
           (define-key map (kbd key-str) #'ghostel--send-event))))
     ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
     (define-key map (kbd "C-@")
-                (lambda () (interactive) (ghostel--send-key "\x00")))
+                (lambda () (interactive) (ghostel--send-string "\x00")))
     ;; C-y: yank from Emacs kill ring into the terminal
     (define-key map (kbd "C-y")       #'ghostel-yank)
     (when (eq system-type 'darwin)
@@ -978,13 +978,13 @@ of waiting for a continuation keystroke."
     (cond
      ;; Control character (C-@=0, C-a=1 through C-_=31)
      ((and (integerp event) (<= event 31))
-      (ghostel--send-key (string event)))
+      (ghostel--send-string (string event)))
      ;; ASCII (32-127)
      ((and (integerp event) (<= event 127))
-      (ghostel--send-key (string event)))
+      (ghostel--send-string (string event)))
      ;; Non-ASCII character without modifier bits — send as UTF-8
      ((and (integerp event) (< event #x400000))
-      (ghostel--send-key (encode-coding-string (string event) 'utf-8)))
+      (ghostel--send-string (encode-coding-string (string event) 'utf-8)))
      ;; Modified key (M-x, C-M-a, etc.) or function key — use encoder
      (t
       (let* ((base (event-basic-type event))
@@ -1015,17 +1015,17 @@ of waiting for a continuation keystroke."
             (ghostel--send-encoded key-name mod-str)
           (message "ghostel: unrecognized key %S" event)))))))
 
-(defun ghostel--send-key (key)
-  "Send KEY string to the terminal process.
+(defun ghostel--send-string (string)
+  "Send STRING as raw bytes to the terminal process.
 Records the send time for immediate-redraw detection and optionally
 coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
   (when (and ghostel--process (process-live-p ghostel--process))
     (setq ghostel--last-send-time (current-time))
     (if (and (> ghostel-input-coalesce-delay 0)
-             (= (length key) 1))
+             (= (length string) 1))
         ;; Coalesce single-char keystrokes
         (progn
-          (push key ghostel--input-buffer)
+          (push string ghostel--input-buffer)
           (unless ghostel--input-timer
             (setq ghostel--input-timer
                   (run-with-timer ghostel-input-coalesce-delay nil
@@ -1039,7 +1039,10 @@ coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
           (process-send-string ghostel--process
                                (apply #'concat (nreverse ghostel--input-buffer)))
           (setq ghostel--input-buffer nil)))
-      (process-send-string ghostel--process key))))
+      (process-send-string ghostel--process string))))
+
+(define-obsolete-function-alias 'ghostel--send-key
+  #'ghostel--send-string "0.16.0")
 
 (defun ghostel--flush-input (buffer)
   "Flush coalesced input in BUFFER to the PTY."
@@ -1064,7 +1067,7 @@ Falls back to raw escape sequences if the encoder doesn't produce output."
         ;; immediate-redraw detection (ghostel--flush-output doesn't do this).
         (setq ghostel--last-send-time (current-time))
       (let ((seq (ghostel--raw-key-sequence key-name mods)))
-        (when seq (ghostel--send-key seq))))))
+        (when seq (ghostel--send-string seq))))))
 
 (defun ghostel--raw-key-sequence (key-name mods)
   "Build a raw escape sequence for KEY-NAME with MODS.
@@ -1157,7 +1160,7 @@ paste, yank, drop."
          (str (if (and (characterp char) (< char 128))
                   (string char)
                 (encode-coding-string (string char) 'utf-8))))
-    (ghostel--send-key str)))
+    (ghostel--send-string str)))
 
 (defun ghostel--send-event ()
   "Send the current key event to the terminal via the key encoder.
@@ -1200,6 +1203,30 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
       (ghostel--send-encoded key-name mod-str))))
 
 
+;;; Public input API
+
+(defun ghostel-send-string (string)
+  "Send STRING to the terminal process in the current ghostel buffer.
+Signals a `user-error' when called outside a ghostel buffer.  STRING
+is passed through unchanged, including any embedded control
+characters; callers are responsible for UTF-8 encoding if needed."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--send-string string))
+
+(defun ghostel-send-key (key-name &optional mods)
+  "Send KEY-NAME with optional MODS to the terminal's key encoder.
+KEY-NAME is a string like \"a\", \"return\", or \"up\".  MODS is a
+comma-separated modifier string like \"ctrl\" or \"shift,ctrl\", or
+nil for no modifiers.  The encoder respects the terminal's current
+mode (application cursor keys, Kitty keyboard protocol, etc.).
+
+Signals a `user-error' when called outside a ghostel buffer."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--send-encoded key-name (or mods "")))
+
+
 ;;; Terminal control commands (C-c prefix)
 
 (defun ghostel-send-C-c ()
@@ -1215,7 +1242,7 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
 (defun ghostel-send-C-backslash ()
   "Send C-\\ (quit) to the terminal."
   (interactive)
-  (ghostel--send-key "\x1c"))
+  (ghostel--send-string "\x1c"))
 
 (defun ghostel-send-C-d ()
   "Send EOF to the terminal."
@@ -1228,7 +1255,7 @@ Clears `quit-flag' which Emacs sets when \\`C-g' is pressed with
 `inhibit-quit' non-nil."
   (interactive)
   (setq quit-flag nil)
-  (ghostel--send-key (string 7)))
+  (ghostel--send-string (string 7)))
 
 
 ;;; Paste / yank
@@ -1305,7 +1332,7 @@ pasted using bracketed paste."
         (let ((type (car arg))
               (objects (cddr arg)))
           (if (eq type 'file)
-              (ghostel--send-key
+              (ghostel--send-string
                (mapconcat #'shell-quote-argument objects " "))
             (ghostel--paste-text
              (mapconcat #'identity objects "\n"))))))))

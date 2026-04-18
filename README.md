@@ -455,6 +455,23 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-download-module`  | Download pre-built native module             |
 | `M-x ghostel-module-compile`   | Compile native module from source            |
 
+### Sending input from Lisp
+
+For packages that need to inject input into a running ghostel buffer
+(agent integrations, custom keymaps, Swerty-style bindings, …) two
+public functions are provided:
+
+```elisp
+(ghostel-send-string "ls -la\n")      ; send raw bytes, newline included
+(ghostel-send-key "return")           ; send a named key through the encoder
+(ghostel-send-key "a" "ctrl")         ; C-a — respects the current terminal mode
+(ghostel-send-key "up" "shift,ctrl")  ; modifiers are comma-separated
+```
+
+Both operate on the current buffer; wrap in `with-current-buffer`
+when driving another ghostel buffer.  Calling either outside a
+ghostel buffer signals a `user-error`.
+
 ### Project integration
 
 `ghostel-project` opens a terminal in the current project's root directory
