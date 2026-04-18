@@ -45,7 +45,7 @@
 (defun evil-ghostel--reset-cursor-point ()
   "Move Emacs point to the terminal cursor position.
 `ghostel--cursor-position' returns row relative to the viewport
-(the last `ghostel--term-rows' lines of the buffer), so the row
+\(the last `ghostel--term-rows' lines of the buffer), so the row
 must be offset by the scrollback line count.  Mirrors the
 placement math the native module performs in `src/render.zig'."
   (when (and ghostel--term ghostel--term-rows)

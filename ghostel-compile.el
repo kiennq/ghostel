@@ -171,7 +171,15 @@ to a ghostel terminal."
   (setq-local next-error-function #'compilation-next-error-function)
   ;; Make sure point lands at the top after a successful recompile (and
   ;; that future input doesn't inherit ghostel's terminal-style behaviour).
-  (setq-local window-point-insertion-type nil))
+  (setq-local window-point-insertion-type nil)
+  ;; The buffer text inherited from the ghostel run carries per-cell `face'
+  ;; text-properties written by the native module.  `compilation-mode'
+  ;; installs font-lock keywords for error highlighting, and the default
+  ;; unfontify function strips every `face' prop — wiping the colour from
+  ;; the recorded output on the first JIT-lock pass.  Neutralise unfontify:
+  ;; compilation-mode's keywords are applied once via `font-lock-ensure'
+  ;; on a finalised, static buffer and don't need to be cleaned up.
+  (setq-local font-lock-unfontify-region-function #'ignore))
 
 (defun ghostel-compile--format-duration (seconds)
   "Format SECONDS (float) as a compilation-style duration string.

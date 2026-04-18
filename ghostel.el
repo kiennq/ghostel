@@ -2819,6 +2819,14 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   "Major mode for Ghostel terminal emulator."
   (buffer-disable-undo)
   (font-lock-mode -1)
+  ;; `font-lock-mode' can still be re-enabled by user configuration that
+  ;; forces `font-lock-defaults' globally (e.g. Doom Emacs).  When active,
+  ;; JIT-lock calls `font-lock-unfontify-region' on every redraw, which
+  ;; strips the per-cell `face' text-properties the native module writes.
+  ;; Neutralise the unfontify pass so face props survive regardless of
+  ;; whether font-lock ends up on.  `ghostel-mode' has no keywords, so
+  ;; skipping unfontify has no other effect.
+  (setq-local font-lock-unfontify-region-function #'ignore)
   (setq buffer-read-only nil)
   (setq-local scroll-margin 0)
   (setq-local auto-hscroll-mode nil)

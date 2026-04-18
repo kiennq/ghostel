@@ -519,6 +519,54 @@ scrolling libghostty's viewport."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: per-cell face props survive font-lock activation
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-face-props-survive-font-lock ()
+  "Regression: per-cell face text-properties must survive a font-lock pass.
+User configs that force `font-lock-defaults' on (notably Doom Emacs,
+which sets `(nil t)' globally) cause `font-lock-mode' to activate in
+ghostel buffers despite the mode body disabling it.  JIT-lock's
+fontify pass then calls `font-lock-unfontify-region' which, without
+the buffer-local override installed by `ghostel-mode', strips every
+`face' property the native module wrote."
+  (let ((buf (generate-new-buffer " *ghostel-test-fl*")))
+    (unwind-protect
+        (with-current-buffer buf
+          ;; Activate `ghostel-mode' so the fix under test (buffer-local
+          ;; `font-lock-unfontify-region-function' override) is installed.
+          (ghostel-mode)
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (setq-local ghostel--term term)
+            ;; Known palette so the red SGR resolves predictably.
+            (let ((rest (apply #'concat (make-list 14 "#000000"))))
+              (ghostel--set-palette term
+                                    (concat "#000000" "#ff0000" rest
+                                            "#ffffff" "#000000")))
+            (ghostel--write-input term "\e[31mRED\e[0m normal")
+            (ghostel--redraw term t)
+            (goto-char (point-min))
+            (let ((face-before (get-text-property (point) 'face)))
+              (should face-before)
+              (should (plist-get face-before :foreground))
+              ;; Simulate a user config that force-enables font-lock.
+              ;; Without the buffer-local unfontify override installed
+              ;; by `ghostel-mode', the fontify pass would strip face
+              ;; props across the buffer.
+              (setq-local font-lock-defaults '(nil t))
+              (font-lock-mode 1)
+              (font-lock-ensure (point-min) (point-max))
+              ;; Face property for the coloured cell must still be there.
+              (goto-char (point-min))
+              (let ((face-after (get-text-property (point) 'face)))
+                (should face-after)
+                (should (plist-get face-after :foreground))
+                (should (equal (plist-get face-before :foreground)
+                               (plist-get face-after :foreground)))))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: multi-byte character rendering (box drawing, Unicode)
 ;; -----------------------------------------------------------------------
 
@@ -1905,6 +1953,30 @@ Downstream consumers (notably `ghostel-compile') depend on it."
               (setq found t)))
           (forward-char 1)))
       (should found))))
+
+(ert-deftest ghostel-test-compile-finalize-preserves-face-props ()
+  "Regression: per-cell `face' text-properties baked in during the ghostel
+run must survive the transition to `ghostel-compile-view-mode'.
+`compilation-mode' installs font-lock keywords for error highlighting,
+and the default `font-lock-unfontify-region-function' strips every
+`face' property — wiping the colour of the recorded output on the first
+JIT-lock pass.  `ghostel-compile-view-mode' installs a buffer-local
+`#'ignore' override to preserve those props."
+  (ghostel-test--with-compile-buffer buf
+    (let ((inhibit-read-only t))
+      (setq ghostel-compile--command "make"
+            ghostel-compile--start-time (current-time)
+            ghostel-compile--scan-marker (copy-marker (point-max)))
+      (insert (propertize "RED" 'face '(:foreground "#ff0000")))
+      (insert " output\n/tmp/x.c:42:5: error: bad\n"))
+    (ghostel-compile--finalize buf 1 (current-time))
+    (font-lock-ensure (point-min) (point-max))
+    ;; The ghostel-painted face on "RED" must still be present.
+    (goto-char (point-min))
+    (re-search-forward "RED")
+    (let ((face (get-text-property (match-beginning 0) 'face)))
+      (should face)
+      (should (equal "#ff0000" (plist-get face :foreground))))))
 
 (ert-deftest ghostel-test-compile-finalize-does-not-double-count-errors ()
   "Regression: parsing must not count each error twice.
@@ -5424,6 +5496,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-finalize-footer-on-failure
     ghostel-test-compile-finalize-trims-trailing-blank-rows
     ghostel-test-compile-finalize-colors-errors
+    ghostel-test-compile-finalize-preserves-face-props
     ghostel-test-compile-finalize-does-not-double-count-errors
     ghostel-test-compile-finalize-does-not-kill-buffer
     ghostel-test-compile-view-mode-n-p-navigate-without-opening
