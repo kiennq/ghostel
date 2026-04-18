@@ -13,27 +13,30 @@
 ;; that detect a terminal (progress bars, colours, curses tools)
 ;; behave as they would in an interactive shell.
 ;;
+;; Each `ghostel-compile' invocation spawns a fresh process via
+;; `shell-file-name -c COMMAND' through a PTY owned by the ghostel
+;; renderer — no interactive shell sits between the command and the
+;; user.  Multi-line scripts are passed verbatim to the shell.  No
+;; OSC 133 / shell integration is required; completion is detected
+;; by the process sentinel, which delivers the real exit status.
+;;
 ;; The buffer mimics `compilation-mode': a "Compilation started at"
-;; header, a "Compilation finished at ..., duration ..." footer (with
-;; the same plain-text format and duration formula `M-x compile'
-;; uses), and surrounding shell prompts are hidden so only the
-;; command's own output is visible.  `mode-line-process' reflects
-;; run/exit state with the same faces `M-x compile' uses.
+;; header, a "Compilation finished at ..., duration ..." footer, and
+;; the same `mode-line-process' run/exit faces.
 ;;
-;; When the command finishes, the live shell and ghostel renderer are
-;; torn down and the buffer's major mode is switched to
-;; `ghostel-compile-view-mode' (derived from `compilation-mode').  At
-;; that point the buffer is a regular, read-only Emacs buffer with
-;; standard error highlighting and `next-error' navigation.  It will
-;; not return to an interactive ghostel terminal — a recompile (`g',
-;; `M-x ghostel-recompile') discards it and starts fresh in the
-;; original `default-directory'.
+;; When the command finishes, the renderer is torn down and the
+;; buffer's major mode is switched to `ghostel-compile-view-mode'
+;; (derived from `compilation-mode').  At that point the buffer is a
+;; regular, read-only Emacs buffer with standard error highlighting
+;; and `next-error' navigation.  It will not return to an interactive
+;; ghostel terminal — a recompile (`g', `M-x ghostel-recompile')
+;; discards it and starts fresh in the original `default-directory'.
 ;;
-;; Completion is detected via the OSC 133 D semantic prompt marker,
-;; so shell integration (`ghostel-shell-integration') must be
-;; enabled — bundled bash, zsh and fish scripts emit those markers
-;; automatically.  `ghostel-compile-debug' logs every OSC 133 C/D
-;; event and the finalize call to *Messages* for diagnostics.
+;; Enable `ghostel-compile-global-mode' to route *all* `compile',
+;; `recompile', `project-compile', ... calls through ghostel.  It
+;; advises `compilation-start' so every caller benefits without any
+;; further configuration.  `grep-mode' (and comint mode) falls through
+;; to the stock implementation.
 ;;
 ;; Standard `compile' options honoured:
 ;;   `compile-command' / `compile-history' (shared with \\[compile])
@@ -55,7 +58,9 @@
 (require 'ghostel)
 (require 'compile)
 
-
+(declare-function ghostel--cursor-position "ghostel-module" (term))
+
+
 ;;; Customization
 
 (defgroup ghostel-compile nil
@@ -75,30 +80,15 @@ navigation and colored error text.
 
 Set to nil to skip the major-mode switch and leave the buffer in
 `ghostel-mode'.  Either way, finalization always tears down the live
-shell and ghostel rendering — the buffer never returns to an
+process and ghostel rendering — the buffer never returns to an
 interactive terminal."
   :type '(choice (const :tag "Compilation view (default)" ghostel-compile-view-mode)
                  (const :tag "Don't switch" nil)
                  (function :tag "Custom major mode")))
 
-(defcustom ghostel-compile-hide-prompts t
-  "When non-nil, hide OSC 133 prompt regions inside the scan range.
-The command echo line and the trailing prompt printed by the shell
-are marked invisible so only the command's own output is shown,
-similar to `M-x compile'."
-  :type 'boolean)
-
-(defcustom ghostel-compile-clear-buffer t
-  "When non-nil, clear the buffer (screen and scrollback) before each run.
-Mirrors `M-x compile's behaviour of starting each compilation with a
-fresh buffer.  Set to nil to keep previous runs visible above the
-new one."
-  :type 'boolean)
-
 (defcustom ghostel-compile-debug nil
-  "When non-nil, log OSC 133 C/D events from `ghostel-compile' to *Messages*.
-Useful for diagnosing wrong exit codes, missed events, or shell
-integration mismatches."
+  "When non-nil, log `ghostel-compile' lifecycle events to *Messages*.
+Useful for diagnosing wrong exit codes or missed events."
   :type 'boolean)
 
 (defcustom ghostel-compile-finish-functions nil
@@ -111,7 +101,7 @@ status message string (e.g. \"finished\\n\" or
 `compilation-finish-functions' is also run with the same arguments."
   :type 'hook)
 
-
+
 ;;; Internal variables
 
 (defvar-local ghostel-compile--command nil
@@ -131,39 +121,19 @@ status message string (e.g. \"finished\\n\" or
 Used by `ghostel-recompile' so the command re-runs in the same
 directory regardless of where the user is when they press `g'.")
 
-(defvar-local ghostel-compile--running nil
-  "State of the in-flight `ghostel-compile' command.
-- nil      : no command in flight (or finalize already ran)
-- `pending': command was sent, but no OSC 133 C marker seen yet
-- `armed'  : C marker seen; the next D marker will trigger finalize
-- `fired'  : a D was accepted, finalize is scheduled; later Ds ignored")
+(defvar-local ghostel-compile--finalized nil
+  "Non-nil once the sentinel has finalized this run.
+Second-chance guard: if the sentinel fires twice (process exit
+followed by teardown) we only run the heavy finalize path once.")
 
-(defvar-local ghostel-compile--header-marker nil
-  "Marker at the end of the inserted compilation header.")
-
-(defvar-local ghostel-compile--footer-marker nil
-  "Marker at the start of the inserted compilation footer.")
-
-(defvar-local ghostel-compile--finalize-timer nil
-  "Pending finalize timer scheduled by `ghostel-compile--on-finish'.
-Set when the first D marker after C is accepted; subsequent D
-markers within the deferred window are ignored (first-D-wins) so
-the real command's exit isn't overwritten by a follow-up prompt's
-D;0.  Cleared by `ghostel-compile--finalize' once it actually
-runs, or by `ghostel-compile-mode' on disable.")
-
-(defvar-local ghostel-compile--owns-compilation-minor-mode nil
-  "Non-nil if `ghostel-compile-mode' enabled `compilation-minor-mode'.
-Tracked so disabling our mode only turns off `compilation-minor-mode'
-when we were the ones who turned it on — never when the user (or
-some other minor mode) had it enabled independently.")
-
-(defvar ghostel-compile-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "g") #'ghostel-recompile)
-    map)
-  "Keymap for `ghostel-compile-mode'.
-Shadows `compilation-minor-mode-map' bindings that clash.")
+(defvar-local ghostel-compile--view-mode-override nil
+  "Buffer-local override for `ghostel-compile-finished-major-mode'.
+Set by the `compilation-start' advice when a caller passes a
+compile-mode subclass (e.g. a custom grep-mode-like mode) so that
+error-regexp and font-lock customisations the subclass installs
+survive into the `ghostel-compile-view-mode' buffer after finalize.
+Nil means finalize falls back to the global
+`ghostel-compile-finished-major-mode'.")
 
 (defvar ghostel-compile-view-mode-map
   (let ((map (make-sparse-keymap)))
@@ -181,15 +151,16 @@ just move point through errors without opening the source file
 in another window.  `g' runs `ghostel-recompile' instead of
 `recompile'.  RET still opens the error like in `compilation-mode'.")
 
-
-;;; Helper functions
+
+;;; Helpers
+
 (define-derived-mode ghostel-compile-view-mode
   compilation-mode "Compilation"
   "Major mode for a finished `ghostel-compile' buffer.
 
 A regular, read-only Emacs buffer.  `g' re-runs the command via
 `ghostel-recompile', `n'/`p' walk errors in the buffer (without
-opening files), RET jumps to the source.  The live shell and
+opening files), RET jumps to the source.  The live process and
 ghostel rendering have been torn down; the buffer will not return
 to a ghostel terminal."
   :group 'ghostel-compile
@@ -217,57 +188,14 @@ Matches the format used by `M-x compile'."
    ((numberp exit) (format "exited abnormally with code %d\n" exit))
    (t              "finished\n")))
 
-(defun ghostel-compile--hide-prompts (start end)
-  "Hide OSC 133 prompt regions and echoed command lines in START..END.
-A buffer line is marked invisible (together with its trailing
-newline) when either condition holds:
-
-1. Any character on the line carries the `ghostel-prompt' text
-   property — the OSC 133 A..B prompt region rendered by the
-   native renderer.
-
-2. The line ends with `ghostel-compile--command' — the shell's
-   PTY-echo of what we typed.  The native renderer applies
-   `ghostel-prompt' only to the prompt glyph itself (A..B), not
-   to the echoed command that follows on the same row, so without
-   this second check the user would see the header's command
-   followed by a duplicated `~/dir λ <cmd>' line right below it."
-  (save-excursion
-    (let ((cmd ghostel-compile--command))
-      (goto-char start)
-      (while (< (point) end)
-        (let* ((bol (line-beginning-position))
-               (eol (min end (line-end-position)))
-               (hide (or
-                      ;; 1. Prompt property anywhere on this line?
-                      (text-property-not-all bol eol
-                                             'ghostel-prompt nil)
-                      ;; 2. Line ends with the echoed command?
-                      (and cmd (not (string-empty-p cmd))
-                           (let ((tail-start
-                                  (max bol (- eol (length cmd)))))
-                             (string= cmd
-                                      (buffer-substring-no-properties
-                                       tail-start eol)))))))
-          (when hide
-            (add-text-properties bol eol '(invisible t))
-            (when (and (< eol end) (eq (char-after eol) ?\n))
-              (add-text-properties eol (1+ eol) '(invisible t)))))
-        (forward-line 1)))))
-
-(defun ghostel-compile--clear-markers ()
-  "Reset header/footer markers."
-  (when (markerp ghostel-compile--header-marker)
-    (set-marker ghostel-compile--header-marker nil))
-  (when (markerp ghostel-compile--footer-marker)
-    (set-marker ghostel-compile--footer-marker nil))
-  (setq ghostel-compile--header-marker nil
-        ghostel-compile--footer-marker nil))
-
 (defun ghostel-compile--header-text (command start-time)
   "Return the header string for COMMAND started at START-TIME.
-Plain text, matching the `M-x compile' header format."
-  (format "-*- mode: ghostel-compile -*-\nCompilation started at %s\n\n%s\n"
+Plain text, matching the `M-x compile' header format — including
+the `default-directory' file-local spec, so reloading the buffer
+restores its compilation directory."
+  (format "-*- mode: ghostel-compile; default-directory: %s -*-\n\
+Compilation started at %s\n\n%s\n"
+          (prin1-to-string (abbreviate-file-name default-directory))
           (substring (current-time-string start-time) 0 19)
           command))
 
@@ -312,11 +240,10 @@ Plain text, matching the `M-x compile' footer format."
           (error nil))))))
 
 (defun ghostel-compile--teardown-terminal ()
-  "Tear down the live shell and ghostel renderer in the current buffer.
+  "Tear down the live process and ghostel renderer in the current buffer.
 Replaces the sentinel and filter with no-ops before deleting the
-process.  Passing nil to `set-process-sentinel' restores the
-*default* sentinel, which writes \"Process NAME killed: N\" into
-the process buffer — exactly what we don't want."
+process so the default sentinel can't write \"Process NAME killed\"
+into our buffer."
   (when (and (bound-and-true-p ghostel--process)
              (process-live-p ghostel--process))
     (set-process-sentinel ghostel--process #'ignore)
@@ -347,9 +274,29 @@ separator line — matching `M-x compile's output format."
       (delete-region (point) (point-max))
       (insert "\n"))))
 
+(defun ghostel-compile--render-header-live (header)
+  "Feed HEADER to the ghostel terminal and commit the render synchronously.
+The buffer-side effect is that HEADER becomes part of the terminal
+scrollback immediately — the user sees the compilation banner while
+the command is running, matching `M-x compile's behaviour.
+
+Newlines in HEADER are rewritten as CRLF so the VT parser returns
+to column 0 at the start of each line; a bare LF only advances the
+cursor one row and would stack the lines diagonally."
+  (when (and ghostel--term (> (length header) 0))
+    (let ((crlf (replace-regexp-in-string "\n" "\r\n" header t t)))
+      (ghostel--write-input ghostel--term crlf))
+    (when ghostel--redraw-timer
+      (cancel-timer ghostel--redraw-timer)
+      (setq ghostel--redraw-timer nil))
+    (ghostel--delayed-redraw (current-buffer))))
+
 (defun ghostel-compile--finalize (buffer exit end-time)
-  "Insert header/footer, hide prompts, parse errors for BUFFER.
+  "Insert header/footer, parse errors, switch major mode for BUFFER.
 EXIT is the command exit status; END-TIME its completion time.
+Safe to call more than once — second and later calls are no-ops
+thanks to `ghostel-compile--finalized'.
+
 Switches the buffer's major mode to
 `ghostel-compile-finished-major-mode' (by default
 `ghostel-compile-view-mode') so the buffer becomes a regular,
@@ -361,240 +308,338 @@ Header and footer are inserted as plain buffer text (matching
 same as in any compilation buffer."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (let* ((start (and ghostel-compile--scan-marker
-                         (marker-position ghostel-compile--scan-marker)))
-             (start-time ghostel-compile--start-time)
-             (command ghostel-compile--command)
-             (directory ghostel-compile--directory)
-             (header (ghostel-compile--header-text command start-time))
-             (footer (ghostel-compile--footer-text exit start-time end-time))
-             (inhibit-read-only t))
-        (setq ghostel-compile--last-exit exit
-              ghostel-compile--running nil
-              ghostel-compile--finalize-timer nil)
-        (when ghostel-compile-debug
-          (message "ghostel-compile: finalizing exit=%S buffer=%S"
-                   exit (buffer-name buffer)))
-        (when (and start ghostel-compile-hide-prompts)
-          (ghostel-compile--hide-prompts start (point-max)))
-        ;; Strip the blank terminal-grid rows the renderer committed
-        ;; after the real output — keeps a short command's footer
-        ;; right below its output instead of 20+ rows below it.
-        (when start
-          (ghostel-compile--trim-trailing-blanks start))
-        (ghostel-compile--clear-markers)
-        (ghostel-compile--teardown-terminal)
-        ;; Switch major mode now that the shell is dead.  Preserve state
-        ;; that `kill-all-local-variables' would otherwise wipe.
-        (let ((saved-command command)
-              (saved-start-time start-time)
-              (saved-directory directory))
-          (when ghostel-compile-finished-major-mode
-            (funcall ghostel-compile-finished-major-mode))
-          (setq-local ghostel-compile--command saved-command
-                      ghostel-compile--directory saved-directory
-                      ghostel-compile--start-time saved-start-time
-                      ghostel-compile--last-exit exit)
-          ;; Pin the buffer's `default-directory' to the directory the
-          ;; user invoked `ghostel-compile' from, so it doesn't drift if
-          ;; the shell happened to `cd' elsewhere during the run.
-          (when saved-directory
-            (setq default-directory saved-directory)))
-        ;; Anchor header at the start of THIS run's output, not at
-        ;; point-min — when `ghostel-compile-clear-buffer' is nil and
-        ;; older output remains in the buffer, the header should still
-        ;; bracket the right region.  Track the resulting parse-start
-        ;; so jit-lock doesn't pick up stale matches above the run.
-        (let* ((inhibit-read-only t)
-               (header-anchor (or start (point-min)))
-               (parse-start (copy-marker header-anchor)))
-          (save-excursion
-            (goto-char header-anchor)
-            (insert header)
-            (setq ghostel-compile--header-marker (point-marker))
-            (set-marker-insertion-type ghostel-compile--header-marker nil))
-          ;; Append footer at end-of-buffer; ensure separation from output.
-          (save-excursion
-            (goto-char (point-max))
-            (unless (or (= (point) (point-min)) (bolp))
-              (insert "\n"))
-            (setq ghostel-compile--footer-marker (point-marker))
-            (set-marker-insertion-type ghostel-compile--footer-marker nil)
-            (insert footer))
-          ;; Parse only this run's output.  Seed `compilation--parsed'
-          ;; at the start of the run so `compilation--ensure-parse'
-          ;; (and any later jit-lock pass) skip everything above it —
-          ;; otherwise old output left over by `--clear-buffer nil'
-          ;; would leak into `next-error' and the error count.  Note:
-          ;; `compilation-mode' initialises `compilation--parsed' to
-          ;; -1 (not a marker), so we set the marker ourselves.
-          (save-excursion
-            (save-restriction
-              (widen)
-              (setq-local compilation--parsed (copy-marker parse-start))
-              (condition-case err
-                  (compilation--ensure-parse (point-max))
-                (error
-                 (message "ghostel-compile: error scanning output: %s"
-                          (error-message-string err)))))))
-        ;; Put point at `point-max' — past the footer — so the user
-        ;; actually sees the "Compilation finished at ..., duration ..."
-        ;; line instead of having it scroll below the window bottom.
-        ;; Recenter each window on this buffer so that line is flush
-        ;; with the bottom of the window.
-        (goto-char (point-max))
-        (dolist (win (get-buffer-window-list buffer nil t))
-          (set-window-point win (point-max))
-          (with-selected-window win (recenter -1))))
-      (ghostel-compile--set-mode-line-exit exit)
-      (setq next-error-last-buffer buffer)
-      (ghostel-compile--auto-jump buffer)
-      (let ((msg (ghostel-compile--status-message exit)))
-        (run-hook-with-args 'compilation-finish-functions buffer msg)
-        (run-hook-with-args 'ghostel-compile-finish-functions buffer msg)))))
+      (unless ghostel-compile--finalized
+        (setq ghostel-compile--finalized t)
+        (let* ((start (and ghostel-compile--scan-marker
+                           (marker-position ghostel-compile--scan-marker)))
+               (start-time ghostel-compile--start-time)
+               (command ghostel-compile--command)
+               (directory ghostel-compile--directory)
+               (footer (ghostel-compile--footer-text exit start-time end-time))
+               (inhibit-read-only t))
+          (setq ghostel-compile--last-exit exit)
+          (when ghostel-compile-debug
+            (message "ghostel-compile: finalizing exit=%S buffer=%S"
+                     exit (buffer-name buffer)))
+          (when start
+            (ghostel-compile--trim-trailing-blanks start))
+          (ghostel-compile--teardown-terminal)
+          ;; Switch major mode now that the process is dead.  Preserve state
+          ;; that `kill-all-local-variables' would otherwise wipe.  A
+          ;; per-buffer override (set by the `compilation-start' advice
+          ;; when the caller passes a custom compile-mode subclass) wins
+          ;; over the global default — so error-regexp and font-lock
+          ;; customisations the subclass installs survive into the
+          ;; finished buffer.
+          (let* ((saved-command command)
+                 (saved-start-time start-time)
+                 (saved-directory directory)
+                 (target-mode (or ghostel-compile--view-mode-override
+                                  ghostel-compile-finished-major-mode)))
+            (when target-mode
+              (funcall target-mode))
+            (setq-local ghostel-compile--command saved-command
+                        ghostel-compile--directory saved-directory
+                        ghostel-compile--start-time saved-start-time
+                        ghostel-compile--last-exit exit
+                        ghostel-compile--finalized t)
+            ;; Pin the buffer's `default-directory' to the directory the
+            ;; user invoked `ghostel-compile' from, so it doesn't drift if
+            ;; the command happened to `cd' elsewhere during the run.
+            (when saved-directory
+              (setq default-directory saved-directory)))
+          ;; The header was rendered into the VT terminal pre-spawn, so
+          ;; it is already buffer text above `scan-marker'.  Append the
+          ;; footer and parse errors over the run's own output.
+          (let* ((inhibit-read-only t)
+                 (parse-start (copy-marker (or start (point-min)))))
+            (save-excursion
+              (goto-char (point-max))
+              ;; Start the footer on a fresh line, then leave a blank
+              ;; separator line between the last output and the footer
+              ;; — matches the `\n\nCompilation finished ...' format
+              ;; `M-x compile' uses.
+              (unless (or (= (point) (point-min)) (bolp))
+                (insert "\n"))
+              (insert "\n" footer))
+            (save-excursion
+              (save-restriction
+                (widen)
+                (setq-local compilation--parsed (copy-marker parse-start))
+                (condition-case err
+                    (compilation--ensure-parse (point-max))
+                  (error
+                   (message "ghostel-compile: error scanning output: %s"
+                            (error-message-string err)))))))
+          (goto-char (point-max))
+          (dolist (win (get-buffer-window-list buffer nil t))
+            (set-window-point win (point-max))
+            (with-selected-window win (recenter -1))))
+        (ghostel-compile--set-mode-line-exit exit)
+        (setq next-error-last-buffer buffer)
+        (ghostel-compile--auto-jump buffer)
+        (let ((msg (ghostel-compile--status-message exit)))
+          (run-hook-with-args 'compilation-finish-functions buffer msg)
+          (run-hook-with-args 'ghostel-compile-finish-functions buffer msg))))))
 
-(defun ghostel-compile--on-start (buffer)
-  "Hook function: arm finalize gating for BUFFER on OSC 133 C marker.
-A D marker is only treated as the user command's exit when a C
-marker has been seen since `ghostel-compile' was invoked.  This
-filters out spurious D markers from prompt redraws (e.g. shell
-clear-screen handlers after we send `\\f' to refresh the display).
 
-When we transition from `pending' to `armed', snap the scan
-marker to the current `point-max'.  The scan marker must land
-*after* any content the shell rendered in response to our clear
-\(the fresh prompt re-echo), which arrives asynchronously through
-the process filter — not synchronously during `ghostel-compile'.
-The C marker is emitted by the shell's preexec / DEBUG trap right
-before the user's command starts producing output, so point-max
-at that moment is exactly the boundary between \"pre-command
-noise\" and the command's real output."
-  (when (and (buffer-live-p buffer)
-             (buffer-local-value 'ghostel-compile-mode buffer))
-    (with-current-buffer buffer
-      (when ghostel-compile-debug
-        (message "ghostel-compile: OSC 133 C — running=%S"
-                 ghostel-compile--running))
-      (when (eq ghostel-compile--running 'pending)
-        (setq ghostel-compile--running 'armed
-              ghostel-compile--scan-marker (copy-marker (point-max)))))))
+;;; Spawning
 
-(defun ghostel-compile--on-finish (buffer exit)
-  "Hook function: schedule finalize for BUFFER with EXIT status.
-
-Runs deferred so any rendering from the same output batch settles
-first.  Only acts when `ghostel-compile--running' is `armed' (i.e.
-a C marker has been seen) — D markers from prompt redraws or other
-shell activity that haven't been preceded by a C are ignored.
-
-The first D after C wins.  Subsequent Ds before finalize actually
-fires are ignored, so a follow-up prompt's D;0 cannot overwrite
-the real command's exit status."
-  (when (and (buffer-live-p buffer)
-             (buffer-local-value 'ghostel-compile-mode buffer))
-    (with-current-buffer buffer
-      (when ghostel-compile-debug
-        (message "ghostel-compile: OSC 133 D;%S — running=%S"
-                 exit ghostel-compile--running))
-      (when (eq ghostel-compile--running 'armed)
-        (setq ghostel-compile--running 'fired
-              ghostel-compile--finalize-timer
-              (run-at-time 0.05 nil
-                           #'ghostel-compile--finalize
-                           buffer exit (current-time)))))))
-
-(define-minor-mode ghostel-compile-mode
-  "Minor mode that turns a ghostel buffer into a compilation buffer.
-
-When enabled, an OSC 133 D marker triggers an error scan over the
-command's output, a compilation-style header/footer is inserted,
-surrounding prompts are hidden, and the buffer's major mode is
-switched to `ghostel-compile-finished-major-mode' (by default
-`ghostel-compile-view-mode' — derived from `compilation-mode').
-Pressing \\<ghostel-compile-mode-map>\\[ghostel-recompile] re-runs
-the last command."
-  :lighter " gh-compile"
-  :keymap ghostel-compile-mode-map
-  (cond
-   (ghostel-compile-mode
-    (unless (derived-mode-p 'ghostel-mode)
-      (setq ghostel-compile-mode nil)
-      (user-error "`ghostel-compile-mode' can only be enabled in a ghostel buffer"))
-    ;; Only adopt `compilation-minor-mode' if it isn't already on, and
-    ;; remember whether we turned it on so we don't yank it from under
-    ;; some other consumer when our mode is disabled.
-    (setq ghostel-compile--owns-compilation-minor-mode
-          (not (bound-and-true-p compilation-minor-mode)))
-    (compilation-minor-mode 1)
-    (setq-local next-error-function #'compilation-next-error-function)
-    ;; Ensure our `g' binding wins over `compilation-minor-mode-map'.
-    (setq-local minor-mode-overriding-map-alist
-                (cons (cons 'ghostel-compile-mode ghostel-compile-mode-map)
-                      (assq-delete-all
-                       'ghostel-compile-mode
-                       minor-mode-overriding-map-alist)))
-    (add-hook 'ghostel-command-start-functions
-              #'ghostel-compile--on-start nil t)
-    (add-hook 'ghostel-command-finish-functions
-              #'ghostel-compile--on-finish nil t))
-   (t
-    (setq-local minor-mode-overriding-map-alist
-                (assq-delete-all
-                 'ghostel-compile-mode
-                 minor-mode-overriding-map-alist))
-    (remove-hook 'ghostel-command-start-functions
-                 #'ghostel-compile--on-start t)
-    (remove-hook 'ghostel-command-finish-functions
-                 #'ghostel-compile--on-finish t)
-    ;; Cancel any pending finalize and reset the in-flight state so
-    ;; turning the mode off mid-command doesn't leak `pending'/`armed'
-    ;; into the next enable cycle.
-    (when (timerp ghostel-compile--finalize-timer)
-      (cancel-timer ghostel-compile--finalize-timer))
-    (setq ghostel-compile--finalize-timer nil
-          ghostel-compile--running nil)
-    ;; Only turn off `compilation-minor-mode' (and the `next-error'
-    ;; wiring that goes with it) if WE turned it on; otherwise the
-    ;; user's pre-existing `compilation-minor-mode' would be left
-    ;; with its `next-error-function' yanked out from under it.
-    (when (and ghostel-compile--owns-compilation-minor-mode
-               (bound-and-true-p compilation-minor-mode))
-      (compilation-minor-mode -1)
-      (kill-local-variable 'next-error-function))
-    (setq ghostel-compile--owns-compilation-minor-mode nil))))
-
-(defun ghostel-compile--get-or-create-buffer ()
-  "Return a live ghostel-compile buffer, creating one if needed.
-Uses the caller's `default-directory' as the new buffer's working
-directory — captured before any buffer kill, so that
-`ghostel-recompile' (which kills the previous `view-mode' buffer)
-runs in the directory bound by its caller, not whatever buffer
-happens to be current after the kill."
-  (let ((existing (get-buffer ghostel-compile-buffer-name))
-        (dir default-directory))
-    (if (and existing
-             (with-current-buffer existing
-               (and (derived-mode-p 'ghostel-mode)
-                    ghostel--process
-                    (process-live-p ghostel--process))))
-        existing
-      (when existing
-        (kill-buffer existing))
-      ;; Create the buffer without displaying it — `ghostel-compile'
-      ;; places it via `display-buffer' afterwards.  Going through the
-      ;; interactive `ghostel' command would `pop-to-buffer' here,
-      ;; which hijacks the caller's window *and* pollutes the window's
-      ;; previous-buffers history (making later `display-buffer' calls
-      ;; pick the same window via `display-buffer-in-previous-window').
-      (ghostel--load-module t)
-      (let ((buffer (get-buffer-create ghostel-compile-buffer-name)))
+(defun ghostel-compile--sentinel (process _event)
+  "Sentinel for the compile PROCESS: finalize the buffer on exit."
+  (when (memq (process-status process) '(exit signal))
+    (let ((buffer (process-buffer process))
+          (exit (process-exit-status process)))
+      (when (buffer-live-p buffer)
         (with-current-buffer buffer
-          (setq-local default-directory dir))
-        (ghostel--init-buffer buffer)
-        buffer))))
+          (when ghostel-compile-debug
+            (message "ghostel-compile: sentinel exit=%S status=%S"
+                     exit (process-status process)))
+          ;; Flush pending bytes to the VT parser, then cancel any
+          ;; scheduled redraw and commit the current terminal state to
+          ;; the buffer synchronously.  Without this, a short-lived
+          ;; command (`echo`, `false`, `exit 7`) finishes before the
+          ;; ~16 ms redraw timer fires and its output is lost when
+          ;; `--teardown-terminal' destroys the renderer.
+          (when ghostel--term
+            (ghostel--flush-pending-output)
+            (when ghostel--redraw-timer
+              (cancel-timer ghostel--redraw-timer)
+              (setq ghostel--redraw-timer nil))
+            (ghostel--delayed-redraw buffer))
+          (setq compilation-in-progress
+                (delq process compilation-in-progress))
+          (when (fboundp 'compilation--update-in-progress-mode-line)
+            (compilation--update-in-progress-mode-line))
+          (ghostel-compile--finalize buffer exit (current-time)))))))
 
-
-;;; Public `ghostel-compile' entry point
+(defconst ghostel-compile--stty-flags "erase '^?' iutf8 -ixon -echo"
+  "`stty' flags for the compile PTY.
+Matches `ghostel--spawn-pty's flags for non-shell programs, with
+`echo' off so we don't render an echoed copy of the command (which
+users already see in the header).")
+
+(defun ghostel-compile--spawn (command buffer height width)
+  "Spawn COMMAND in BUFFER via a PTY sized HEIGHT rows by WIDTH columns.
+Installs `ghostel--filter' and `ghostel-compile--sentinel'.  Returns
+the process.
+
+COMMAND is passed verbatim to `shell-file-name' via
+`shell-command-switch', so multi-line scripts and shell
+metacharacters are handled the same way `M-x compile' handles
+them.  `/bin/sh' is used only to set PTY attributes (stty) before
+exec'ing the user's shell.
+
+For remote (TRAMP) `default-directory's, `shell-file-name' and
+`shell-command-switch' are resolved via `with-connection-local-variables'
+so the remote host's shell is used (not whatever zsh/bash path the
+local machine happens to have)."
+  (let* ((remote-p (file-remote-p default-directory))
+         (shell (if remote-p
+                    (with-connection-local-variables shell-file-name)
+                  shell-file-name))
+         (switch (if remote-p
+                     (with-connection-local-variables shell-command-switch)
+                   shell-command-switch))
+         (wrapper
+          (list "/bin/sh" "-c"
+                (concat
+                 "stty " ghostel-compile--stty-flags
+                 (format " rows %d columns %d" height width)
+                 " 2>/dev/null; "
+                 "exec "
+                 (shell-quote-argument shell) " "
+                 (shell-quote-argument switch) " "
+                 (shell-quote-argument command))))
+         (process-environment
+          (append compilation-environment
+                  (list (format "INSIDE_EMACS=%s,compile" emacs-version)
+                        "TERM=xterm-256color"
+                        "COLORTERM=truecolor"
+                        ;; Defeat pagers (git grep, etc.).
+                        "PAGER=")
+                  (copy-sequence process-environment)))
+         (proc (make-process
+                :name "ghostel-compile"
+                :buffer buffer
+                :command wrapper
+                :connection-type 'pty
+                :file-handler remote-p
+                :filter #'ghostel--filter
+                :sentinel #'ghostel-compile--sentinel)))
+    ;; Store the process on the buffer so `ghostel--self-insert'
+    ;; (and other ghostel-mode key handlers) can send keystrokes to
+    ;; it — that's how users interact with long-running programs
+    ;; (`htop', `less', test prompts, ...) during the compile.
+    (with-current-buffer buffer
+      (setq ghostel--process proc))
+    (set-process-coding-system proc 'binary 'binary)
+    (set-process-window-size proc height width)
+    (when compilation-always-kill
+      (set-process-query-on-exit-flag proc nil))
+    (process-put proc 'adjust-window-size-function
+                 #'ghostel--window-adjust-process-window-size)
+    proc))
+
+
+;;; Buffer management
+
+(defconst ghostel-compile--managed-buffer-sentinel :ghostel-compile
+  "Sentinel value used for `ghostel--managed-buffer-name' in compile buffers.
+When set, `ghostel--set-title' (OSC 2) skips auto-renaming the buffer — we
+don't want a compile command's title sequence to replace our fixed name.")
+
+(defun ghostel-compile--prepare-buffer (name dir)
+  "Return the ghostel buffer named NAME, reset for a fresh run from DIR.
+If a buffer with NAME already exists, the run is prepared in place
+— the buffer is erased and the terminal rebuilt, but the buffer
+object is preserved.  This keeps any window already displaying the
+buffer stable across recompiles (so `g' in a compile buffer reuses
+its window, matching `M-x recompile').
+
+If the existing buffer has a live process, prompt via `yes-or-no-p'
+before killing it, unless `compilation-always-kill' is non-nil or
+the process has its query-on-exit flag cleared.
+
+Creates the terminal directly — no interactive shell is spawned —
+so there is no remote-integration round-trip on TRAMP buffers."
+  (let ((existing (get-buffer name)))
+    (when existing
+      (with-current-buffer existing
+        (let ((proc (bound-and-true-p ghostel--process)))
+          (when (process-live-p proc)
+            (if (or (eq (process-query-on-exit-flag proc) nil)
+                    compilation-always-kill
+                    (yes-or-no-p
+                     (format "A %s process is running; kill it? "
+                             (buffer-name existing))))
+                (condition-case nil
+                    (progn
+                      ;; Our sentinel is what removes the process from
+                      ;; `compilation-in-progress'; we're about to
+                      ;; suppress it (replacing with `#'ignore'), so
+                      ;; do that bookkeeping ourselves now to avoid
+                      ;; leaking a dead entry.
+                      (setq compilation-in-progress
+                            (delq proc compilation-in-progress))
+                      (set-process-sentinel proc #'ignore)
+                      (set-process-filter proc #'ignore)
+                      (interrupt-process proc)
+                      (sit-for 0.1)
+                      (delete-process proc))
+                  (error nil))
+              (error "Cannot have two processes in `%s' at once"
+                     (buffer-name existing))))
+          (setq ghostel--process nil))
+        (when (bound-and-true-p ghostel--redraw-timer)
+          (cancel-timer ghostel--redraw-timer)
+          (setq ghostel--redraw-timer nil))
+        (when (bound-and-true-p ghostel--input-timer)
+          (cancel-timer ghostel--input-timer)
+          (setq ghostel--input-timer nil)))))
+  (ghostel--load-module t)
+  (let* ((buffer (get-buffer-create name))
+         (win (or (get-buffer-window buffer t) (selected-window)))
+         (height (if (window-live-p win) (window-body-height win) 24))
+         (width  (if (window-live-p win) (window-max-chars-per-line win) 80)))
+    (with-current-buffer buffer
+      ;; Reset to `ghostel-mode' unconditionally — on a recompile the
+      ;; buffer is in `ghostel-compile-view-mode' (derived from
+      ;; `compilation-mode', *not* `ghostel-mode'), so the previous
+      ;; `(unless derived-mode-p ghostel-mode) (ghostel-mode))' guard
+      ;; also fired, but also made state-reset implicit; make it
+      ;; explicit here so this helper doesn't have two code paths.
+      (ghostel-mode)
+      (setq-local default-directory dir)
+      (let ((inhibit-read-only t))
+        (erase-buffer))
+      (setq ghostel--pending-output nil)
+      ;; Pin the buffer name so a compile command's OSC 2 title sequence
+      ;; can't rename the buffer mid-run.  `ghostel--set-title' only
+      ;; renames when `ghostel--managed-buffer-name' equals the current
+      ;; buffer name (see ghostel.el); a sentinel that can never match
+      ;; disables auto-renaming.
+      (setq ghostel--managed-buffer-name
+            ghostel-compile--managed-buffer-sentinel)
+      (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
+      (setq ghostel--term-rows height)
+      (ghostel--apply-palette ghostel--term))
+    buffer))
+
+
+;;; Entry points
+
+(defun ghostel-compile--start (command buffer-name dir &optional finished-mode)
+  "Run COMMAND in BUFFER-NAME from DIR and return the buffer.
+Creates or resets the buffer, spawns COMMAND via `shell-file-name',
+and displays the buffer.  Used by both `ghostel-compile' and the
+`compilation-start' advice installed by `ghostel-compile-global-mode'.
+
+FINISHED-MODE, when non-nil, is the major mode to switch the
+buffer into after finalize (overriding
+`ghostel-compile-finished-major-mode').  The advice uses this to
+honour custom compile-mode subclasses the caller passed to
+`compilation-start'."
+  (unless (and command (not (string-blank-p command)))
+    (user-error "Empty compile command"))
+  (save-some-buffers (not compilation-ask-about-save)
+                     compilation-save-buffers-predicate)
+  (let* ((buffer (ghostel-compile--prepare-buffer buffer-name dir))
+         (outwin (display-buffer buffer '(nil (allow-no-window . t))))
+         (start-time (current-time)))
+    (with-current-buffer buffer
+      ;; During the run the buffer stays plain `ghostel-mode' so
+      ;; keystrokes reach the process for interactive programs like
+      ;; `htop', `less', or read prompts.  Compile-mode semantics
+      ;; (`g', `n'/`p', error nav) kick in at finalize when the
+      ;; buffer is switched to `ghostel-compile-view-mode'.
+      (setq ghostel-compile--command command
+            ghostel-compile--directory dir
+            ghostel-compile--start-time start-time
+            ghostel-compile--last-exit nil
+            ghostel-compile--finalized nil
+            ghostel-compile--view-mode-override finished-mode)
+      ;; Render the compilation header into the terminal before spawning
+      ;; the command, so the user sees the "Compilation started at ..."
+      ;; banner *during* the run rather than only when it finishes (the
+      ;; same behaviour `M-x compile' has).  Bytes are written as CRLF
+      ;; so the VT parser lands on column 0 after each line.
+      (ghostel-compile--render-header-live
+       (ghostel-compile--header-text command start-time))
+      ;; Place the scan marker at the buffer position right after the
+      ;; header — NOT at `point-max' — because the VT renderer pads
+      ;; the grid out to `ghostel--term-rows' lines, so `point-max'
+      ;; sits well below the command's first output row.  Anchoring
+      ;; here makes `--trim-trailing-blanks' correctly strip padding
+      ;; between the last output line and the footer.
+      ;;
+      ;; The VT cursor's row after the render is where output will go;
+      ;; use it directly (via `ghostel--cursor-position') rather than
+      ;; counting source newlines in the header text — a long command
+      ;; line that wraps in the terminal would desynchronise otherwise.
+      (setq ghostel-compile--scan-marker
+            (save-excursion
+              (goto-char (point-min))
+              (forward-line (cdr (ghostel--cursor-position ghostel--term)))
+              (copy-marker (point))))
+      (ghostel-compile--set-mode-line-running)
+      (let* ((height (max 1 (if outwin
+                                (window-body-height outwin)
+                              (window-body-height))))
+             (width (max 1 (if outwin
+                               (window-body-width outwin)
+                             (window-max-chars-per-line))))
+             (proc (ghostel-compile--spawn command buffer height width)))
+        ;; Match stock `compilation-start' ordering: hook fires before
+        ;; `compilation-in-progress' is updated, so hook functions can
+        ;; install filter-hooks / error-regexps before the next
+        ;; redisplay tick processes any output.
+        (run-hook-with-args 'compilation-start-hook proc)
+        (push proc compilation-in-progress)
+        (when (fboundp 'compilation--update-in-progress-mode-line)
+          (compilation--update-in-progress-mode-line))
+        (setq next-error-last-buffer buffer)))
+    buffer))
 
 ;;;###autoload
 (defun ghostel-compile (command)
@@ -602,20 +647,21 @@ happens to be current after the kill."
 
 Like \\[compile], but uses a ghostel buffer so programs that require
 a real TTY work correctly.  The buffer gets a compilation-mode-like
-header and footer, surrounding prompts are hidden, and when the
-command finishes (detected via the OSC 133 D semantic prompt marker)
-the major mode is switched to `ghostel-compile-finished-major-mode'
-\(by default `ghostel-compile-view-mode', derived from
-`compilation-mode').  Error locations become available through
-`next-error'.
+header and footer, and when the command finishes the major mode is
+switched to `ghostel-compile-finished-major-mode' (by default
+`ghostel-compile-view-mode', derived from `compilation-mode').
+Error locations become available through `next-error'.
+
+COMMAND is passed verbatim to `shell-file-name -c', so multi-line
+scripts work exactly as in \\[shell-command].  No shell-integration
+setup is required — the process sentinel reports the real exit
+status.
 
 Output always scrolls as it arrives (equivalent to
 `compilation-scroll-output' being non-nil).  `compilation-ask-about-save'
 and `compilation-auto-jump-to-first-error' are honoured.  The command
 default and history are shared with \\[compile] via `compile-command'
-and `compile-history'.
-
-Requires shell integration; see `ghostel-shell-integration'."
+and `compile-history'."
   (interactive
    (list
     (let ((default (eval compile-command t)))
@@ -627,31 +673,7 @@ Requires shell integration; see `ghostel-shell-integration'."
         default))))
   (unless (equal command (eval compile-command t))
     (setq compile-command command))
-  (save-some-buffers (not compilation-ask-about-save)
-                     compilation-save-buffers-predicate)
-  (let ((buffer (ghostel-compile--get-or-create-buffer)))
-    (with-current-buffer buffer
-      (when (bound-and-true-p ghostel--copy-mode-active)
-        (ghostel-copy-mode-exit))
-      (unless ghostel-compile-mode
-        (ghostel-compile-mode 1))
-      (ghostel-compile--clear-markers)
-      (when ghostel-compile-clear-buffer
-        (ghostel-clear-scrollback))
-      ;; The scan marker is snapped by `ghostel-compile--on-start' when
-      ;; the shell emits OSC 133 C — by then any async output from our
-      ;; clear-scrollback's `\\f' (the re-echoed prompt) has already
-      ;; landed, so the marker lands exactly at the command's own
-      ;; output boundary instead of above that noise.
-      (setq ghostel-compile--command command
-            ghostel-compile--directory default-directory
-            ghostel-compile--start-time (current-time)
-            ghostel-compile--last-exit nil
-            ghostel-compile--running 'pending
-            ghostel-compile--scan-marker nil)
-      (ghostel-compile--set-mode-line-running)
-      (ghostel--flush-output (concat command "\n")))
-    (display-buffer buffer '(nil (allow-no-window . t)))))
+  (ghostel-compile--start command ghostel-compile-buffer-name default-directory))
 
 (defun ghostel-recompile (&optional edit-command)
   "Re-run the last `ghostel-compile' command in its original directory.
@@ -659,16 +681,26 @@ If EDIT-COMMAND is non-nil, prompt for the command so the user can
 edit it before running — interactively this is triggered by a
 prefix arg, matching the convention of \\[recompile].
 
-Falls back to `compile-command' (and the current `default-directory')
-when no ghostel compile has run yet."
+When invoked from a ghostel-compile buffer (any buffer with a
+local `ghostel-compile--command'), re-runs into THAT buffer — the
+window showing it stays put.  This matches `M-x recompile' in a
+`*compilation*' buffer.  Otherwise falls back to
+`ghostel-compile-buffer-name', and ultimately to `compile-command'
+with the current `default-directory' when no prior run exists."
   (interactive "P")
-  (let* ((buf (get-buffer ghostel-compile-buffer-name))
-         (cmd (or (and (buffer-live-p buf)
-                       (buffer-local-value 'ghostel-compile--command buf))
+  (let* ((source (cond
+                  ((local-variable-p 'ghostel-compile--command)
+                   (current-buffer))
+                  ((get-buffer ghostel-compile-buffer-name))))
+         (cmd (or (and (buffer-live-p source)
+                       (buffer-local-value 'ghostel-compile--command source))
                   (eval compile-command t)))
-         (dir (or (and (buffer-live-p buf)
-                       (buffer-local-value 'ghostel-compile--directory buf))
-                  default-directory)))
+         (dir (or (and (buffer-live-p source)
+                       (buffer-local-value 'ghostel-compile--directory source))
+                  default-directory))
+         (name (if (buffer-live-p source)
+                   (buffer-name source)
+                 ghostel-compile-buffer-name)))
     (unless (and cmd (not (string-blank-p cmd)))
       (user-error "No previous `ghostel-compile' command to re-run"))
     (when edit-command
@@ -679,8 +711,84 @@ when no ghostel compile has run yet."
                    'compile-history)))
       (unless (equal cmd (eval compile-command t))
         (setq compile-command cmd)))
-    (let ((default-directory dir))
-      (ghostel-compile cmd))))
+    (ghostel-compile--start cmd name dir)))
+
+
+;;; ghostel-compile-global-mode — opt-in: advise compilation-start
+
+(defcustom ghostel-compile-global-mode-excluded-modes '(grep-mode)
+  "Modes for which `ghostel-compile-global-mode' falls through to stock `compile'.
+`grep-mode' is excluded by default because it has its own output
+parsing and window-management conventions that don't fit a TTY.
+Add your own compile-mode subclass to this list if you need to
+opt a specific caller out."
+  :type '(repeat symbol))
+
+(defun ghostel-compile--compilation-start-advice
+    (orig-fn command &optional mode name-function highlight-regexp continue)
+  "Around advice for `compilation-start': route COMMAND through ghostel.
+Falls back to ORIG-FN (with COMMAND, MODE, NAME-FUNCTION,
+HIGHLIGHT-REGEXP, CONTINUE unchanged) when:
+
+- MODE is t — `compilation-start' asks for a comint buffer, which
+  we don't emulate.
+- MODE is in `ghostel-compile-global-mode-excluded-modes' — e.g.
+  `grep-mode' by default.
+- CONTINUE is non-nil — the caller wants to append to an existing
+  compilation buffer; each `ghostel-compile' run replaces its
+  buffer from scratch, so we can't honour that.
+
+Otherwise routes COMMAND through `ghostel-compile--start', honouring
+NAME-FUNCTION for the buffer name and HIGHLIGHT-REGEXP for error
+highlighting."
+  (if (or (eq mode t)
+          continue
+          (memq mode ghostel-compile-global-mode-excluded-modes))
+      (funcall orig-fn command mode name-function highlight-regexp continue)
+    (let* ((actual-mode (or mode 'compilation-mode))
+           (name-of-mode
+            (replace-regexp-in-string "-mode\\'" ""
+                                      (symbol-name actual-mode)))
+           (buf-name (compilation-buffer-name
+                      name-of-mode actual-mode name-function))
+           ;; Pass a custom compile-mode subclass through so finalize
+           ;; can switch to it (honouring its error-regexp,
+           ;; font-lock keywords, keymap, etc.).  For plain
+           ;; `compilation-mode' we use nil so the default
+           ;; `ghostel-compile-finished-major-mode'
+           ;; (= `ghostel-compile-view-mode') kicks in, which derives
+           ;; from `compilation-mode' and adds our own keybindings.
+           (finished-mode (unless (eq actual-mode 'compilation-mode)
+                            actual-mode))
+           (buffer (ghostel-compile--start command buf-name
+                                           default-directory
+                                           finished-mode)))
+      (when highlight-regexp
+        (with-current-buffer buffer
+          (setq-local compilation-highlight-regexp highlight-regexp)))
+      buffer)))
+
+;;;###autoload
+(define-minor-mode ghostel-compile-global-mode
+  "Global minor mode: route all `compile'-style calls through ghostel.
+
+When enabled, advises `compilation-start' so that \\[compile],
+\\[recompile], \\[project-compile], and every other caller that
+goes through `compilation-start' runs in a ghostel terminal —
+giving you a real TTY for progress bars, colours, and curses tools
+without having to switch commands.
+
+Modes in `ghostel-compile-global-mode-excluded-modes' (by default,
+`grep-mode') still use the stock implementation, since their output
+parsers and window-management conventions don't fit a live TTY."
+  :global t
+  :group 'ghostel-compile
+  (if ghostel-compile-global-mode
+      (advice-add 'compilation-start :around
+                  #'ghostel-compile--compilation-start-advice)
+    (advice-remove 'compilation-start
+                   #'ghostel-compile--compilation-start-advice)))
+
 
 (provide 'ghostel-compile)
 

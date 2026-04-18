@@ -473,6 +473,13 @@ footer, error highlighting, and `next-error` navigation — but backed by
 a real TTY so programs that probe `isatty(3)` (coloured output, progress
 bars, curses tools) behave as they do in a normal shell.
 
+Each invocation spawns a fresh process via
+`shell-file-name -c COMMAND` through a PTY owned by the ghostel
+renderer — no interactive shell sits between the command and the
+user, so multi-line shell scripts are passed through verbatim and
+no shell-integration setup is required.  The process sentinel
+delivers the real exit status.
+
 ```elisp
 (require 'ghostel-compile)
 
@@ -481,10 +488,11 @@ bars, curses tools) behave as they do in a normal shell.
 
 Commands:
 
-| Command                 | Description                                         |
-|-------------------------|-----------------------------------------------------|
-| `M-x ghostel-compile`   | Prompt for a command and run it (uses `compile-command`) |
-| `M-x ghostel-recompile` | Re-run the last command in its original directory   |
+| Command                      | Description                                              |
+|------------------------------|----------------------------------------------------------|
+| `M-x ghostel-compile`        | Prompt for a command and run it (uses `compile-command`) |
+| `M-x ghostel-recompile`      | Re-run the last command in its original directory        |
+| `M-x ghostel-compile-global-mode` | Route *all* `compile`-style calls through ghostel (opt-in) |
 
 What a run looks like — the buffer text matches `M-x compile`:
 
@@ -499,16 +507,15 @@ make -j4 test
 Compilation finished at Wed Apr 15 08:30:19, duration 8.20 s
 ```
 
-When the command finishes, the live shell and ghostel renderer are torn
-down and the buffer's major mode is switched to `ghostel-compile-view-mode`
-(derived from `compilation-mode`).  The buffer becomes a regular,
-read-only Emacs buffer with compile-mode's coloured error / line-number
-faces; the buffer never returns to an interactive ghostel terminal —
-a recompile discards it and starts fresh in the original directory.
-Point stays at the end of the output (where the renderer left it) so
-you see the latest output and the footer rather than jumping to the
-top.  `mode-line-process` shows `:run` while the command is running
-and `:exit [N]` afterwards, using the same faces `M-x compile` uses.
+When the command finishes, the live process and ghostel renderer are
+torn down and the buffer's major mode is switched to
+`ghostel-compile-view-mode` (derived from `compilation-mode`).  The
+buffer becomes a regular, read-only Emacs buffer with compile-mode's
+coloured error / line-number faces; the buffer never returns to an
+interactive ghostel terminal — a recompile discards it and starts
+fresh in the original directory.  `mode-line-process` shows
+`:run` while the command is running and `:exit [N]` afterwards, using
+the same faces `M-x compile` uses.
 
 Keybindings (in `ghostel-compile-view-mode`):
 
@@ -538,23 +545,35 @@ These standard `compile` options are honoured:
   `compilation-scroll-output` non-nil).
 
 `ghostel-recompile` runs in the directory the original `ghostel-compile`
-was invoked from, regardless of which buffer you're in when you press
-`g`.
+was invoked from, regardless of which buffer you're in when you press `g`.
+
+#### Make `compile` / `recompile` / `project-compile` use ghostel
+
+Enable `ghostel-compile-global-mode` to advise `compilation-start`
+so every caller that goes through it — `M-x compile`,
+`M-x recompile`, `M-x project-compile`, and any third-party command
+that uses `compilation-start` under the hood — runs in a ghostel
+buffer automatically.
+
+```elisp
+(require 'ghostel-compile)
+(ghostel-compile-global-mode 1)
+```
+
+`grep-mode` falls through to the stock `compilation-start`
+implementation by default, because its output parsing and
+window-management conventions don't fit a live TTY.  Extend
+`ghostel-compile-global-mode-excluded-modes` to opt other modes out.
 
 Ghostel-specific customisation:
 
-| Option                                | Effect                                                                                                             |
-|---------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `ghostel-compile-buffer-name`         | Buffer name (default `*ghostel-compile*`)                                                                          |
-| `ghostel-compile-finished-major-mode` | Major mode to switch to after each run (default `ghostel-compile-view-mode`; set to nil to stay in `ghostel-mode`) |
-| `ghostel-compile-hide-prompts`        | Hide surrounding shell prompts (default `t`)                                                                       |
-| `ghostel-compile-clear-buffer`        | Clear the buffer before each run (default `t`)                                                                     |
-| `ghostel-compile-finish-functions`    | Ghostel-specific finish hook (runs alongside `compilation-finish-functions`)                                       |
-| `ghostel-compile-debug`               | Log every OSC 133 C/D event to `*Messages*` (default `nil`)                                                        |
-
-Completion is detected via the OSC 133 `D;<exit>` semantic prompt
-marker, so shell integration (`ghostel-shell-integration`, enabled by
-default) must be active.
+| Option                                       | Effect                                                                                                             |
+|----------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| `ghostel-compile-buffer-name`                | Buffer name (default `*ghostel-compile*`)                                                                          |
+| `ghostel-compile-finished-major-mode`        | Major mode to switch to after each run (default `ghostel-compile-view-mode`; set to nil to stay in `ghostel-mode`) |
+| `ghostel-compile-finish-functions`           | Ghostel-specific finish hook (runs alongside `compilation-finish-functions`)                                       |
+| `ghostel-compile-global-mode-excluded-modes` | Modes for which the global advice falls through to stock `compile` (default `(grep-mode)`)                         |
+| `ghostel-compile-debug`                      | Log lifecycle events to `*Messages*` (default `nil`)                                                               |
 
 #### Hooks for your own integrations
 
