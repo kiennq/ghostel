@@ -3794,54 +3794,98 @@ rows in the viewport — with or without the trailing newline."
                                              (skip-chars-backward "\n")
                                              (point))))))))))
 
-(ert-deftest ghostel-test-anchor-window-clamps-pending-wrap ()
-  "`ghostel--anchor-window' must clamp PT at `point-max' by one.
-Regression test for #138: when the TUI cursor is in the pending-wrap
-state on the last visible row, the Zig cursor placement lands at
-`point-max' (one past the last character).  Emacs redisplay then
-classifies that point as off-screen and — with `scroll-conservatively'
-set by `ghostel-mode' — shifts `window-start' up by a row to make it
-visible, which fights the viewport pin and hides the block cursor.
-The anchor helper must clamp `window-point' back by one in that case."
-  (let ((buf (generate-new-buffer " *ghostel-test-anchor-clamp*"))
+(ert-deftest ghostel-test-anchor-window-no-clamp-without-pending-wrap ()
+  "`ghostel--anchor-window' must leave `window-point' at PT outside pending-wrap.
+Regression test for #146: PR #139 originally clamped unconditionally
+whenever PT equalled `point-max', which pulled the block cursor onto
+the last character of a normal shell prompt (the cursor is legitimately
+at `point-max' right after typing).  The clamp must only fire for the
+#138 scenario where the terminal is genuinely in pending-wrap state.
+
+This pure-elisp test leaves `ghostel--term' nil; the helper must then
+skip the clamp entirely regardless of where PT sits."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-no-clamp*"))
         (orig-buf (window-buffer (selected-window))))
     (unwind-protect
         (progn
           (with-current-buffer buf
-            (insert "row-1\nrow-2\nlast-row-content"))
+            (insert "row-1\nrow-2\n$ ls"))
           (set-window-buffer (selected-window) buf)
           (let ((win (selected-window))
                 (pmax (with-current-buffer buf (point-max))))
-            ;; pt at point-max: window-point clamps back by one.
+            ;; pt at point-max, no term: window-point stays put (#146).
             (with-current-buffer buf
+              (setq-local ghostel--term nil)
               (ghostel--anchor-window win (point-min) pmax))
-            (should (= (1- pmax) (window-point win)))
+            (should (= pmax (window-point win)))
             ;; pt inside the buffer: window-point is left alone.
             (with-current-buffer buf
               (ghostel--anchor-window win (point-min) (- pmax 3)))
             (should (= (- pmax 3) (window-point win))))
-          ;; Buffer ending in a trailing newline: clamp still fires.
-          ;; Lands on the newline — not ideal but strictly better than
-          ;; the symptom (block cursor disappearing).  Next redraw heals.
-          (with-current-buffer buf
-            (goto-char (point-max))
-            (insert "\n"))
-          (let ((win (selected-window))
-                (pmax (with-current-buffer buf (point-max))))
-            (with-current-buffer buf
-              (ghostel--anchor-window win (point-min) pmax))
-            (should (= (1- pmax) (window-point win))))
-          ;; Empty buffer: nothing to clamp against; must not underflow.
+          ;; Empty buffer: no underflow when pt == point-min == point-max.
           (let ((empty-buf (generate-new-buffer " *ghostel-test-anchor-empty*")))
             (unwind-protect
                 (progn
                   (set-window-buffer (selected-window) empty-buf)
                   (with-current-buffer empty-buf
+                    (setq-local ghostel--term nil)
                     (ghostel--anchor-window (selected-window)
                                             (point-min) (point-max)))
                   (should (= (point-min)
                              (window-point (selected-window)))))
               (kill-buffer empty-buf))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-cursor-pending-wrap-p ()
+  "`ghostel--cursor-pending-wrap-p' tracks libghostty's pending-wrap flag."
+  (let ((term (ghostel--new 5 10 100)))
+    ;; Fresh terminal: cursor at (0,0), no pending wrap.
+    (should-not (ghostel--cursor-pending-wrap-p term))
+    ;; Write fewer chars than the row width: still no pending wrap.
+    (ghostel--write-input term "hello")
+    (should-not (ghostel--cursor-pending-wrap-p term))
+    ;; Fill the row exactly (10 columns): pending wrap is set.
+    (ghostel--write-input term "XYZXY")
+    (should (ghostel--cursor-pending-wrap-p term))))
+
+(ert-deftest ghostel-test-anchor-window-clamps-on-pending-wrap ()
+  "`ghostel--anchor-window' clamps `window-point' only in pending-wrap state.
+Regression test for #138 (clamp must fire) and #146 (clamp must NOT fire
+otherwise).  Feeds enough characters to put the VT cursor in pending-wrap,
+then verifies the helper clamps; then feeds one more character to leave
+pending-wrap and verifies the helper leaves `window-point' alone."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-pw*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 3 10 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 3)
+                 (inhibit-read-only t))
+            (set-window-buffer (selected-window) buf)
+            ;; Fill the last row to the width: cursor enters pending-wrap.
+            (ghostel--write-input term "\r\n\r\n1234567890")
+            (should (ghostel--cursor-pending-wrap-p term))
+            (ghostel--redraw term t)
+            (let ((win (selected-window))
+                  (pmax (point-max)))
+              (ghostel--anchor-window win (point-min) pmax)
+              ;; Clamp fires: window-point pulled back by one.
+              (should (= (1- pmax) (window-point win))))
+            ;; One more char soft-wraps; cursor leaves pending-wrap.
+            ;; This is the canonical #146 regression branch exercised
+            ;; via a real terminal: pt == point-max, term is live, but
+            ;; pending-wrap is false — the helper must NOT clamp.
+            (ghostel--write-input term "X")
+            (should-not (ghostel--cursor-pending-wrap-p term))
+            (ghostel--redraw term t)
+            (let ((win (selected-window))
+                  (pmax (point-max)))
+              (ghostel--anchor-window win (point-min) pmax)
+              (should (= pmax (window-point win))))))
       (when (buffer-live-p orig-buf)
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
@@ -6277,7 +6321,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-global-mode-falls-through-on-comint
     ghostel-test-compile-global-mode-excluded-custom-mode
     ghostel-test-viewport-start-skips-trailing-newline
-    ghostel-test-anchor-window-clamps-pending-wrap
+    ghostel-test-anchor-window-no-clamp-without-pending-wrap
     ghostel-test-exec-errors-on-live-process
     ghostel-test-exec-calls-spawn-pty-with-expected-args
     ghostel-test-exec-threads-remote-p-from-tramp-dir
