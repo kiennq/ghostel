@@ -53,7 +53,7 @@ checkdoc:
 		              (checkdoc-proper-noun-list nil) \
 		              (checkdoc-verb-check-experimental-flag nil) \
 		              (ok t)) \
-		  (dolist (f '(\"ghostel.el\" \"ghostel-debug.el\" \"ghostel-compile.el\" \"ghostel-eshell.el\" \"evil-ghostel.el\")) \
+		  (dolist (f '(\"ghostel.el\" \"ghostel-debug.el\" \"ghostel-compile.el\" \"ghostel-eshell.el\" \"evil-ghostel.el\" \"test/ghostel-test.el\")) \
 		    (ignore-errors (kill-buffer \"*Warnings*\")) \
 		    (let ((inhibit-message t)) \
 		      (checkdoc-file f)) \

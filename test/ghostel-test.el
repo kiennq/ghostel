@@ -1955,8 +1955,8 @@ Downstream consumers (notably `ghostel-compile') depend on it."
       (should found))))
 
 (ert-deftest ghostel-test-compile-finalize-preserves-face-props ()
-  "Regression: per-cell `face' text-properties baked in during the ghostel
-run must survive the transition to `ghostel-compile-view-mode'.
+  "Baked-in per-cell `face' text-properties must survive the mode transition.
+The transition is from the live ghostel run into `ghostel-compile-view-mode'.
 `compilation-mode' installs font-lock keywords for error highlighting,
 and the default `font-lock-unfontify-region-function' strips every
 `face' property — wiping the colour of the recorded output on the first
@@ -2338,8 +2338,9 @@ so `ghostel-recompile' (and other tooling) can rely on it."
       (should (equal "make -C /tmp silent" captured-cmd)))))   ; used as-is
 
 (ert-deftest ghostel-test-compile-prepare-buffer-no-window-side-effects ()
-  "`ghostel-compile--prepare-buffer' must create the buffer without touching
-the caller's selected window or its `window-prev-buffers' history."
+  "`ghostel-compile--prepare-buffer' must not touch the caller's window state.
+Specifically, it must not change the selected window or mutate its
+`window-prev-buffers' history while creating the buffer."
   (let* ((name "*ghostel-test-create*")
          (origin (generate-new-buffer " *ghostel-test-origin*"))
          (saved (current-window-configuration)))
@@ -2431,7 +2432,7 @@ the caller's selected window or its `window-prev-buffers' history."
                  (setq captured (list cmd name dir))
                  (generate-new-buffer " *ghostel-test-advice*"))))
       (ghostel-compile--compilation-start-advice
-       (lambda (&rest _) (error "stock path should not run"))
+       (lambda (&rest _) (error "Stock path should not run"))
        "make test" nil nil nil nil))
     (should (equal "make test" (nth 0 captured)))              ; command preserved
     ;; Default buffer name for `compilation-mode' is "*compilation*".
@@ -2452,13 +2453,13 @@ override with the default `ghostel-compile-view-mode'."
                  nil)))
       ;; Custom mode → threaded through.
       (ghostel-compile--compilation-start-advice
-       (lambda (&rest _) (error "stock path should not run"))
+       (lambda (&rest _) (error "Stock path should not run"))
        "make" 'my-custom-compile-mode nil nil nil)
       (should (eq 'my-custom-compile-mode captured-finished))
       ;; Plain `compilation-mode' → nil (default view-mode kicks in).
       (setq captured-finished :unchanged)
       (ghostel-compile--compilation-start-advice
-       (lambda (&rest _) (error "stock path should not run"))
+       (lambda (&rest _) (error "Stock path should not run"))
        "make" 'compilation-mode nil nil nil)
       (should-not captured-finished))))
 
@@ -2478,7 +2479,7 @@ override with the default `ghostel-compile-view-mode'."
   "MODE=t (comint) must fall through."
   (let ((orig-called nil))
     (cl-letf (((symbol-function 'ghostel-compile--start)
-               (lambda (&rest _) (error "should not run"))))
+               (lambda (&rest _) (error "Should not run"))))
       (ghostel-compile--compilation-start-advice
        (lambda (&rest _) (setq orig-called t) nil)
        "make" t nil nil nil))
@@ -2489,7 +2490,7 @@ override with the default `ghostel-compile-view-mode'."
   (let ((orig-called nil)
         (ghostel-compile-global-mode-excluded-modes '(my-fake-grep-mode)))
     (cl-letf (((symbol-function 'ghostel-compile--start)
-               (lambda (&rest _) (error "ghostel path should not run"))))
+               (lambda (&rest _) (error "Ghostel path should not run"))))
       (ghostel-compile--compilation-start-advice
        (lambda (&rest _) (setq orig-called t) nil)
        "whatever" 'my-fake-grep-mode nil nil nil))
@@ -2550,8 +2551,9 @@ through the process to confirm they land in the buffer."
           (kill-buffer buf-name))))))
 
 (ert-deftest ghostel-test-compile-multiline-end-to-end ()
-  "Regression: a multi-line shell paragraph run through `ghostel-compile'
-lands in the buffer intact and reports the real exit status.
+  "A multi-line shell paragraph must run intact under `ghostel-compile'.
+The paragraph must land in the buffer unmangled and the run must
+report the real exit status.
 
 This is the end-to-end proof for the core PR change: the old design
 typed the command into a live shell and each embedded newline was
@@ -4165,7 +4167,7 @@ hand nil to the native module."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-copy-mode-buffer-navigation ()
-  "Copy-mode navigation commands operate on the Emacs buffer directly."
+  "`ghostel-copy-mode-end-of-buffer' skips trailing blank rows."
   (let ((buf (generate-new-buffer " *ghostel-test-copy-nav*")))
     (unwind-protect
         (with-current-buffer buf
@@ -4174,15 +4176,10 @@ hand nil to the native module."
                 (ghostel--term 'fake-term)
                 (inhibit-read-only t))
             (insert (mapconcat #'number-to-string (number-sequence 1 20) "\n"))
+            (insert "   \n\n")
             (goto-char (point-min))
             (ghostel-copy-mode-end-of-buffer)
-            (should (= (point) (point-max)))
-            (ghostel-copy-mode-beginning-of-buffer)
-            (should (= (point) (point-min)))
-            (ghostel-copy-mode-next-line)
-            (should (= 2 (line-number-at-pos)))
-            (ghostel-copy-mode-previous-line)
-            (should (= 1 (line-number-at-pos)))))
+            (should (looking-back "20" (line-beginning-position)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -4777,7 +4774,7 @@ redraw and produce visible flicker, so point is left alone."
 Regression test: previously `ghostel--redispatch-scroll-event' set
 the buffer-local intercept flag in `current-buffer', which for wheel
 events on an unselected window is the *selected* window's buffer —
-not the ghostel buffer.  The flag therefore stayed `t' in the ghostel
+not the ghostel buffer.  The flag therefore stayed t in the ghostel
 buffer and the re-dispatched event was intercepted again, hanging
 Emacs until `C-g'."
   (let ((ghostel-buf (generate-new-buffer " *ghostel-test-unsel*"))
@@ -5177,9 +5174,9 @@ integration script runs, so input echo must be enabled before exec."
               (delete-process proc))))))))
 
 (ert-deftest ghostel-test-spawn-pty-disables-adaptive-read-buffering ()
-  "`ghostel--spawn-pty' must disable adaptive read buffering and raise
-`read-process-output-max'.  Before Emacs 31 the former defaulted to t
-and throttled bursty TUI redraws."
+  "`ghostel--spawn-pty' must disable adaptive read buffering.
+It must also raise `read-process-output-max'.  Before Emacs 31 the
+former defaulted to t and throttled bursty TUI redraws."
   (let ((captured-adaptive 'unset)
         (captured-max nil)
         (orig-make-process (symbol-function #'make-process)))
@@ -5199,8 +5196,8 @@ and throttled bursty TUI redraws."
               (delete-process proc))))))))
 
 (ert-deftest ghostel-test-compile-spawn-disables-adaptive-read-buffering ()
-  "`ghostel-compile--spawn' must disable adaptive read buffering and
-raise `read-process-output-max'.  Same reason as
+  "`ghostel-compile--spawn' must disable adaptive read buffering.
+It must also raise `read-process-output-max'.  Same reason as
 `ghostel--spawn-pty' (issue #85)."
   (let ((captured-adaptive 'unset)
         (captured-max nil)

@@ -37,42 +37,45 @@
 ;; Usage:
 ;;
 ;;   M-x ghostel          Open a new terminal
+;;   M-x ghostel-project  Open a terminal in the current project root
 ;;   M-x ghostel-other    Switch to next terminal or create one
 ;;
 ;; Key bindings in the terminal buffer:
 ;;
 ;;   Most keys are sent directly to the shell.  Keys in
 ;;   `ghostel-keymap-exceptions' (C-c, C-x, M-x, etc.) pass through
-;;   to Emacs.  Terminal control keys use a C-c prefix:
+;;   to Emacs.  Terminal control and navigation use a C-c prefix:
 ;;
-;;   C-c C-c   Interrupt        C-c C-z   Suspend
-;;   C-c C-d   EOF              C-c C-\   Quit
-;;   C-c C-t   Copy mode        C-c C-y   Paste
-;;   C-c C-l   Clear scrollback C-c C-q   Send next key literally
-;;   C-y       Yank             M-y       Yank-pop
+;;   C-c C-c   Interrupt          C-c C-z   Suspend
+;;   C-c C-d   EOF                C-c C-\   Quit
+;;   C-c C-t   Copy mode          C-c C-y   Paste
+;;   C-c C-l   Clear scrollback   C-c C-q   Send next key literally
+;;   C-c M-w   Copy scrollback    C-y / M-y Yank / yank-pop
+;;   C-c C-n / C-c C-p            Next/previous hyperlink
+;;   C-c M-n / C-c M-p            Next/previous prompt (OSC 133)
 ;;
 ;; Copy mode (C-c C-t) freezes the display and enables standard Emacs
 ;; navigation.  Set mark with C-SPC, select text, then M-w to copy.
-;; Soft-wrapped newlines and trailing whitespace are stripped
-;; automatically.
 ;;
 ;; Shell integration:
 ;;
-;;   For directory tracking (OSC 7), source the appropriate script
-;;   from etc/ in your shell configuration:
+;;   Directory tracking (OSC 7), prompt navigation (OSC 133), and the
+;;   `ghostel_cmd' helper are auto-injected for bash, zsh, and fish —
+;;   no shell rc changes needed.  Controlled by `ghostel-shell-integration'
+;;   (default t); set it to nil to source etc/ghostel.{bash,zsh,fish}
+;;   manually instead.
 ;;
-;;     # bash (~/.bashrc)
-;;     [[ "$INSIDE_EMACS" = 'ghostel' ]] && \
-;;       source "$EMACS_GHOSTEL_PATH/etc/ghostel.bash"
+;; Native module:
 ;;
-;;     # zsh (~/.zshrc)
-;;     [[ "$INSIDE_EMACS" = 'ghostel' ]] && \
-;;       source "$EMACS_GHOSTEL_PATH/etc/ghostel.zsh"
+;;   A pre-built binary is downloaded automatically on first use.  To
+;;   build from source instead (requires Zig 0.15.2+), run zig build
+;;   from the project root, or M-x ghostel-module-compile.  M-x
+;;   ghostel-download-module re-fetches the pre-built binary.
 ;;
-;; Building the native module (requires Zig 0.15.2+):
-;;
-;;   Run zig build from the project root,
-;;   or M-x ghostel-module-compile from within Emacs.
+;; See also: evil-ghostel.el (evil-mode integration), ghostel-compile.el
+;; (TTY-backed M-x compile replacement), ghostel-eshell.el (eshell
+;; visual-command integration).  TRAMP paths as `default-directory'
+;; spawn remote shells; see README.md for details.
 
 ;;; Code:
 
@@ -1408,26 +1411,6 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             row col
                             (ghostel--mouse-mods event)))))
 
-
-(defun ghostel-copy-mode-previous-line ()
-  "Move to the previous line in copy mode."
-  (interactive)
-  (let ((col (current-column)))
-    (forward-line -1)
-    (move-to-column col)))
-
-(defun ghostel-copy-mode-next-line ()
-  "Move to the next line in copy mode."
-  (interactive)
-  (let ((col (current-column)))
-    (forward-line 1)
-    (move-to-column col)))
-
-(defun ghostel-copy-mode-beginning-of-buffer ()
-  "Move to the top of the buffer (oldest scrollback) in copy mode."
-  (interactive)
-  (goto-char (point-min)))
-
 (defun ghostel-copy-mode-end-of-buffer ()
   "Move to the bottom of the buffer (current viewport) in copy mode."
   (interactive)
@@ -1525,9 +1508,6 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
     ;; Prompt navigation works in copy mode too
     (define-key map (kbd "C-c M-n") #'ghostel-next-prompt)
     (define-key map (kbd "C-c M-p") #'ghostel-previous-prompt)
-    (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
-    (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
-    (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
     (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
@@ -1551,7 +1531,7 @@ Covers both `global-hl-line-mode' and buffer-local `hl-line-mode'.")
   "Enter copy mode for selecting and copying terminal text.
 Live terminal output is paused; standard Emacs navigation, search,
 and marking work across the full scrollback that is already rendered
-in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
+in the buffer."
   (interactive)
   (if ghostel--copy-mode-active
       (ghostel-copy-mode-exit)
@@ -1569,7 +1549,7 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
     (setq buffer-read-only t)
     (setq mode-line-process ":Copy")
     (force-mode-line-update)
-    (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit")))
+    (message "Copy mode: Press any key to exit")))
 
 (defun ghostel-copy-mode-exit ()
   "Exit copy mode and return to terminal mode."
