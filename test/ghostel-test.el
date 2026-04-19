@@ -1583,6 +1583,206 @@ the reply waits for the redraw timer."
     (should (equal nil (ghostel--focus-event term t)))))   ; focus ignored after reset
 
 ;; -----------------------------------------------------------------------
+;; Test: window-level focus events (issue #140)
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test--make-focus-buffer (name)
+  "Create a ghostel-mode buffer NAME with a fake term and live process.
+Returns the buffer."
+  (let ((buf (generate-new-buffer name)))
+    (with-current-buffer buf
+      (ghostel-mode)
+      (setq ghostel--term (vector 'fake-term))
+      (setq ghostel--process
+            (start-process (concat "ghostel-test-focus-" name)
+                           nil "cat"))
+      (set-process-query-on-exit-flag ghostel--process nil))
+    buf))
+
+(defun ghostel-test--cleanup-focus-buffer (buf)
+  "Kill BUF and its fake process."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (when (and ghostel--process (process-live-p ghostel--process))
+        (delete-process ghostel--process)))
+    (kill-buffer buf)))
+
+(defmacro ghostel-test--with-focus-stub (events-var focus-fn &rest body)
+  "Run BODY with `ghostel--focus-event' and `frame-focus-state' stubbed.
+EVENTS-VAR names a list that receives (BUFFER . FOCUSED) pairs.
+FOCUS-FN is a zero-arg function returning the current `frame-focus-state'."
+  (declare (indent 2))
+  `(cl-letf (((symbol-function 'ghostel--focus-event)
+              (lambda (_term focused)
+                (push (cons (current-buffer) focused) ,events-var)
+                t))
+             ((symbol-function 'frame-focus-state)
+              (lambda (&optional _frame) (funcall ,focus-fn))))
+     ,@body))
+
+(ert-deftest ghostel-test-focus-window-selection ()
+  "Window selection changes flip per-buffer focus state."
+  (let* ((events nil)
+         (focus-fn (lambda () t))
+         (buf (ghostel-test--make-focus-buffer " *ghostel-focus-1*"))
+         (other (generate-new-buffer " *other*"))
+         (saved-window-config (current-window-configuration)))
+    (unwind-protect
+        (ghostel-test--with-focus-stub events focus-fn
+          (delete-other-windows)
+          (switch-to-buffer buf)
+          (let ((other-win (split-window)))
+            (set-window-buffer other-win other)
+            ;; ghostel window selected → focus-in
+            (ghostel--focus-change)
+            (should (equal (car events) (cons buf t)))
+            ;; Select the other window → focus-out
+            (select-window other-win)
+            (setq events nil)
+            (ghostel--focus-change)
+            (should (equal (car events) (cons buf nil)))
+            ;; Select ghostel window again → focus-in
+            (select-window (get-buffer-window buf))
+            (setq events nil)
+            (ghostel--focus-change)
+            (should (equal (car events) (cons buf t)))))
+      (set-window-configuration saved-window-config)
+      (ghostel-test--cleanup-focus-buffer buf)
+      (kill-buffer other))))
+
+(ert-deftest ghostel-test-focus-dedup ()
+  "Repeat calls with unchanged state do not re-send focus events."
+  (let* ((events nil)
+         (frame-focused t)
+         (focus-fn (lambda () frame-focused))
+         (buf (ghostel-test--make-focus-buffer " *ghostel-focus-dedup*"))
+         (saved-window-config (current-window-configuration)))
+    (unwind-protect
+        (ghostel-test--with-focus-stub events focus-fn
+          (delete-other-windows)
+          (switch-to-buffer buf)
+          (ghostel--focus-change)          ; focus-in
+          (ghostel--focus-change)          ; no-op (dedup)
+          (ghostel--focus-change)          ; no-op (dedup)
+          (should (equal events (list (cons buf t))))
+          ;; Transition to focus-out, then confirm further calls dedup.
+          (setq frame-focused nil)
+          (ghostel--focus-change)          ; focus-out
+          (ghostel--focus-change)          ; no-op (dedup)
+          (should (equal events (list (cons buf nil) (cons buf t)))))
+      (set-window-configuration saved-window-config)
+      (ghostel-test--cleanup-focus-buffer buf))))
+
+(ert-deftest ghostel-test-focus-two-ghostel-buffers ()
+  "Only the ghostel buffer in the selected window is focused."
+  (let* ((events nil)
+         (focus-fn (lambda () t))
+         (buf-a (ghostel-test--make-focus-buffer " *ghostel-focus-a*"))
+         (buf-b (ghostel-test--make-focus-buffer " *ghostel-focus-b*"))
+         (saved-window-config (current-window-configuration)))
+    (unwind-protect
+        (ghostel-test--with-focus-stub events focus-fn
+          (delete-other-windows)
+          (switch-to-buffer buf-a)
+          (let ((win-b (split-window)))
+            (set-window-buffer win-b buf-b)
+            ;; A selected: A transitions nil→t, B stays nil (dedup).
+            (ghostel--focus-change)
+            (should (equal events (list (cons buf-a t))))
+            ;; Select B: A transitions t→nil, B transitions nil→t.
+            (select-window win-b)
+            (setq events nil)
+            (ghostel--focus-change)
+            (should (= (length events) 2))
+            (should (member (cons buf-a nil) events))
+            (should (member (cons buf-b t) events))
+            ;; Back to A: inverse transitions.
+            (select-window (get-buffer-window buf-a))
+            (setq events nil)
+            (ghostel--focus-change)
+            (should (= (length events) 2))
+            (should (member (cons buf-a t) events))
+            (should (member (cons buf-b nil) events))))
+      (set-window-configuration saved-window-config)
+      (ghostel-test--cleanup-focus-buffer buf-a)
+      (ghostel-test--cleanup-focus-buffer buf-b))))
+
+(ert-deftest ghostel-test-focus-frame-blur ()
+  "Frame losing focus drives the ghostel buffer to focus-out."
+  (let* ((events nil)
+         (frame-focused t)
+         (focus-fn (lambda () frame-focused))
+         (buf (ghostel-test--make-focus-buffer " *ghostel-focus-blur*"))
+         (saved-window-config (current-window-configuration)))
+    (unwind-protect
+        (ghostel-test--with-focus-stub events focus-fn
+          (delete-other-windows)
+          (switch-to-buffer buf)
+          (ghostel--focus-change)          ; focus-in
+          (should (equal (car events) (cons buf t)))
+          (setq frame-focused nil)         ; simulate app blur
+          (setq events nil)
+          (ghostel--focus-change)
+          (should (equal (car events) (cons buf nil)))
+          (setq frame-focused t)           ; refocus
+          (setq events nil)
+          (ghostel--focus-change)
+          (should (equal (car events) (cons buf t))))
+      (set-window-configuration saved-window-config)
+      (ghostel-test--cleanup-focus-buffer buf))))
+
+(ert-deftest ghostel-test-focus-skips-state-update-when-1004-off ()
+  "Dropped events (mode 1004 off) do not update cached focus state.
+Otherwise, enabling 1004 after a focus change would dedup away the
+first real focus event."
+  (let* ((events nil)
+         (emit-p nil)
+         (buf (ghostel-test--make-focus-buffer " *ghostel-focus-gated*"))
+         (saved-window-config (current-window-configuration)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--focus-event)
+                   (lambda (_term focused)
+                     (when emit-p
+                       (push (cons (current-buffer) focused) events))
+                     emit-p))
+                  ((symbol-function 'frame-focus-state)
+                   (lambda (&optional _frame) t)))
+          (delete-other-windows)
+          (switch-to-buffer buf)
+          ;; Mode 1004 off: event is dropped, state must remain nil.
+          (ghostel--focus-change)
+          (should (null events))
+          (with-current-buffer buf
+            (should (null ghostel--focus-state)))
+          ;; Child now enables mode 1004.  Next focus-change must emit.
+          (setq emit-p t)
+          (ghostel--focus-change)
+          (should (equal events (list (cons buf t)))))
+      (set-window-configuration saved-window-config)
+      (ghostel-test--cleanup-focus-buffer buf))))
+
+(ert-deftest ghostel-test-focus-minibuffer ()
+  "Activating the minibuffer triggers focus-out on the ghostel buffer."
+  (let* ((events nil)
+         (focus-fn (lambda () t))
+         (buf (ghostel-test--make-focus-buffer " *ghostel-focus-mini*"))
+         (saved-window-config (current-window-configuration)))
+    (unwind-protect
+        (ghostel-test--with-focus-stub events focus-fn
+          (delete-other-windows)
+          (switch-to-buffer buf)
+          (ghostel--focus-change)
+          (should (equal (car events) (cons buf t)))
+          ;; Simulate minibuffer activation by selecting the minibuffer window.
+          (let ((mb-win (minibuffer-window)))
+            (select-window mb-win)
+            (setq events nil)
+            (ghostel--focus-change)
+            (should (equal (car events) (cons buf nil)))))
+      (set-window-configuration saved-window-config)
+      (ghostel-test--cleanup-focus-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: incremental (partial) redraw
 ;; -----------------------------------------------------------------------
 
@@ -5942,7 +6142,13 @@ while :; do sleep 0.1; done'\n")
 
 
 (defconst ghostel-test--elisp-tests
-  '(ghostel-test-raw-key-sequences
+  '(ghostel-test-focus-window-selection
+    ghostel-test-focus-dedup
+    ghostel-test-focus-two-ghostel-buffers
+    ghostel-test-focus-frame-blur
+    ghostel-test-focus-skips-state-update-when-1004-off
+    ghostel-test-focus-minibuffer
+    ghostel-test-raw-key-sequences
     ghostel-test-modifier-number
     ghostel-test-send-event
     ghostel-test-raw-key-modified-specials

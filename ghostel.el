@@ -2244,17 +2244,41 @@ Call this after changing the Emacs theme so terminals match."
 
 ;;; Focus events
 
-(defun ghostel--focus-change ()
-  "Notify ghostel terminals in the selected frame about focus change.
-Only send the event if the terminal has enabled focus reporting (mode 1004)."
-  (let ((focused (frame-focus-state)))
-    (dolist (buf (buffer-list))
+(defvar-local ghostel--focus-state nil
+  "Last focus state actually reported to the terminal for this buffer.
+Non-nil means a focus-in event was delivered.  Only updated when
+`ghostel--focus-event' actually emits (mode 1004 enabled), so that
+enabling 1004 after a focus change still lets the next event fire.")
+
+(defun ghostel--buffer-focused-p (buf)
+  "Return non-nil if BUF is logically focused.
+BUF is focused when it is displayed in the selected window of a
+frame whose focus state is t (i.e. the frame has keyboard focus
+and the buffer is the active selection within it)."
+  (seq-some (lambda (win)
+              (let ((frame (window-frame win)))
+                (and (eq (frame-focus-state frame) t)
+                     (eq win (frame-selected-window frame)))))
+            (get-buffer-window-list buf nil t)))
+
+(defun ghostel--focus-change (&rest _)
+  "Update focus state for every live ghostel buffer.
+Called from `after-focus-change-function',
+`window-selection-change-functions', and
+`window-buffer-change-functions'.  Sends a focus event only when
+the buffer's logical focus state transitions; `ghostel--focus-event'
+further gates on terminal mode 1004."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
       (with-current-buffer buf
         (when (and (derived-mode-p 'ghostel-mode)
                    ghostel--term
                    ghostel--process
                    (process-live-p ghostel--process))
-          (ghostel--focus-event ghostel--term focused))))))
+          (let ((focused (and (ghostel--buffer-focused-p buf) t)))
+            (unless (eq focused ghostel--focus-state)
+              (when (ghostel--focus-event ghostel--term focused)
+                (setq ghostel--focus-state focused)))))))))
 
 (defvar-local ghostel--pending-output nil
   "Accumulated output chunks waiting to be fed to the terminal.
@@ -2319,7 +2343,6 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--input-timer
           (cancel-timer ghostel--input-timer)
           (setq ghostel--input-timer nil))
-        (remove-function after-focus-change-function #'ghostel--focus-change)
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
             (kill-buffer buf)
@@ -2978,6 +3001,8 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (setq-local scroll-conservatively 101)
   (setq-local line-spacing 0)
   (add-function :after after-focus-change-function #'ghostel--focus-change)
+  (add-hook 'window-selection-change-functions #'ghostel--focus-change)
+  (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
   (ghostel--suppress-interfering-modes)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
