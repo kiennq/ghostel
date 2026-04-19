@@ -5787,10 +5787,155 @@ start-up size and breaks live resize."
                                       captured-env))
                 (should-not (seq-some (lambda (s) (string-prefix-p "COLUMNS=" s))
                                       captured-env))
-                (should (member "TERM=xterm-256color" captured-env))
+                (should (member "TERM=xterm-ghostty" captured-env))
+                (should (member "TERM_PROGRAM=ghostty" captured-env))
+                (should (seq-some (lambda (s) (string-prefix-p "TERMINFO=" s))
+                                  captured-env))
                 (should (member "COLORTERM=truecolor" captured-env)))
             (when (process-live-p proc)
               (delete-process proc))))))))
+
+(ert-deftest ghostel-test-start-process-respects-ghostel-term-opt-out ()
+  "Setting `ghostel-term' to xterm-256color drops the Ghostty advertisement.
+TERMINFO and TERM_PROGRAM must not leak through when the user opts
+out — otherwise outbound `ssh' (or any consumer of those vars) would
+falsely conclude that ghostty is the controlling terminal."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/sh")
+               (ghostel-shell-integration nil)
+               (ghostel-term "xterm-256color")
+               (default-directory "/tmp/")
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (progn
+                (should (member "TERM=xterm-256color" captured-env))
+                (should (member "COLORTERM=truecolor" captured-env))
+                (should-not (seq-some (lambda (s) (string-prefix-p "TERMINFO=" s))
+                                      captured-env))
+                (should-not (member "TERM_PROGRAM=ghostty" captured-env)))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
+(ert-deftest ghostel-test-start-process-ssh-install-exports-env ()
+  "`ghostel-ssh-install-terminfo' must export GHOSTEL_SSH_INSTALL_TERMINFO=1.
+The bundled bash/zsh/fish integration scripts gate the outbound
+`ssh' install-and-cache wrapper on this env var, so the elisp custom
+is the single source of truth.
+
+The `auto' default follows `ghostel-tramp-shell-integration': enabled
+when that's non-nil, off otherwise.  Setting it to t forces on,
+setting it to nil forces off."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/sh")
+               (ghostel-shell-integration nil)
+               ;; Without this, the per-iteration `delete-process' fires
+               ;; the sentinel which kills our `with-temp-buffer' buffer,
+               ;; flipping `current-buffer' (and its `default-directory')
+               ;; for subsequent iterations.
+               (ghostel-kill-buffer-on-exit nil)
+               (default-directory "/tmp/"))
+          ;; auto + tramp-shell-integration nil → not exported.
+          (setq captured-env nil)
+          (let* ((ghostel-ssh-install-terminfo 'auto)
+                 (ghostel-tramp-shell-integration nil)
+                 (proc (ghostel--start-process)))
+            (unwind-protect
+                (should-not (member "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                                    captured-env))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; auto + tramp-shell-integration t → exported.
+          (setq captured-env nil)
+          (let* ((ghostel-ssh-install-terminfo 'auto)
+                 (ghostel-tramp-shell-integration t)
+                 (proc (ghostel--start-process)))
+            (unwind-protect
+                (should (member "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                                captured-env))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; Forced on.
+          (setq captured-env nil)
+          (let* ((ghostel-ssh-install-terminfo t)
+                 (ghostel-tramp-shell-integration nil)
+                 (proc (ghostel--start-process)))
+            (unwind-protect
+                (should (member "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                                captured-env))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; Forced off (overrides tramp-shell-integration).
+          (setq captured-env nil)
+          (let* ((ghostel-ssh-install-terminfo nil)
+                 (ghostel-tramp-shell-integration t)
+                 (proc (ghostel--start-process)))
+            (unwind-protect
+                (should-not (member "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                                    captured-env))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; Local TERM opt-out (`ghostel-term' /= xterm-ghostty)
+          ;; suppresses the SSH-install advertisement even when forced
+          ;; on — otherwise outbound ssh would falsely claim ghostty
+          ;; while the local buffer is plain xterm-256color.
+          (setq captured-env nil)
+          (let* ((ghostel-term "xterm-256color")
+                 (ghostel-ssh-install-terminfo t)
+                 (ghostel-tramp-shell-integration t)
+                 (proc (ghostel--start-process)))
+            (unwind-protect
+                (should-not (member "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                                    captured-env))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; Bundled terminfo missing (e.g. broken install): the env
+          ;; helper falls back to TERM=xterm-256color *and* must
+          ;; suppress GHOSTEL_SSH_INSTALL_TERMINFO so the wrapper
+          ;; doesn't try to advertise xterm-ghostty over ssh.
+          (setq captured-env nil)
+          (cl-letf (((symbol-function #'ghostel--terminfo-directory)
+                     (lambda () nil))
+                    ;; Suppress the one-shot fallback warning during
+                    ;; the test so it doesn't pollute output.
+                    (ghostel--terminfo-warned t))
+            (let* ((ghostel-term "xterm-ghostty")
+                   (ghostel-ssh-install-terminfo t)
+                   (ghostel-tramp-shell-integration t)
+                   (proc (ghostel--start-process)))
+              (unwind-protect
+                  (progn
+                    (should (member "TERM=xterm-256color" captured-env))
+                    (should-not (member "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                                        captured-env)))
+                (when (process-live-p proc) (delete-process proc))))))))))
+
+(ert-deftest ghostel-test-terminfo-directory-finds-bundled ()
+  "`ghostel--terminfo-directory' must locate the bundled compiled entries.
+The package ships compiled terminfo for both macOS (78/) and Linux (x/)
+layouts; if neither is present after install, the lookup must return
+nil so the fallback warning fires."
+  (let ((dir (ghostel--terminfo-directory)))
+    (should dir)
+    (should (file-directory-p dir))
+    (should (or (file-readable-p (expand-file-name "78/xterm-ghostty" dir))
+                (file-readable-p (expand-file-name "x/xterm-ghostty" dir))))))
 
 (ert-deftest ghostel-test-start-process-local-bash-integration-keeps-early-echo ()
   "Local bash integration must keep `stty echo' in the wrapper.
@@ -6326,7 +6471,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-exec-calls-spawn-pty-with-expected-args
     ghostel-test-exec-threads-remote-p-from-tramp-dir
     ghostel-test-eshell-visual-command-mode-toggles-advice
-    ghostel-test-eshell/ghostel-dispatches-to-exec-visual)
+    ghostel-test-eshell/ghostel-dispatches-to-exec-visual
+    ghostel-test-terminfo-directory-finds-bundled)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()

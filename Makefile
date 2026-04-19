@@ -6,7 +6,7 @@ EVIL_DIR       ?= $(XDG_CACHE_HOME)/evil
 
 ELC := ghostel.elc ghostel-debug.elc ghostel-compile.elc ghostel-eshell.elc
 
-.PHONY: all build test test-native test-all test-evil lint melpazoid byte-compile bench bench-quick clean
+.PHONY: all build test test-native test-all test-evil lint melpazoid byte-compile bench bench-quick clean regen-terminfo
 
 all: build test-all test-evil lint
 
@@ -67,7 +67,7 @@ melpazoid:
 	@if [ ! -d "$(MELPAZOID_DIR)" ]; then \
 		git clone https://github.com/riscy/melpazoid.git "$(MELPAZOID_DIR)"; \
 	fi
-	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files ("ghostel.el" "ghostel-debug.el" "ghostel-compile.el" "ghostel-module.*"))' \
+	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files ("ghostel.el" "ghostel-debug.el" "ghostel-compile.el" "ghostel-module.*" "terminfo"))' \
 		LOCAL_REPO=$(CURDIR) \
 		make -C "$(MELPAZOID_DIR)"
 
@@ -81,3 +81,22 @@ clean:
 	rm -f ghostel-module.dylib ghostel-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache
+
+# Maintainer-only: regenerate the bundled compiled terminfo from
+# `terminfo/xterm-ghostty.terminfo'.  Run after bumping libghostty
+# (the source file should be re-extracted from a fresh Ghostty install
+# via `infocmp -x xterm-ghostty') and commit the resulting binaries.
+# `tic' on macOS emits the BSD hashed-dir layout (78/, 67/); the
+# binary file format is identical to Linux ncurses, so we mirror the
+# compiled entries into the Linux layout (x/, g/) by copying.
+regen-terminfo:
+	rm -rf terminfo/x terminfo/g terminfo/78 terminfo/67
+	tic -x -o terminfo/ terminfo/xterm-ghostty.terminfo
+	@if [ -d terminfo/78 ]; then \
+		mkdir -p terminfo/x terminfo/g; \
+		cp terminfo/78/xterm-ghostty terminfo/x/xterm-ghostty; \
+		cp terminfo/67/ghostty terminfo/g/ghostty; \
+	fi
+	@TERMINFO=$(CURDIR)/terminfo infocmp xterm-ghostty >/dev/null \
+		|| (echo "ERROR: regenerated terminfo failed to round-trip"; exit 1)
+	@find terminfo -type f | sort

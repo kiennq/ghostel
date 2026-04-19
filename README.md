@@ -124,6 +124,12 @@ ghostty dependency automatically.
 Alternatively, download a **pre-built binary** via `M-x ghostel-download-module`
 (or `C-u M-x ghostel-download-module` to pick a specific release).
 
+The compiled `xterm-ghostty` terminfo entry ships pre-built in
+`terminfo/` and is identical to what `tic` would produce locally —
+no build step needed, and the file format is portable across BSD
+and ncurses systems.  Maintainers regenerate it via `make
+regen-terminfo` after bumping libghostty.
+
 ## Shell Integration
 
 Shell integration (directory tracking via OSC 7, prompt navigation via OSC 133,
@@ -211,6 +217,7 @@ history — even outside copy mode.
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
 - 256-color and RGB (24-bit true color) support
+- **`TERM=xterm-ghostty` with bundled terminfo** — apps that consult terminfo for capabilities (Claude Code, neovim, tmux, modern TUIs) discover synchronized output (DEC 2026), Kitty keyboard protocol, true color, colored underlines, focus reporting, etc., and use their fast paths.  Synchronized output in particular eliminates the choppy partial-redraw effect when Claude Code repaints over a large scrollback.  OSC 52 (clipboard) is supported but intentionally not advertised in the bundled terminfo — see Clipboard below.  Override via `ghostel-term`.
 - **OSC 4 / 10 / 11 color queries** — TUI programs can query the current palette, foreground, and background colors, so tools like `duf`, `btop`, `delta`, and anything else using `termenv` auto-detect the right light/dark theme from the Emacs face colors
 - **OSC 9 / OSC 777** — desktop notifications and ConEmu progress reports (percentage shown in the mode line; see [Notifications and Progress](#notifications-and-progress))
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
@@ -224,7 +231,7 @@ history — even outside copy mode.
 - **File path detection** — patterns like `/path/to/file.el:42` become clickable, opening the file at the given line (toggle with `ghostel-enable-file-detection`)
 
 ### Clipboard
-- **OSC 52 clipboard** — terminal programs can set the Emacs kill ring and system clipboard (opt-in via `ghostel-enable-osc52`, useful for remote SSH sessions)
+- **OSC 52 clipboard** — terminal programs can set the Emacs kill ring and system clipboard (opt-in via `ghostel-enable-osc52`, useful for remote SSH sessions).  Note: the bundled `xterm-ghostty` terminfo intentionally **does not** advertise the `Ms` capability, so apps don't auto-discover it.  This avoids silent clipboard drops when `ghostel-enable-osc52` is at its default `nil`.  If you enable OSC 52 and want apps (neovim, tmux) to auto-detect, install upstream Ghostty's terminfo on the same path or override `TERMINFO`.
 - **Bracketed paste** — yank from kill ring sends text as a bracketed paste so shells handle it correctly
 
 ### Input
@@ -312,6 +319,116 @@ test "$INSIDE_EMACS" = 'ghostel'; and source ~/.local/share/ghostel/ghostel.fish
 
 The integration scripts provide directory tracking (OSC 7), prompt
 navigation (OSC 133), and `ghostel_cmd` for calling Elisp from the shell.
+
+#### Remote `xterm-ghostty` terminfo
+
+Ghostel sets `TERM=xterm-ghostty` so apps inside the buffer get the
+full capability set (synchronized output, Kitty keyboard, etc.).
+That same `TERM` value gets inherited by anything spawned inside
+the buffer — including `ssh REMOTE` and `M-x ghostel` from a TRAMP
+`default-directory`.  Remote hosts without the `xterm-ghostty`
+entry will then print `Error opening terminal: xterm-ghostty`.
+
+`ghostel-ssh-install-terminfo` (default `auto`) handles both cases.
+`auto` is enabled when `ghostel-tramp-shell-integration` is on, so
+turning on remote integration also turns on terminfo install — one
+switch.
+
+##### TRAMP-launched ghostel
+
+`M-x ghostel` from a TRAMP path (`/ssh:host:/path/`) spawns the
+shell on the remote.  Ghostel pushes the bundled compiled terminfo
+to a remote temp dir over the existing TRAMP connection (no extra
+ssh round-trip), sets `TERMINFO=<that dir>` in the remote shell's
+env, and cleans up on exit.  Both Linux (`x/`, `g/`) and macOS
+(`78/`, `67/`) layouts are written so any ncurses or BSD libcurses
+finds it.  Nothing persists on the remote.
+
+##### Outbound `ssh` from a local ghostel buffer
+
+The bundled bash/zsh/fish integration shadows `ssh` with a function
+that:
+
+1. Resolves the canonical target via `ssh -G` (normalises ssh_config
+   aliases).
+2. Looks up the target in `~/.cache/ghostel/ssh-terminfo-cache`.
+   The cache key includes a hash of the local terminfo, so libghostty
+   bumps automatically invalidate it.  Cache hit → connect with the
+   remembered `TERM`.
+3. On miss, runs a single setup ssh that probes whether the entry
+   already exists on the remote, and if not, installs it via
+   `tic -x -` into `~/.terminfo/`.  Records `ok` (use
+   `xterm-ghostty`) or `skip` (use `xterm-256color`) in the cache.
+4. Runs the user's actual ssh with the resolved `TERM`.
+
+The setup ssh is one extra connection per new host.  Without
+ControlMaster you'll see two auth prompts the first time.  Strongly
+recommended:
+
+```ssh-config
+# ~/.ssh/config
+Host *
+    ControlMaster auto
+    ControlPath   ~/.ssh/cm-%r@%h:%p
+    ControlPersist 60s
+```
+
+With this, the setup connection and the real connection share a
+single auth.  Subsequent connections within `ControlPersist` are
+free.
+
+The cache key includes a hash of the **local** terminfo, so
+libghostty bumps automatically invalidate the cache.  It does NOT
+notice when a remote's terminfo changes out-of-band (system update,
+manual `tic`).  Run `M-x ghostel-ssh-clear-terminfo-cache` to force
+re-probe.
+
+Verified working from macOS to Linux remotes.  Mixed macOS-to-macOS
+or BSD targets inherit `tic`'s native hashed-dir layout
+(`~/.terminfo/<hex>/`); `infocmp` reads the same path so they pair
+correctly.
+
+Skip-install heuristics:
+- `ssh HOST cmd` (user passes a remote command): wrapper skips
+  install for that call to avoid clashing with the user's command.
+  Connects with cached `TERM` if known, otherwise `xterm-256color`.
+  The next interactive `ssh HOST` triggers install.
+- `ssh -V`, `ssh -h`, etc. (no host resolved): pass through.
+- No `infocmp` locally: pass through.
+
+Per-call escape: prefix with `GHOSTEL_SSH_KEEP_TERM=1` to bypass
+the wrapper entirely.
+
+##### Manual install (no auto-machinery)
+
+If you'd rather not have ghostel touch remote hosts (and don't want
+the auto-cache), set `(setq ghostel-ssh-install-terminfo nil)` and
+install the entry yourself once per host.
+
+Pipe the local entry across:
+```bash
+infocmp -x xterm-ghostty | ssh REMOTE 'mkdir -p ~/.terminfo && tic -x -'
+```
+
+Or copy the bundled compiled binary from the package directory:
+```bash
+ssh REMOTE 'mkdir -p ~/.terminfo/x'
+scp <package-dir>/terminfo/x/xterm-ghostty REMOTE:~/.terminfo/x/
+# Ghostty also looks in 78/ on macOS:
+ssh REMOTE 'uname' | grep -q Darwin && {
+    ssh REMOTE 'mkdir -p ~/.terminfo/78'
+    scp <package-dir>/terminfo/78/xterm-ghostty REMOTE:~/.terminfo/78/
+}
+```
+
+After this, every shell on the remote sees `xterm-ghostty` and
+ghostel's outbound ssh wrapper is unnecessary.
+
+##### Drop the Ghostty advertisement entirely
+
+Set `(setq ghostel-term "xterm-256color")` to drop `TERM=xterm-ghostty`
+locally.  No advertisement, no terminfo gymnastics, no synchronized
+output fast-path either.
 
 ### Rendering
 - Incremental redraw — only dirty rows are re-rendered
@@ -441,6 +558,8 @@ individual faces with `M-x customize-face`.
 |----------------------------------|----------------------|----------------------------------------------------------|
 | `ghostel-module-auto-install`    | `ask`                | What to do when native module is missing (`ask`, `download`, `compile`, `nil`) |
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
+| `ghostel-term`                   | `"xterm-ghostty"`    | Value of `TERM` for spawned processes.  Default uses the bundled terminfo so apps can detect ghostel's full capability set.  Set to `"xterm-256color"` to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
+| `ghostel-ssh-install-terminfo`   | `auto`               | Install `xterm-ghostty` terminfo on remote hosts as needed.  `auto` follows `ghostel-tramp-shell-integration`.  Affects both TRAMP-launched ghostel (push terminfo over the existing TRAMP connection) and outbound `ssh` from a local buffer (install via `tic` on first connection, cache in `~/.cache/ghostel/ssh-terminfo-cache`).  Per-call ssh override: `GHOSTEL_SSH_KEEP_TERM=1` |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
 | `ghostel-shell-integration`      | `t`                  | Auto-inject shell integration                            |
 | `ghostel-tramp-default-method`   | `nil`                | TRAMP method for new remote paths from OSC 7 (nil uses `tramp-default-method`) |
@@ -513,6 +632,7 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-force-redraw`     | Force a full terminal redraw                 |
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
+| `M-x ghostel-ssh-clear-terminfo-cache` | Clear outbound-ssh terminfo install cache (force re-probe) |
 | `M-x ghostel-download-module`  | Download pre-built native module             |
 | `M-x ghostel-module-compile`   | Compile native module from source            |
 
@@ -557,6 +677,12 @@ renderer — no interactive shell sits between the command and the
 user, so multi-line shell scripts are passed through verbatim and
 no shell-integration setup is required.  The process sentinel
 delivers the real exit status.
+
+`ghostel-compile` inherits the same `TERM=xterm-ghostty` and
+`TERMINFO=...` env as `M-x ghostel`, so build output gets
+synchronized output, true color, etc.  If a test runner or build
+tool gets confused by the unfamiliar `TERM`, set
+`(setq ghostel-term "xterm-256color")`.
 
 ```elisp
 (require 'ghostel-compile)

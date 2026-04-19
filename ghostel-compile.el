@@ -461,11 +461,10 @@ local machine happens to have)."
                  (shell-quote-argument command))))
          (process-environment
           (append compilation-environment
-                  (list (format "INSIDE_EMACS=%s,compile" emacs-version)
-                        "TERM=xterm-256color"
-                        "COLORTERM=truecolor"
-                        ;; Defeat pagers (git grep, etc.).
-                        "PAGER=")
+                  (list (format "INSIDE_EMACS=%s,compile" emacs-version))
+                  (ghostel--terminal-env)
+                  ;; Defeat pagers (git grep, etc.).
+                  (list "PAGER=")
                   (copy-sequence process-environment)))
          ;; See `ghostel--spawn-pty' for why these are set.
          (process-adaptive-read-buffering nil)

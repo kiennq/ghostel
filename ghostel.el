@@ -99,6 +99,47 @@
   "Shell program to run in the terminal."
   :type 'string)
 
+(defcustom ghostel-term "xterm-ghostty"
+  "Value of `TERM' for ghostel processes.
+
+The default \"xterm-ghostty\" advertises ghostel's capability set via
+the bundled terminfo entry: synchronized output (DEC 2026), Kitty
+keyboard protocol, true color, colored underlines, focus reporting,
+and more.  Apps that key off these capabilities — Claude Code, modern
+TUIs, neovim, tmux — will use their fast paths.  Notably,
+synchronized output eliminates choppy partial-redraw effects when
+Claude Code or similar TUIs repaint over a large scrollback.
+
+OSC 52 clipboard is supported (`ghostel-enable-osc52', off by
+default) but intentionally NOT advertised in the bundled terminfo,
+to avoid silent yank drops when the option is disabled.
+
+Set to \"xterm-256color\" to fall back to a generic terminal.  When
+`ghostel-term' is not \"xterm-ghostty\", the bundled terminfo and
+`TERM_PROGRAM=ghostty' are not advertised, so nothing claims to be
+Ghostty.  This is also the right setting if outbound `ssh' from a
+ghostel buffer trips up on remote hosts that lack the xterm-ghostty
+terminfo entry."
+  :type '(choice (const :tag "Ghostty (recommended)" "xterm-ghostty")
+                 (const :tag "Generic xterm-256color" "xterm-256color")
+                 (string :tag "Other")))
+
+(defcustom ghostel-ssh-install-terminfo 'auto
+  "Install xterm-ghostty terminfo on remote hosts as needed.
+Affects both `M-x ghostel' from a TRAMP `default-directory' (push
+over the existing TRAMP connection) and outbound `ssh' from a
+local ghostel buffer (install via `tic' on first connection,
+cached in `~/.cache/ghostel/ssh-terminfo-cache').
+
+Values: `auto' (default; enabled when
+`ghostel-tramp-shell-integration' is non-nil), t, nil.  Always
+disabled when `ghostel-term' is not \"xterm-ghostty\".  See the
+README for the full design and per-call escape hatch."
+  :type '(choice
+          (const :tag "Auto (follow `ghostel-tramp-shell-integration')" auto)
+          (const :tag "Always" t)
+          (const :tag "Never" nil)))
+
 (defcustom ghostel-tramp-shells
   '(("ssh" login-shell)
     ("scp" login-shell)
@@ -2409,10 +2450,58 @@ When `default-directory' is a remote TRAMP path, consult
     (buffer-string)))
 
 (defun ghostel--write-remote-file (tramp-path content)
-  "Write CONTENT to TRAMP-PATH on the remote host."
+  "Write CONTENT to TRAMP-PATH on the remote host.
+CONTENT may be a unibyte string (e.g. compiled terminfo bytes) or
+a multibyte string (e.g. shell rc).  The temp buffer is set unibyte
+when CONTENT is unibyte so byte values round-trip without depending
+on an outer `coding-system-for-write' binding."
   (with-temp-buffer
+    (when (not (multibyte-string-p content))
+      (set-buffer-multibyte nil))
     (insert content)
     (write-region (point-min) (point-max) tramp-path nil 'silent)))
+
+(defun ghostel--push-remote-terminfo (remote-prefix)
+  "Push bundled compiled terminfo into a temp dir on the remote host.
+
+REMOTE-PREFIX is the TRAMP prefix (e.g. \"/ssh:host:\").  Writes
+both the Linux (x/) and macOS (78/) layouts so the remote ncurses
+or BSD libcurses finds it regardless of OS.  Returns a plist
+\(:env (...) :temp-dirs (...)) suitable for merging into the
+remote-integration plist, or nil if the local terminfo isn't
+available or the push fails."
+  (let ((local-dir (ghostel--terminfo-directory)))
+    (when local-dir
+      (condition-case err
+          (let* ((temp-dir (make-temp-file
+                            (concat remote-prefix "ghostel-tinfo-") t))
+                 (remote-dir (file-remote-p temp-dir 'localname))
+                 (coding-system-for-write 'binary)
+                 (coding-system-for-read 'binary))
+            (dolist (sub '("x" "g" "78" "67"))
+              (let ((src (expand-file-name
+                          (pcase sub
+                            ((or "x" "78") "xterm-ghostty")
+                            ((or "g" "67") "ghostty"))
+                          (expand-file-name sub local-dir))))
+                (when (file-readable-p src)
+                  (let ((bytes (with-temp-buffer
+                                 (set-buffer-multibyte nil)
+                                 (insert-file-contents-literally src)
+                                 (buffer-string)))
+                        (dest (concat (file-name-as-directory temp-dir)
+                                      sub "/"
+                                      (if (member sub '("x" "78"))
+                                          "xterm-ghostty"
+                                        "ghostty"))))
+                    (make-directory (file-name-directory dest) t)
+                    (ghostel--write-remote-file dest bytes)))))
+            (list :env (list (format "TERMINFO=%s" remote-dir))
+                  :temp-dirs (list temp-dir)))
+        (error
+         (message "ghostel: remote terminfo push failed: %s"
+                  (error-message-string err))
+         nil)))))
 
 (defun ghostel--cleanup-temp-paths (files dirs)
   "Delete temporary FILES and DIRS created for remote shell integration.
@@ -2423,11 +2512,25 @@ such as a per-session `.zshenv', are cleaned up as well."
   (dolist (d dirs)
     (ignore-errors (delete-directory d t))))
 
+(defun ghostel--merge-integration-plists (base extra)
+  "Merge EXTRA into BASE plist, appending list values for shared keys.
+Used to fold the terminfo-push plist into a shell-rc plist so the
+caller sees one combined :env / :temp-dirs / :temp-files."
+  (let ((out (copy-sequence base)))
+    (dolist (key '(:env :temp-files :temp-dirs))
+      (let ((b (plist-get base key))
+            (e (plist-get extra key)))
+        (when (or b e)
+          (setq out (plist-put out key (append b e))))))
+    out))
+
 (defun ghostel--setup-remote-integration (shell-type)
   "Set up shell integration on the remote host for SHELL-TYPE.
 Reads the local integration script, writes it (with any necessary
-preamble) to a temporary file on the remote host, and returns a
-plist (:env :args :stty :temp-files :temp-dirs) for
+preamble) to a temporary file on the remote host.  When the bundled
+terminfo is available locally, also pushes it to a remote temp dir
+over the same TRAMP connection and adds `TERMINFO=...' to the env.
+Returns a plist (:env :args :stty :temp-files :temp-dirs) for
 `ghostel--start-process'.
 Returns nil on failure."
   (condition-case err
@@ -2439,8 +2542,10 @@ Returns nil on failure."
              (ext (symbol-name shell-type))
              (integration (ghostel--read-local-file
                            (expand-file-name
-                            (format "etc/ghostel.%s" ext) ghostel-dir))))
-        (pcase shell-type
+                            (format "etc/ghostel.%s" ext) ghostel-dir)))
+             (tinfo (and (ghostel--ssh-install-enabled-p)
+                         (ghostel--push-remote-terminfo remote-prefix)))
+             (base (pcase shell-type
           ;; Bash: --rcfile replaces normal rc loading, so we source
           ;; startup files explicitly before the integration.
           ('bash
@@ -2503,11 +2608,101 @@ Returns nil on failure."
              (list :env nil
                    :args (list "-C" (format "source %s"
                                             (shell-quote-argument path)))
-                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp))))))
+                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp)))))))
+        (if tinfo
+            (ghostel--merge-integration-plists base tinfo)
+          base))
     (error
      (message "ghostel: remote shell integration failed: %s"
               (error-message-string err))
      nil)))
+
+(defvar ghostel--terminfo-warned nil
+  "Non-nil after a warning about missing bundled terminfo has been issued.
+Suppresses repeat warnings on every spawn.")
+
+(defun ghostel--package-directory ()
+  "Return the directory ghostel is loaded from, or nil."
+  (let ((src (or (locate-library "ghostel")
+                 load-file-name buffer-file-name)))
+    (and src (file-name-directory src))))
+
+(defun ghostel--terminfo-directory ()
+  "Return absolute path to bundled `terminfo/' directory if usable.
+Usable means a compiled xterm-ghostty entry exists in either the
+macOS hashed-dir layout (78/xterm-ghostty) or the Linux layout
+\(x/xterm-ghostty).  Returns nil if missing."
+  (let* ((pkg (ghostel--package-directory))
+         (dir (and pkg (expand-file-name "terminfo" pkg))))
+    (and dir
+         (file-directory-p dir)
+         (or (file-readable-p (expand-file-name "78/xterm-ghostty" dir))
+             (file-readable-p (expand-file-name "x/xterm-ghostty" dir)))
+         dir)))
+
+(defun ghostel--ssh-install-enabled-p ()
+  "Return non-nil if remote terminfo install is enabled.
+Honors `ghostel-ssh-install-terminfo'.  Always nil when
+`ghostel-term' isn't \"xterm-ghostty\" — there's no point installing
+ghostty terminfo on remotes when we're not even claiming it locally."
+  (and (equal ghostel-term "xterm-ghostty")
+       (pcase ghostel-ssh-install-terminfo
+         ('auto (and ghostel-tramp-shell-integration t))
+         ('nil  nil)
+         (_     t))))
+
+(defun ghostel-ssh-clear-terminfo-cache ()
+  "Delete the outbound-ssh terminfo install cache file.
+The bundled bash/zsh/fish wrappers cache per-host install outcomes
+in `~/.cache/ghostel/ssh-terminfo-cache' (XDG-aware).  Cache keys
+include a hash of the local terminfo, so libghostty bumps invalidate
+the local entries automatically — but not stale entries from before
+a remote out-of-band update.  Run this command after such an update
+\(or whenever you suspect the cache is wrong) to force re-probe."
+  (interactive)
+  (let* ((dir (or (getenv "XDG_CACHE_HOME")
+                  (expand-file-name ".cache" "~")))
+         (cache (expand-file-name "ghostel/ssh-terminfo-cache" dir)))
+    (if (file-exists-p cache)
+        (progn (delete-file cache)
+               (message "ghostel: cleared %s" cache))
+      (message "ghostel: no cache at %s" cache))))
+
+(defun ghostel--terminal-env ()
+  "Return list of TERM-related env-var strings for ghostel processes.
+Honors `ghostel-term' and `ghostel-ssh-install-terminfo'.  When
+\"xterm-ghostty\" is requested but the bundled terminfo isn't readable,
+falls back to xterm-256color and warns once per session.  The SSH
+install env var is only exported when the resolved TERM is actually
+xterm-ghostty — falling back to xterm-256color must not advertise a
+wrapper that would re-claim ghostty over ssh."
+  (let* ((env (cond
+               ((not (equal ghostel-term "xterm-ghostty"))
+                (list (concat "TERM=" ghostel-term) "COLORTERM=truecolor"))
+               (t
+                (let ((tinfo (ghostel--terminfo-directory)))
+                  (cond
+                   (tinfo
+                    (list "TERM=xterm-ghostty"
+                          (concat "TERMINFO=" tinfo)
+                          "TERM_PROGRAM=ghostty"
+                          "COLORTERM=truecolor"))
+                   (t
+                    (unless ghostel--terminfo-warned
+                      (setq ghostel--terminfo-warned t)
+                      (display-warning
+                       'ghostel
+                       (format
+                        "Bundled terminfo not found in %s; falling back to TERM=xterm-256color.  \
+Apps like Claude Code may exhibit choppy redraws.  Reinstall ghostel \
+to restore the terminfo/ directory, or customize `ghostel-term' to silence."
+                        (or (ghostel--package-directory) "<unknown>"))
+                       :warning))
+                    (list "TERM=xterm-256color" "COLORTERM=truecolor"))))))))
+    (if (and (member "TERM=xterm-ghostty" env)
+             (ghostel--ssh-install-enabled-p))
+        (append env (list "GHOSTEL_SSH_INSTALL_TERMINFO=1"))
+      env)))
 
 (defun ghostel--spawn-pty (program program-args height width stty-flags
                                    extra-env &optional remote-p)
@@ -2551,10 +2746,7 @@ matches the PTY window size, and stores the process in
                                                 program-args " "))))))
          (process-environment
           (append
-           (list
-            "INSIDE_EMACS=ghostel"
-            "TERM=xterm-256color"
-            "COLORTERM=truecolor")
+           (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
            extra-env
            process-environment))
          ;; Large TUI redraws (Claude Code, pi on resize) can emit
