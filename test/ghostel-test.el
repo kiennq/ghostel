@@ -5955,7 +5955,36 @@ rather than the selected window's buffer."
             (should-not (eq binding #'ghostel--send-event))
           (should (eq binding #'ghostel--send-event))))))
   ;; M-y should be bound to ghostel-yank-pop, not send-event
-  (should (eq (lookup-key ghostel-mode-map (kbd "M-y")) #'ghostel-yank-pop)))
+  (should (eq (lookup-key ghostel-mode-map (kbd "M-y")) #'ghostel-yank-pop))
+  ;; M-DEL must be bound so TTY Alt-Backspace ([27 127]) routes through
+  ;; ghostel--send-event instead of global backward-kill-word.
+  (should (eq (lookup-key ghostel-mode-map (kbd "M-DEL")) #'ghostel--send-event)))
+
+(ert-deftest ghostel-test-send-event-tty-esc-prefix ()
+  "Re-inject meta when the key arrives via ESC prefix (TTY Emacs).
+In TTY Emacs, M-<key> is delivered as two events ([27 KEY]) via
+`esc-map'.  `last-command-event' is just KEY with no meta modifier,
+but `this-command-keys-vector' retains the ESC prefix."
+  (let (captured-key captured-mods)
+    (cl-letf (((symbol-function 'ghostel--send-encoded)
+               (lambda (key mods &optional _utf8)
+                 (setq captured-key key captured-mods mods))))
+      (cl-flet ((sim-tty (keys-vec event expected-key expected-mods)
+                  (setq captured-key nil captured-mods nil)
+                  (cl-letf (((symbol-function 'this-command-keys-vector)
+                             (lambda () keys-vec)))
+                    (let ((last-command-event event))
+                      (ghostel--send-event)))
+                  (should (equal expected-key captured-key))
+                  (should (equal expected-mods captured-mods))))
+        ;; M-b in TTY: ESC then b → re-inject meta
+        (sim-tty (vector 27 ?b)   ?b  "b" "meta")
+        (sim-tty (vector 27 ?f)   ?f  "f" "meta")
+        (sim-tty (vector 27 ?d)   ?d  "d" "meta")
+        ;; M-DEL in TTY: ESC then 127 → backspace + meta
+        (sim-tty (vector 27 127)  127 "backspace" "meta")
+        ;; Already-meta event (shouldn't double-add meta)
+        (sim-tty (vector 27 ?b)   (aref (kbd "M-b") 0) "b" "meta")))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-yank-pop DWIM
@@ -7004,6 +7033,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-c-g-exits-copy-mode
     ghostel-test-inhibit-quit
     ghostel-test-meta-key-bindings
+    ghostel-test-send-event-tty-esc-prefix
     ghostel-test-yank-pop-after-yank
     ghostel-test-yank-pop-no-preceding-yank
     ghostel-test-copy-mode-recenter

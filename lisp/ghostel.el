@@ -1037,6 +1037,11 @@ is non-nil.")
       (let ((key-str (format "M-%c" c)))
         (unless (member key-str ghostel-keymap-exceptions)
           (define-key map (kbd key-str) #'ghostel--send-event))))
+    ;; M-DEL: TTY Emacs delivers Alt-Backspace as ESC + 0x7f, which
+    ;; resolves to ?\M-\d.  The `M-<backspace>' form above only covers
+    ;; the `[M-backspace]' symbol path; without this binding, TTY
+    ;; Alt-Backspace falls through to global `backward-kill-word'.
+    (define-key map (kbd "M-DEL") #'ghostel--send-event)
     ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
     (define-key map (kbd "C-@")
                 (lambda () (interactive) (ghostel--send-string "\x00")))
@@ -1282,12 +1287,21 @@ paste, yank, drop."
   "Send the current key event to the terminal via the key encoder.
 Extracts the base key name and modifiers from `last-command-event'
 and routes through the ghostty key encoder, which respects terminal
-modes (application cursor keys, Kitty keyboard protocol, etc.)."
+modes (application cursor keys, Kitty keyboard protocol, etc.).
+
+In TTY Emacs, `M-<key>' arrives as two events (ESC then <key>) via
+`esc-map'; `last-command-event' is just <key> and has no meta bit.
+Detect that case via `this-command-keys-vector' and re-inject meta."
   (interactive)
   (ghostel--snap-to-input)
   (let* ((event last-command-event)
+         (keys (this-command-keys-vector))
+         (via-esc (and (> (length keys) 1) (eq (aref keys 0) 27)))
          (base (event-basic-type event))
          (mods (event-modifiers event))
+         (mods (if (and via-esc (not (memq 'meta mods)))
+                   (cons 'meta mods)
+                 mods))
          (key-name (cond
                     ;; backtab is Emacs's name for S-TAB
                     ((eq base 'backtab) "tab")
