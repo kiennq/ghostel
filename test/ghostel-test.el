@@ -3818,6 +3818,98 @@ it through mangling."
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-hidden-buffer-snaps-on-reshow ()
+  "Buffer re-shown after output-while-hidden snaps to the viewport (issue #177).
+Dispatches through `window-buffer-change-functions' so the hook
+wiring — not just `ghostel--reshow-snap' in isolation — is exercised."
+  (let ((buf (generate-new-buffer " *ghostel-test-177-snap*"))
+        (other (get-buffer-create "*ghostel-test-177-other*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t)
+                 (win (selected-window)))
+            (dotimes (i 30)
+              (ghostel--write-input term (format "pre-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (set-window-buffer win buf)
+            (goto-char (point-max))
+            (set-window-point win (point-max))
+            (set-window-start win (ghostel--viewport-start) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            (let ((pre-hide-ws (window-start win)))
+              ;; Hide; output arrives while hidden so the anchor advances.
+              (set-window-buffer win other)
+              (dotimes (i 30)
+                (ghostel--write-input term (format "hidden-%02d\r\n" i)))
+              (setq ghostel--force-next-redraw t)
+              (ghostel--delayed-redraw buf)
+              ;; Re-show with the stale pre-hide `window-start', then
+              ;; dispatch the hook the way redisplay would.
+              (set-window-buffer win buf)
+              (set-window-start win pre-hide-ws t)
+              (run-hook-with-args 'window-buffer-change-functions win)
+              (setq ghostel--force-next-redraw t)
+              (ghostel--delayed-redraw buf)
+              (should (= (window-start win) (ghostel--viewport-start)))
+              ;; The snap entry was consumed and cleared.
+              (should-not ghostel--windows-needing-snap))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf)
+      (when (buffer-live-p other) (kill-buffer other)))))
+
+(ert-deftest ghostel-test-second-window-does-not-disturb-scrollback ()
+  "Opening a second window on a ghostel buffer does not yank peer windows.
+Issue #177 regression guard for the multi-window case: a window
+already scrolled back for reading history must stay put when a new
+window opens on the same buffer."
+  (let ((buf (generate-new-buffer " *ghostel-test-177-multi*"))
+        (orig-config (current-window-configuration))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t)
+                 (win-a (selected-window)))
+            (dotimes (i 30)
+              (ghostel--write-input term (format "pre-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (set-window-buffer win-a buf)
+            (set-window-start win-a (ghostel--viewport-start) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            ;; Scroll win-a into the scrollback.
+            (set-window-start win-a (point-min) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            (let ((scrollback-ws (window-start win-a))
+                  (win-b (split-window win-a)))
+              (set-window-buffer win-b buf)
+              (set-window-start win-b (point-min) t)
+              ;; Simulate the callback redisplay fires for the new window.
+              (run-hook-with-args 'window-buffer-change-functions win-b)
+              (setq ghostel--force-next-redraw t)
+              (ghostel--delayed-redraw buf)
+              ;; win-b snapped; win-a's scrollback is untouched.
+              (should (= (window-start win-b) (ghostel--viewport-start)))
+              (should (= (window-start win-a) scrollback-ws))
+              (should-not ghostel--windows-needing-snap))))
+      (set-window-configuration orig-config)
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-redraw-preserves-scroll-during-live-output ()
   "Scrollback view is preserved when live PTY output triggers a redraw.
 Before the fix, any redraw timer firing while the user was reading

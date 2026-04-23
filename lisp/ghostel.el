@@ -872,6 +872,14 @@ runs.  When nil, a redraw preserves the existing `window-start' if the
 user has scrolled into the scrollback, so live output and Emacs commands
 do not yank the view back to the prompt.")
 
+(defvar-local ghostel--windows-needing-snap nil
+  "List of windows that must anchor to the viewport on the next redraw.
+Populated by `ghostel--reshow-snap' when a window starts displaying
+this buffer, and cleared by `ghostel--delayed-redraw' after the anchor
+runs.  Per-window (rather than buffer-local like `ghostel--snap-requested')
+so opening a second window on a ghostel buffer does not yank peers the
+user has scrolled back for reading history (issue #177).")
+
 (defvar-local ghostel--last-anchor-position nil
   "Buffer position where the anchor last set `window-start'.
 Used by `ghostel--delayed-redraw' to tell windows that are following
@@ -3069,15 +3077,17 @@ position COL columns into the first matched line."
 (defsubst ghostel--window-anchored-p (win)
   "Non-nil if WIN is auto-following the viewport.
 A window counts as anchored when `ghostel--snap-requested' is set
-\(the user just typed), when no anchor has been recorded yet (first
-redraw), or when its `window-start' is at or past the prior anchor.
-During a resize-triggered redraw, a window absent from
+\(the user just typed), when WIN is in `ghostel--windows-needing-snap'
+\(WIN just gained this buffer), when no anchor has been recorded yet
+\(first redraw), or when its `window-start' is at or past the prior
+anchor.  During a resize-triggered redraw, a window absent from
 `ghostel--scroll-positions' also counts as anchored: the prior redraw
 left it following the viewport, so a drifted `window-start' below the
 anchor is Emacs redisplay (e.g. `keep-point-visible' when the
 minibuffer shrinks the window), not a user scroll."
   (let ((anchor ghostel--last-anchor-position))
     (or ghostel--snap-requested
+        (memq win ghostel--windows-needing-snap)
         (null anchor)
         (>= (window-start win) anchor)
         (and ghostel--redraw-resize-active
@@ -3230,7 +3240,8 @@ following the viewport."
                    win (assq win non-anchored-states))))
               (when vs
                 (setq ghostel--last-anchor-position vs))))
-          (setq ghostel--snap-requested nil))))))
+          (setq ghostel--snap-requested nil)
+          (setq ghostel--windows-needing-snap nil))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
@@ -3298,6 +3309,26 @@ PROCESS is the shell process, WINDOWS is the list of windows."
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
     ;; after this function returns.  nil suppresses the call.
     size))
+
+(defun ghostel--reshow-snap (window)
+  "Mark WINDOW for viewport-snap on the next redraw.
+Intended for buffer-local `window-buffer-change-functions'.  Fires
+whenever this buffer becomes WINDOW's buffer: both on the classic
+hide-then-show transition and when an additional window opens on
+the same buffer (`split-window', `display-buffer', etc.).  While
+the buffer is hidden `ghostel--last-anchor-position' keeps advancing
+with each redraw, so the pre-show `window-start' that Emacs restores
+falls behind the anchor and is misclassified as scrollback (issue
+#177).  Recording WINDOW (rather than setting a buffer-level flag)
+forces the next redraw to anchor only that window, leaving peer
+windows the user may have scrolled back undisturbed.
+`ghostel--invalidate' schedules the redraw even when no new PTY
+output is arriving."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             ghostel--term)
+    (cl-pushnew window ghostel--windows-needing-snap)
+    (ghostel--invalidate)))
 
 (defun ghostel--commit-cropped-size (window)
   "Commit WINDOW's size if the user focused into a cropped ghostel window.
@@ -3371,6 +3402,8 @@ window (not when it has just been deselected)."
   ;; receives WINDOW directly (rather than FRAME as the default binding).
   (add-hook 'window-selection-change-functions
             #'ghostel--commit-cropped-size nil t)
+  (add-hook 'window-buffer-change-functions
+            #'ghostel--reshow-snap nil t)
   (ghostel--suppress-interfering-modes)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
