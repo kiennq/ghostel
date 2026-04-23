@@ -19,7 +19,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     // --- Symbol interning ---
@@ -155,6 +157,10 @@ pub const Env = struct {
         self.raw.non_local_exit_signal.?(self.raw, symbol, data);
     }
 
+    pub fn openChannel(self: Env, process: Value) i32 {
+        return self.raw.open_channel.?(self.raw, process);
+    }
+
     // --- Function registration ---
 
     pub fn makeFunction(
@@ -248,6 +254,14 @@ pub const Env = struct {
         _ = self.call4(sym.@"put-text-property", start, end, prop, value);
     }
 
+    pub fn bufferReadOnly(self: Env) bool {
+        return self.isNotNil(self.call1(sym.@"symbol-value", sym.@"buffer-read-only"));
+    }
+
+    pub fn setBufferReadOnly(self: Env, read_only: bool) void {
+        _ = self.call2(sym.@"set", sym.@"buffer-read-only", if (read_only) self.t() else self.nil());
+    }
+
     /// Signal an error with a message string.
     pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
@@ -291,7 +305,9 @@ pub const Sym = struct {
     // Built-in functions
     cons: Value,
     list: Value,
+    @"set": Value,
     @"symbol-value": Value,
+    @"buffer-read-only": Value,
     @"put-text-property": Value,
     @"goto-char": Value,
     point: Value,
@@ -319,7 +335,6 @@ pub const Sym = struct {
     // Ghostel symbols
     @"ghostel-link-map": Value,
     @"ghostel--set-buffer-face": Value,
-    @"ghostel--detect-urls": Value,
     @"ghostel--has-wide-chars": Value,
     @"ghostel--set-cursor-style": Value,
     @"ghostel--update-directory": Value,
@@ -335,11 +350,18 @@ pub const Sym = struct {
 };
 
 pub var sym: Sym = undefined;
+var sym_initialized = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
 pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
     inline for (std.meta.fields(Sym)) |field| {
         @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
     }
+    sym_initialized = true;
 }

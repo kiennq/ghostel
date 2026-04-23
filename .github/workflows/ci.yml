@@ -107,6 +107,7 @@ jobs:
             zig-out/bin/ghostel-module${{ matrix.suffix }}
             zig-out/bin/ghostel-module.json
             zig-out/bin/conpty-module${{ matrix.suffix }}
+            zig-out/bin/conpty-module.json
 
       - name: Upload module artifact
         if: matrix.os != 'windows-latest'

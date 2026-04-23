@@ -227,7 +227,7 @@ history — even outside copy mode.
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
 - 256-color and RGB (24-bit true color) support
-- **`TERM=xterm-ghostty` with bundled terminfo** — apps that consult terminfo for capabilities (Claude Code, neovim, tmux, modern TUIs) discover synchronized output (DEC 2026), Kitty keyboard protocol, true color, colored underlines, focus reporting, etc., and use their fast paths.  Synchronized output in particular eliminates the choppy partial-redraw effect when Claude Code repaints over a large scrollback.  OSC 52 (clipboard) is supported but intentionally not advertised in the bundled terminfo — see Clipboard below.  Override via `ghostel-term`.
+- **`TERM=xterm-ghostty` with bundled terminfo** — apps that consult terminfo for capabilities (Claude Code, neovim, tmux, modern TUIs) discover synchronized output (DEC 2026), Kitty keyboard protocol, true color, colored underlines, focus reporting, etc., and use their fast paths.  Synchronized output in particular eliminates the choppy partial-redraw effect when Claude Code repaints over a large scrollback.  OSC 52 (clipboard) is supported but intentionally not advertised in the bundled terminfo — see Clipboard below.  Override via `ghostel-term`.  On Windows, Ghostel defaults `ghostel-term` to `xterm-256color` until the bundled terminfo is wired up safely for ConPTY shells.
 - **OSC 4 / 10 / 11 color queries** — TUI programs can query the current palette, foreground, and background colors, so tools like `duf`, `btop`, `delta`, and anything else using `termenv` auto-detect the right light/dark theme from the Emacs face colors
 - **OSC 9 / OSC 777** — desktop notifications and ConEmu progress reports (percentage shown in the mode line; see [Notifications and Progress](#notifications-and-progress))
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
@@ -332,8 +332,12 @@ navigation (OSC 133), and `ghostel_cmd` for calling Elisp from the shell.
 
 #### Remote `xterm-ghostty` terminfo
 
-Ghostel sets `TERM=xterm-ghostty` so apps inside the buffer get the
-full capability set (synchronized output, Kitty keyboard, etc.).
+On non-Windows platforms, Ghostel sets `TERM=xterm-ghostty` when it can
+also provide matching terminfo for the shell it is starting, so apps
+inside the buffer get the full capability set (synchronized output,
+Kitty keyboard, etc.).  For TRAMP-launched shells without prepared
+remote terminfo, Ghostel falls back to `xterm-256color` instead of
+claiming unsupported capabilities.
 That same `TERM` value gets inherited by anything spawned inside
 the buffer — including `ssh REMOTE` and `M-x ghostel` from a TRAMP
 `default-directory`.  Remote hosts without the `xterm-ghostty`
@@ -579,7 +583,7 @@ inside a light Emacs):
 |----------------------------------|----------------------|----------------------------------------------------------|
 | `ghostel-module-auto-install`    | `ask`                | What to do when native module is missing (`ask`, `download`, `compile`, `nil`) |
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
-| `ghostel-term`                   | `"xterm-ghostty"`    | Value of `TERM` for spawned processes.  Default uses the bundled terminfo so apps can detect ghostel's full capability set.  Set to `"xterm-256color"` to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
+| `ghostel-term`                   | `"xterm-ghostty"` on Unix, `"xterm-256color"` on Windows | Value of `TERM` for spawned processes.  Unix defaults use the bundled terminfo so apps can detect ghostel's full capability set.  Windows stays on `"xterm-256color"` until bundled terminfo is wired up safely for ConPTY shells.  Set to `"xterm-256color"` anywhere to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
 | `ghostel-environment`            | `nil`                | Extra env vars for spawned processes (list of `"KEY=VALUE"` strings). |
 | `ghostel-ssh-install-terminfo`   | `auto`               | Install `xterm-ghostty` terminfo on remote hosts as needed.  `auto` follows `ghostel-tramp-shell-integration`.  Affects both TRAMP-launched ghostel (push terminfo over the existing TRAMP connection) and outbound `ssh` from a local buffer (install via `tic` on first connection, cache in `~/.cache/ghostel/ssh-terminfo-cache`).  Per-call ssh override: `GHOSTEL_SSH_KEEP_TERM=1` |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
@@ -716,10 +720,11 @@ user, so multi-line shell scripts are passed through verbatim and
 no shell-integration setup is required.  The process sentinel
 delivers the real exit status.
 
-`ghostel-compile` inherits the same `TERM=xterm-ghostty` and
-`TERMINFO=...` env as `M-x ghostel`, so build output gets
-synchronized output, true color, etc.  If a test runner or build
-tool gets confused by the unfamiliar `TERM`, set
+`ghostel-compile` inherits the same terminal env as `M-x ghostel`, so
+on Unix build output gets `TERM=xterm-ghostty` plus `TERMINFO=...`
+for synchronized output, true color, etc.  Windows keeps the safer
+`xterm-256color` default.  If a test runner or build tool gets
+confused by the unfamiliar `TERM`, set
 `(setq ghostel-term "xterm-256color")`.
 
 ```elisp
