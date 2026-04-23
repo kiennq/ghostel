@@ -8,7 +8,7 @@
 /// - DIRTY_FULL: erase buffer and redraw everything
 /// - DIRTY_PARTIAL: only update dirty rows in-place
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Terminal = @import("terminal.zig");
 
@@ -879,6 +879,12 @@ fn positionCursorByCell(env: emacs.Env, term: *Terminal, cx: u16, cy: u16) bool 
     return true;
 }
 
+fn temporarilyWritableBuffer(env: emacs.Env) bool {
+    const was_read_only = env.bufferReadOnly();
+    if (was_read_only) env.setBufferReadOnly(false);
+    return was_read_only;
+}
+
 /// Redraw the terminal into the current Emacs buffer.
 ///
 /// Maintains a "growing buffer" model where the Emacs buffer contains
@@ -894,6 +900,8 @@ fn positionCursorByCell(env: emacs.Env, term: *Terminal, cx: u16, cy: u16) bool 
 /// When `force_full` is true, the viewport region is fully re-rendered
 /// instead of using the incremental dirty-row path.
 pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
     // Snapshot the buffer's mark across the destructive ops below.  Both
     // paths — full (eraseBuffer / deleteRegion over the viewport) and
     // partial (per-row deleteRegion + insert) — move every marker in the
@@ -1240,10 +1248,23 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         // Trim excess buffer lines beyond the terminal's row count.
         // Partial redraws don't erase the viewport region, so stale
         // trailing lines can accumulate after a resize or mode switch.
+        //
+        // Important: keep a final newline when it represents a
+        // legitimate blank last terminal row. Only trim when there is
+        // an actual line *after* the last expected row.
         if (partial and row_count > 0) {
             env.gotoCharN(viewport_start_int);
-            if (env.forwardLine(@as(i64, @intCast(row_count))) == 0) {
-                env.deleteRegion(env.point(), env.pointMax());
+            if (env.forwardLine(@as(i64, @intCast(row_count - 1))) == 0) {
+                // Start of the line after the last expected row. If
+                // this succeeds, everything from the separator newline
+                // before that line to point-max is stale.
+                if (env.forwardLine(1) == 0) {
+                    const extra_start = env.point();
+                    const extra_start_int = env.extractInteger(extra_start);
+                    if (extra_start_int > 1) {
+                        env.deleteRegion(env.makeInteger(extra_start_int - 1), env.pointMax());
+                    }
+                }
             }
         }
 
@@ -1270,6 +1291,9 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         }
     }
 
+    // Plain-text URL/file detection is deferred and coalesced from Elisp
+    // after redraw so interactive typing does not pay the regex/property
+    // application cost inline. OSC-8 hyperlinks still stay native here.
     if (dirty != gt.DIRTY_FALSE) {
         if (has_wide_chars) {
             _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());
@@ -1340,4 +1364,144 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     // Clear the write flag so the next redraw can detect "writes happened
     // since last redraw" for the rotation check.
     term.wrote_since_redraw = false;
+}
+
+
+pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
+    const total_rows = term.getTotalRows();
+    if (total_rows == 0) return 1;
+
+    // Save current viewport position
+    const sb = term.getScrollbar() orelse return 1;
+    const saved_offset = sb.offset;
+
+    // Get default colors
+    // (need a render_state_update to read them, use current viewport for that)
+    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
+        return 1;
+    }
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
+    var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
+    var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
+
+    // Set buffer default face
+    var fg_hex: [7]u8 = undefined;
+    var bg_hex: [7]u8 = undefined;
+    _ = env.call2(
+        emacs.sym.@"ghostel--set-buffer-face",
+        env.makeString(formatColor(default_fg, &fg_hex)),
+        env.makeString(formatColor(default_bg, &bg_hex)),
+    );
+
+    // Erase buffer
+    env.eraseBuffer();
+
+    // Scroll to top of scrollback
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+
+    // Shared buffers for row content
+    var runs: [512]RunInfo = undefined;
+    var text_buf: [16384]u8 = undefined;
+
+    var rendered: usize = 0;
+    var prev_wrapped: bool = false;
+
+    while (rendered < total_rows) {
+        // Query actual viewport position
+        const cur_sb = term.getScrollbar() orelse break;
+        const viewport_start = cur_sb.offset;
+
+        // Update render state for current viewport
+        if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
+            break;
+        }
+
+        // Get row iterator
+        if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+            break;
+        }
+
+        // How many rows to skip (already rendered from previous page overlap)
+        const viewport_rows: usize = term.rows;
+        const skip: usize = if (rendered > viewport_start) rendered - viewport_start else 0;
+        if (skip >= viewport_rows) break; // no new rows in this viewport
+        // How many rows to take from this viewport
+        const take: usize = @min(viewport_rows - skip, total_rows - rendered);
+        if (take == 0) break; // no progress possible
+
+        var row_in_page: usize = 0;
+        while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+            defer row_in_page += 1;
+
+            if (row_in_page < skip) {
+                // Still need to track wrap state through skipped rows
+                prev_wrapped = isRowWrapped(term);
+                continue;
+            }
+            if (row_in_page >= skip + take) {
+                break;
+            }
+
+            // Get cells for this row
+            if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+                prev_wrapped = false;
+                rendered += 1;
+                continue;
+            }
+
+            // Insert newline between rows
+            if (rendered > 0) {
+                const nl_start = env.point();
+                env.insert("\n");
+                if (prev_wrapped) {
+                    env.putTextProperty(nl_start, env.point(), emacs.sym.@"ghostel-wrap", env.t());
+                }
+            }
+
+            // Build row content
+            var run_count: usize = 0;
+            const content = buildRowContent(term, &text_buf, &runs, &run_count);
+
+            // Insert text and apply styles
+            const row_start = env.extractInteger(env.point());
+            insertAndStyle(env, &text_buf, content, &runs, run_count, default_fg, default_bg);
+
+            // Mark prompt portion
+            if (content.prompt_char_len > 0) {
+                env.putTextProperty(
+                    env.makeInteger(row_start),
+                    env.makeInteger(row_start + @as(i64, @intCast(content.prompt_char_len))),
+                    emacs.sym.@"ghostel-prompt",
+                    env.t(),
+                );
+            } else if (isRowPrompt(term)) {
+                env.putTextProperty(
+                    env.makeInteger(row_start),
+                    env.point(),
+                    emacs.sym.@"ghostel-prompt",
+                    env.t(),
+                );
+            }
+
+            prev_wrapped = isRowWrapped(term);
+            rendered += 1;
+        }
+
+        if (rendered >= total_rows) break;
+
+        // Scroll down by viewport size for next page
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(term.rows));
+    }
+
+    // Restore viewport to saved position
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    if (saved_offset > 0) {
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
+
+    // Return 1-based line number of the original viewport top
+    return @as(i64, @intCast(saved_offset)) + 1;
 }
