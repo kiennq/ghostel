@@ -37,19 +37,11 @@ pub const DeviceAttributes = c.GhosttyDeviceAttributes;
 pub const SizeFn = c.GhosttyTerminalSizeFn;
 pub const SizeReportSize = c.GhosttySizeReportSize;
 
-// Grid reference types
-pub const GridRef = c.GhosttyGridRef;
-pub const Point = c.GhosttyPoint;
-pub const PointTag = c.GhosttyPointTag;
-pub const PointCoordinate = c.GhosttyPointCoordinate;
-pub const PointValue = c.GhosttyPointValue;
-
 // Result constants
 pub const SUCCESS = c.GHOSTTY_SUCCESS;
 pub const OUT_OF_MEMORY = c.GHOSTTY_OUT_OF_MEMORY;
 pub const INVALID_VALUE = c.GHOSTTY_INVALID_VALUE;
 pub const NO_VALUE = c.GHOSTTY_NO_VALUE;
-pub const OUT_OF_SPACE = c.GHOSTTY_OUT_OF_SPACE;
 
 // Terminal option constants
 pub const OPT_USERDATA = c.GHOSTTY_TERMINAL_OPT_USERDATA;
@@ -139,6 +131,14 @@ pub const SCROLL_TOP: c_int = c.GHOSTTY_SCROLL_VIEWPORT_TOP;
 pub const SCROLL_BOTTOM: c_int = c.GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
 pub const SCROLL_DELTA: c_int = c.GHOSTTY_SCROLL_VIEWPORT_DELTA;
 
+// Point types
+pub const Point = c.GhosttyPoint;
+pub const PointTag = c.GhosttyPointTag;
+pub const PointCoordinate = c.GhosttyPointCoordinate;
+pub const PointValue = c.GhosttyPointValue;
+pub const GridRef = c.GhosttyGridRef;
+pub const OUT_OF_SPACE = c.GHOSTTY_OUT_OF_SPACE;
+
 // Point tag constants
 pub const POINT_TAG_VIEWPORT: c_int = c.GHOSTTY_POINT_TAG_VIEWPORT;
 
@@ -154,3 +154,4 @@ pub const FormatterTerminalOptions = c.GhosttyFormatterTerminalOptions;
 pub const FormatterTerminalExtra = c.GhosttyFormatterTerminalExtra;
 pub const FormatterScreenExtra = c.GhosttyFormatterScreenExtra;
 pub const FORMATTER_PLAIN = c.GHOSTTY_FORMATTER_FORMAT_PLAIN;
+pub const FORMATTER_FORMAT_HTML: c_int = c.GHOSTTY_FORMATTER_FORMAT_HTML;
