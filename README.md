@@ -56,8 +56,12 @@ If you prefer to build from source or need a different platform, you'll also nee
 
 ```elisp
 (use-package ghostel
-  :vc (:url "https://github.com/dakra/ghostel" :rev :newest))
+  :vc (:url "https://github.com/dakra/ghostel"
+       :lisp-dir "lisp"
+       :rev :newest))
 ```
+
+NOTE: `:lisp-dir "lisp"` is only required on Emacs <31.1
 
 ### use-package with load-path
 
