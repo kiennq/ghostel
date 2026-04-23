@@ -4,7 +4,7 @@
 /// All ghostty resources are created and destroyed together.
 const std = @import("std");
 const gt = @import("ghostty.zig");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const Self = @This();
 
 /// The libghostty terminal handle.
@@ -174,7 +174,7 @@ pub fn setColorBackground(self: *Self, color: *const gt.ColorRgb) !void {
 
 /// Set the color palette (256 entries).
 pub fn setColorPalette(self: *Self, palette: *const [256]gt.ColorRgb) !void {
-    try self.terminalSet(gt.OPT_COLOR_PALETTE, palette);
+    try self.terminalSet(gt.OPT_COLOR_PALETTE, @ptrCast(&palette[0]));
 }
 
 /// Set the terminal's working directory (from OSC 7).
@@ -216,7 +216,7 @@ pub fn getColorPalette(self: *Self, palette: *[256]gt.ColorRgb) bool {
     return gt.c.ghostty_terminal_get(
         self.terminal,
         gt.DATA_COLOR_PALETTE,
-        @ptrCast(palette),
+        @ptrCast(&palette[0]),
     ) == gt.SUCCESS;
 }
 

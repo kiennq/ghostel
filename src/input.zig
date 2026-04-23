@@ -5,7 +5,7 @@
 /// (application cursor keys, Kitty keyboard protocol, etc.).
 const std = @import("std");
 const gt = @import("ghostty.zig");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const Terminal = @import("terminal.zig");
 
 const Key = gt.c.GhosttyKey;
