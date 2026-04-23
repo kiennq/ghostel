@@ -6463,6 +6463,130 @@ setting it to nil forces off."
                                         captured-env)))
                 (when (process-live-p proc) (delete-process proc))))))))))
 
+(ert-deftest ghostel-test-environment-precedes-internal-env ()
+  "`ghostel-environment' entries must come before ghostel's own env vars.
+When a user sets TERM via `ghostel-environment', it must win over the
+internal `TERM=xterm-ghostty' so a `process-environment' lookup (which
+returns the first match) resolves to the user's value."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/sh")
+               (ghostel-shell-integration nil)
+               (ghostel-environment '("TERM=dumb" "MY_VAR=42"))
+               (default-directory "/tmp/")
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (let ((term-idx (seq-position captured-env "TERM=dumb"))
+                    (default-term-idx
+                     (seq-position captured-env "TERM=xterm-ghostty")))
+                (should (member "MY_VAR=42" captured-env))
+                (should term-idx)
+                (should default-term-idx)
+                (should (< term-idx default-term-idx)))
+            (when (process-live-p proc) (delete-process proc))))))))
+
+(ert-deftest ghostel-test-environment-applies-to-compile ()
+  "`ghostel-compile--spawn' must prepend `ghostel-environment'.
+The splice lives in the compile spawn (separate from `ghostel--spawn-pty'),
+so this path needs its own coverage — without it, users setting
+`CC=clang' would see it take effect in shells but silently miss for
+compile jobs.  Also pins the position: `compilation-environment'
+entries must precede `ghostel-environment', and both must precede
+ghostel's own `INSIDE_EMACS=...,compile' marker."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((default-directory "/tmp/")
+               (compilation-environment '("COMPENV=first"))
+               (ghostel-environment '("CC=clang"))
+               (proc (ghostel-compile--spawn "true" (current-buffer) 24 80)))
+          (unwind-protect
+              (let ((compenv-idx (seq-position captured-env "COMPENV=first"))
+                    (cc-idx      (seq-position captured-env "CC=clang"))
+                    (inside-idx  (cl-position-if
+                                  (lambda (s)
+                                    (string-prefix-p "INSIDE_EMACS=" s))
+                                  captured-env)))
+                (should compenv-idx)
+                (should cc-idx)
+                (should inside-idx)
+                (should (< compenv-idx cc-idx))
+                (should (< cc-idx inside-idx)))
+            (when (process-live-p proc) (delete-process proc))))))))
+
+(ert-deftest ghostel-test-compile-prepare-buffer-sets-dir-before-mode ()
+  "`default-directory' must be set before `ghostel-mode' in prepare-buffer.
+The mode's `hack-dir-local-variables' call must resolve dir-locals
+against the target directory.  If the order flips, per-project
+`ghostel-environment' overrides silently miss for compile.  Also
+pins that `default-directory' survives the mode switch — if somebody
+drops the `permanent-local' property upstream this test catches it."
+  (let ((captured-default-directory nil)
+        (target "/tmp/"))
+    (cl-letf (((symbol-function 'hack-dir-local-variables)
+               (lambda ()
+                 (setq captured-default-directory default-directory))))
+      (let ((buf (ghostel-compile--prepare-buffer
+                  " *ghostel-prepare-test*" target)))
+        (unwind-protect
+            (progn
+              (should (equal captured-default-directory target))
+              (with-current-buffer buf
+                (should (equal default-directory target))))
+          (kill-buffer buf))))))
+
+(ert-deftest ghostel-test-environment-honors-dir-locals ()
+  "End-to-end: a real `.dir-locals.el' populates `ghostel-environment'.
+Covers the whole pipeline (`hack-dir-local-variables' reading the
+file, the safety gate, and buffer-local assignment) — not just the
+final `setq-local'."
+  (let* ((dir (file-name-as-directory (make-temp-file "ghostel-dl-" t)))
+         (dl  (expand-file-name ".dir-locals.el" dir))
+         (buf (generate-new-buffer " *ghostel-dl-test*")))
+    (unwind-protect
+        (progn
+          (with-temp-file dl
+            (insert
+             "((ghostel-mode . ((ghostel-environment . (\"FOO=1\" \"BAR=2\")))))"))
+          (with-current-buffer buf
+            (setq-local default-directory dir)
+            (ghostel-mode)
+            (should (local-variable-p 'ghostel-environment))
+            (should (equal ghostel-environment '("FOO=1" "BAR=2")))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest ghostel-test-environment-rejects-unsafe-dir-locals ()
+  "An unsafe `ghostel-environment' value in dir-locals must be rejected.
+Guards against a malicious `.dir-locals.el' that tries to smuggle a
+non-list/non-string value past the usual `safe-local-variable-p'
+machinery."
+  (let ((buf (generate-new-buffer " *ghostel-unsafe-test*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (cl-letf (((symbol-function 'hack-dir-local-variables)
+                     (lambda ()
+                       (setq-local dir-local-variables-alist
+                                   '((ghostel-environment . "not-a-list"))))))
+            (ghostel-mode))
+          (should-not (local-variable-p 'ghostel-environment)))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-terminfo-directory-finds-bundled ()
   "`ghostel--terminfo-directory' must locate the bundled compiled entries.
 The package ships compiled terminfo for both macOS (78/) and Linux (x/)
@@ -7221,6 +7345,11 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-exec-errors-on-live-process
     ghostel-test-exec-calls-spawn-pty-with-expected-args
     ghostel-test-exec-threads-remote-p-from-tramp-dir
+    ghostel-test-environment-precedes-internal-env
+    ghostel-test-environment-applies-to-compile
+    ghostel-test-environment-honors-dir-locals
+    ghostel-test-environment-rejects-unsafe-dir-locals
+    ghostel-test-compile-prepare-buffer-sets-dir-before-mode
     ghostel-test-eshell-visual-command-mode-toggles-advice
     ghostel-test-eshell/ghostel-dispatches-to-exec-visual
     ghostel-test-terminfo-directory-finds-bundled)

@@ -124,6 +124,42 @@ terminfo entry."
                  (const :tag "Generic xterm-256color" "xterm-256color")
                  (string :tag "Other")))
 
+(defcustom ghostel-environment nil
+  "Extra environment variables for ghostel shell processes.
+
+A list of \"KEY=VALUE\" strings, prepended to `process-environment'
+before spawning the shell.  A bare \"KEY\" (no `=') unsets the variable.
+
+For local spawns, entries here take precedence over ghostel's own
+variables (`TERM', `INSIDE_EMACS', `EMACS_GHOSTEL_PATH',
+shell-integration vars), so a user who sets `TERM' here wins — which
+will also disable ghostel's shell integration if the chosen TERM
+breaks its assumptions.
+
+Also honored via `dir-locals.el' for per-project overrides.
+
+TRAMP caveats:
+- Entries with `=' are propagated to the remote shell.
+- `TERM' and `INSIDE_EMACS' are *always* reset by TRAMP to
+  `tramp-terminal-type' and TRAMP's own marker respectively (see
+  `tramp-handle-make-process'); overrides in `ghostel-environment'
+  do not win remotely.
+- Bare \"KEY\" unset works for TRAMP-sh methods (`ssh', `sudo', ...)
+  which emit `unset KEY' in the remote wrapper, but is dropped by
+  the generic handler used by `adb' and `sshfs'.
+
+Example: \\='(\"LANG=en_US.UTF-8\" \"CC=clang\")"
+  :type '(repeat string))
+
+(defun ghostel--safe-environment-p (value)
+  "Return non-nil if VALUE is a valid `ghostel-environment' list.
+Used to gate dir-locals application — only a list of strings is
+accepted without prompting."
+  (and (listp value)
+       (seq-every-p #'stringp value)))
+
+(put 'ghostel-environment 'safe-local-variable #'ghostel--safe-environment-p)
+
 (defcustom ghostel-ssh-install-terminfo 'auto
   "Install xterm-ghostty terminfo on remote hosts as needed.
 Affects both `M-x ghostel' from a TRAMP `default-directory' (push
@@ -2797,6 +2833,7 @@ matches the PTY window size, and stores the process in
                                                 program-args " "))))))
          (process-environment
           (append
+           ghostel-environment
            (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
            extra-env
            process-environment))
@@ -3298,6 +3335,11 @@ window (not when it has just been deselected)."
 
 (define-derived-mode ghostel-mode fundamental-mode "Ghostel"
   "Major mode for Ghostel terminal emulator."
+  (hack-dir-local-variables)
+  (when-let* ((cell (assq 'ghostel-environment dir-local-variables-alist))
+              (value (cdr cell))
+              ((ghostel--safe-environment-p value)))
+    (setq-local ghostel-environment value))
   (buffer-disable-undo)
   (font-lock-mode -1)
   ;; `font-lock-mode' can still be re-enabled by user configuration that

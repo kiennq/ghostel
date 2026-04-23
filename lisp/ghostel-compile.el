@@ -462,6 +462,7 @@ local machine happens to have)."
                  (shell-quote-argument command))))
          (process-environment
           (append compilation-environment
+                  ghostel-environment
                   (list (format "INSIDE_EMACS=%s,compile" emacs-version))
                   (ghostel--terminal-env)
                   ;; Defeat pagers (git grep, etc.).
@@ -549,6 +550,11 @@ so there is no remote-integration round-trip on TRAMP buffers."
          (height (if (window-live-p win) (window-body-height win) 24))
          (width  (if (window-live-p win) (window-max-chars-per-line win) 80)))
     (with-current-buffer buffer
+      ;; Set `default-directory' before `ghostel-mode' so the mode's
+      ;; `hack-dir-local-variables' call resolves dir-locals against
+      ;; the target directory, not whatever the buffer inherited at
+      ;; `get-buffer-create' time.
+      (setq-local default-directory dir)
       ;; Reset to `ghostel-mode' unconditionally — on a recompile the
       ;; buffer is in `ghostel-compile-view-mode' (derived from
       ;; `compilation-mode', *not* `ghostel-mode'), so the previous
@@ -556,7 +562,6 @@ so there is no remote-integration round-trip on TRAMP buffers."
       ;; also fired, but also made state-reset implicit; make it
       ;; explicit here so this helper doesn't have two code paths.
       (ghostel-mode)
-      (setq-local default-directory dir)
       (let ((inhibit-read-only t))
         (erase-buffer))
       (setq ghostel--pending-output nil)
