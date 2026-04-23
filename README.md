@@ -563,6 +563,7 @@ individual faces with `M-x customize-face`.
 | `ghostel-module-auto-install`    | `ask`                | What to do when native module is missing (`ask`, `download`, `compile`, `nil`) |
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
 | `ghostel-term`                   | `"xterm-ghostty"`    | Value of `TERM` for spawned processes.  Default uses the bundled terminfo so apps can detect ghostel's full capability set.  Set to `"xterm-256color"` to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
+| `ghostel-environment`            | `nil`                | Extra env vars for spawned processes (list of `"KEY=VALUE"` strings). |
 | `ghostel-ssh-install-terminfo`   | `auto`               | Install `xterm-ghostty` terminfo on remote hosts as needed.  `auto` follows `ghostel-tramp-shell-integration`.  Affects both TRAMP-launched ghostel (push terminfo over the existing TRAMP connection) and outbound `ssh` from a local buffer (install via `tic` on first connection, cache in `~/.cache/ghostel/ssh-terminfo-cache`).  Per-call ssh override: `GHOSTEL_SSH_KEEP_TERM=1` |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
 | `ghostel-shell-integration`      | `t`                  | Auto-inject shell integration                            |
@@ -584,7 +585,7 @@ individual faces with `M-x customize-face`.
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
 | `ghostel-ignore-cursor-change`   | `nil`                | Ignore terminal-driven cursor shape/visibility changes   |
-| `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
+| `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)`  | Keys passed through to Emacs                             |
 | `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
 
 ## Evil-mode

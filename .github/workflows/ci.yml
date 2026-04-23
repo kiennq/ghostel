@@ -44,6 +44,9 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
+      - name: Install fish
+        run: sudo apt-get install -y fish
+
       - name: Run pure Elisp tests
         run: |
           emacs --batch -Q -L lisp \
@@ -147,9 +150,9 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
-      - name: Install zsh
+      - name: Install zsh and fish
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y zsh
+        run: sudo apt-get install -y zsh fish
 
       - name: Download native module
         uses: actions/download-artifact@v4

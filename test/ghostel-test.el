@@ -6539,7 +6539,10 @@ drops the `permanent-local' property upstream this test catches it."
         (target "/tmp/"))
     (cl-letf (((symbol-function 'hack-dir-local-variables)
                (lambda ()
-                 (setq captured-default-directory default-directory))))
+                 (setq captured-default-directory default-directory)))
+              ((symbol-function 'ghostel--load-module) #'ignore)
+              ((symbol-function 'ghostel--new) (lambda (&rest _) 'fake-term))
+              ((symbol-function 'ghostel--apply-palette) #'ignore))
       (let ((buf (ghostel-compile--prepare-buffer
                   " *ghostel-prepare-test*" target)))
         (unwind-protect
