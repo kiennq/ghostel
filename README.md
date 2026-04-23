@@ -30,7 +30,7 @@ process, keymap, and buffer.
 ## Requirements
 
 - Emacs 27.1+ with dynamic module support
-- macOS, Linux or FreeBSD
+- macOS, Linux, FreeBSD, or Windows 10/11 with ConPTY support
 
 The native module is **automatically downloaded** on first use.  Pre-built
 binaries are available for:
@@ -40,9 +40,12 @@ binaries are available for:
 - `x86_64-linux`
 - `aarch64-linux`
 - `x86_64-freebsd`
+- `x86_64-windows`
+- `aarch64-windows`
 
 If you prefer to build from source or need a different platform, you'll also need
-[Zig](https://ziglang.org/) 0.15.2+ (see [Building from source](#building-from-source)).
+[Zig](https://ziglang.org/) 0.15.2+ and the ghostty submodule (see
+[Building from source](#building-from-source)).
 
 ## Installation
 
@@ -82,41 +85,53 @@ Then `M-x ghostel` to open a terminal.
 
 ### Native module
 
-When the native module is missing, Ghostel will offer to **download a
-pre-built binary** or **compile from source** (controlled by
+When the native module payload is missing, Ghostel will offer to **download a
+pre-built package** or **compile from source** (controlled by
 `ghostel-module-auto-install`, default `ask`).  You can also trigger these
 manually:
 
-- `M-x ghostel-download-module` — download the minimum supported pre-built binary
+- `M-x ghostel-download-module` — download and install a pre-built package from GitHub releases
 - `C-u M-x ghostel-download-module` — choose a specific release tag (leave blank for latest)
 - `M-x ghostel-module-compile` — build from source via `zig build`
+
+Set `ghostel-module-dir` to keep downloaded modules in a custom
+directory, similar to vterm's configurable module directory.  When this
+option is set, Ghostel loads and downloads `ghostel-module` there and
+does not fall back to the package directory; source builds still run in
+the package checkout and then copy the finished module into the custom
+directory.
 
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
+On Windows, run the build from Git Bash or another Bash-compatible shell.
+Windows builds target the GNU/UCRT runtime so the resulting module matches the
+runtime family used by Windows Emacs distributions such as emacs-libvterm's
+MinGW/UCRT builds.
 Ghostel vendors a generated `vendor/emacs-module.h`, so normal builds do not
-require local Emacs headers.  If you want to override the vendored header, set
-`EMACS_INCLUDE_DIR` to a directory containing `emacs-module.h`, or set
-`EMACS_BIN_DIR` to an Emacs `bin/` directory and Ghostel will look for
-`../include` and `../share/emacs/include`.
+require local Emacs headers or an Emacs source checkout.
+If you want to override the vendored header, set `EMACS_INCLUDE_DIR` to a
+directory containing `emacs-module.h`, set `EMACS_BIN_DIR` to an Emacs `bin/`
+directory (Ghostel will look for `../include` and `../share/emacs/include`),
+or set `EMACS_SOURCE_DIR` to an Emacs source checkout and Ghostel will generate
+the header from the upstream module fragments.
 
 ```sh
-git clone https://github.com/dakra/ghostel.git
+# Clone with submodules
+git clone --recurse-submodules https://github.com/dakra/ghostel.git
 cd ghostel
 
-# Build everything (fetches ghostty automatically via Zig package manager)
+# Optional: override the vendored header with an Emacs source checkout
+# export EMACS_SOURCE_DIR=/path/to/emacs
+
+# Build everything (libghostty-vt + ghostel-module)
 zig build -Doptimize=ReleaseFast
 ```
 
-To override the vendored Emacs header, set `EMACS_INCLUDE_DIR` to a
-directory containing `emacs-module.h`, or set `EMACS_BIN_DIR` to an
-Emacs `bin/` directory.
-
-To build against a local ghostty checkout, temporarily point the
-dependency at your local path:
+If you already have the repo, initialize the submodules and build:
 
 ```sh
-zig fetch --save=ghostty /path/to/ghostty
+git submodule update --init --recursive vendor/ghostty vendor/emacs-util-mods
 zig build -Doptimize=ReleaseFast
 ```
 
@@ -637,6 +652,7 @@ inside a light Emacs):
 | `ghostel-input-coalesce-delay`   | `0.003`              | Seconds to buffer rapid keystrokes before sending (0 to disable) |
 | `ghostel-full-redraw`            | `nil`                | Always do full redraws instead of incremental updates    |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
+| `ghostel-cursor-follow`          | `t`                  | Keep point following terminal cursor on redraw           |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
 | `ghostel-notification-function`  | `ghostel-default-notify` | Handler for OSC 9 / OSC 777 desktop notifications (nil disables) |
@@ -689,8 +705,8 @@ When `evil-ghostel-mode` is active:
 - **Undo** (`u`) sends readline undo (`Ctrl+_`)
 - Cursor shape follows evil state (block for normal, bar for insert)
 - Alt-screen programs (vim, less, htop) are unaffected
-
 ## Commands
+<!-- Some commands are missing from the previous commits -->
 
 | Command                        | Description                                  |
 |--------------------------------|----------------------------------------------|
@@ -711,8 +727,9 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
 | `M-x ghostel-ssh-clear-terminfo-cache` | Clear outbound-ssh terminfo install cache (force re-probe) |
-| `M-x ghostel-download-module`  | Download pre-built native module             |
-| `M-x ghostel-module-compile`   | Compile native module from source            |
+| `M-x ghostel-download-module`  | Download and publish the native loader package |
+| `M-x ghostel-module-compile`   | Compile and publish the native loader package  |
+| `M-x ghostel-reload-module`    | Manually reload the versioned real module      |
 
 ### Sending input from Lisp
 
