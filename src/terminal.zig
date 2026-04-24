@@ -59,12 +59,14 @@ rebuild_pending: bool = false,
 /// new.
 last_input_was_cr: bool = false,
 
-/// Hash of the first scrollback row's content, sampled at the end of
-/// each redraw that touched scrollback. Used to detect rotation
-/// (libghostty evicting the oldest row in lockstep with new ones being
-/// pushed) when `total_rows` is plateaued at the cap. Zero means "no
-/// scrollback" or "not yet sampled".
-first_scrollback_row_hash: u64 = 0,
+/// Snapshot of the first scrollback row's codepoints (one per cell, up
+/// to `cols` entries), sampled at the end of each redraw that touched
+/// scrollback. Used to detect rotation (libghostty evicting the oldest
+/// row in lockstep with new ones being pushed) when `total_rows` is
+/// plateaued at the cap. Only meaningful when `first_scrollback_row_valid`
+/// is true.
+first_scrollback_row: [512]u32 = [_]u32{0} ** 512,
+first_scrollback_row_valid: bool = false,
 
 /// Cached Emacs env pointer — only valid during a callback from Emacs.
 env: ?emacs.Env = null,

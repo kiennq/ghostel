@@ -464,21 +464,23 @@ pub fn isRowEmptyAt(term: *Terminal, cy: u16) bool {
     return true;
 }
 
-/// Hash the first ~16 cells of libghostty's first scrollback row using
-/// FNV-1a. Returns 0 if there is no scrollback or if anything fails.
+/// Read the first scrollback row's codepoints into `out` (one per cell,
+/// up to 512 entries). Returns true on success, false if there is no
+/// scrollback or anything fails. For terminals wider than 512 columns
+/// only the first 512 cells are compared — a practical limit since
+/// 512 columns exceeds any standard display.
 ///
 /// Used to detect rotation: when libghostty's scrollback is plateaued at
 /// its byte cap, sustained writes evict the oldest row in lockstep with
 /// new rows being pushed, so `total_rows` doesn't change and the normal
-/// delta-detection sees no work to do. Sampling the first scrollback
-/// row's content lets us detect that the row at index 0 has changed
-/// underneath us.
+/// delta-detection sees no work to do. Comparing the full row lets us
+/// detect that the row at index 0 has changed underneath us.
 ///
 /// Scrolls libghostty's viewport to the top to read the row, then
-/// restores the previous viewport offset. Cheap (~6 libghostty calls);
-/// gated by the caller to only run when rotation is suspected.
-fn computeFirstScrollbackRowHash(term: *Terminal) u64 {
-    const sb = term.getScrollbar() orelse return 0;
+/// restores the previous viewport offset. Gated by the caller to only
+/// run when rotation is suspected.
+fn readFirstScrollbackRow(term: *Terminal, out: *[512]u32) bool {
+    const sb = term.getScrollbar() orelse return false;
     const saved_offset = sb.offset;
 
     term.scrollViewport(gt.SCROLL_TOP, 0);
@@ -489,29 +491,23 @@ fn computeFirstScrollbackRowHash(term: *Terminal) u64 {
         }
     }
 
-    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return 0;
-    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) return 0;
-    if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) return 0;
-    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) return 0;
+    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return false;
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) return false;
+    if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) return false;
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) return false;
 
-    // FNV-1a 64-bit hash. We mix in the first ~16 cells' first
-    // codepoints (or a space for empty cells) — enough entropy to
-    // distinguish rotation states without scanning the whole row.
-    const fnv_prime: u64 = 0x100000001b3;
-    var hash: u64 = 0xcbf29ce484222325;
+    @memset(out, 0);
     var i: usize = 0;
-    while (i < 16 and gt.c.ghostty_render_state_row_cells_next(term.row_cells)) : (i += 1) {
+    const cols = @min(term.cols, 512);
+    while (i < cols and gt.c.ghostty_render_state_row_cells_next(term.row_cells)) : (i += 1) {
         var graphemes_len: u32 = 0;
         if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) != gt.SUCCESS) continue;
-        if (graphemes_len == 0) {
-            hash = (hash ^ ' ') *% fnv_prime;
-            continue;
-        }
+        if (graphemes_len == 0) continue;
         var codepoints: [4]u32 = undefined;
         if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&codepoints)) != gt.SUCCESS) continue;
-        hash = (hash ^ codepoints[0]) *% fnv_prime;
+        out[i] = codepoints[0];
     }
-    return hash;
+    return true;
 }
 
 /// Result from buildRowContent: byte length for make_string, char count for properties.
@@ -976,20 +972,22 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     // that sampling requires is wasted work if we are about to erase anyway.
     // On a hash match, stash the value for reuse at end-of-redraw (promotion
     // and insert-at-tail don't shift row 0, so it stays valid).
-    var cached_row0_hash: ?u64 = null;
+    var cached_row0_valid = false;
     if (!scrollback_stale and
         term.wrote_since_redraw and
         term.scrollback_in_buffer > 0 and
-        term.first_scrollback_row_hash != 0)
+        term.first_scrollback_row_valid)
     {
-        const new_hash = computeFirstScrollbackRowHash(term);
-        // computeFirstScrollbackRowHash scrolled libghostty's viewport to
+        var new_row: [512]u32 = undefined;
+        const read_ok = readFirstScrollbackRow(term, &new_row);
+        // readFirstScrollbackRow scrolled libghostty's viewport to
         // sample row 0; the render state is now stale — refresh it.
         if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return;
-        if (new_hash != term.first_scrollback_row_hash) {
+        const compare_cols = @min(term.cols, 512);
+        if (read_ok and !std.mem.eql(u32, new_row[0..compare_cols], term.first_scrollback_row[0..compare_cols])) {
             scrollback_stale = true;
-        } else {
-            cached_row0_hash = new_hash;
+        } else if (read_ok) {
+            cached_row0_valid = true;
         }
     }
 
@@ -1004,7 +1002,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     if (scrollback_stale) {
         env.eraseBuffer();
         term.scrollback_in_buffer = 0;
-        term.first_scrollback_row_hash = 0;
+        term.first_scrollback_row_valid = false;
         force_full = true;
     }
 
@@ -1331,24 +1329,21 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         _ = env.call1(emacs.sym.@"ghostel--update-directory", env.makeString(pwd));
     }
 
-    // Update the cached first-scrollback-row hash for the next redraw's
-    // rotation check. Reuse the start-of-redraw hash when it's still
-    // valid (no rotation, no trim) — avoids a second scroll-to-top +
-    // render_state_update round trip per redraw.
-    //
-    // If nothing was written AND we didn't populate `cached_row0_hash`
-    // at the top, row 0 cannot have moved since the previous redraw
-    // set `first_scrollback_row_hash`, so skip the compute entirely.
-    // This covers cursor-only redraws and idle-timer fires.
+    // Update the cached first-scrollback-row snapshot for the next redraw's
+    // rotation check. When the start-of-redraw check found no rotation,
+    // `term.first_scrollback_row` already holds the current value — skip
+    // the second round trip. If nothing was written at all, row 0 cannot
+    // have moved, so skip entirely. This covers cursor-only redraws and
+    // idle-timer fires.
     if (term.scrollback_in_buffer > 0) {
-        if (cached_row0_hash) |h| {
-            term.first_scrollback_row_hash = h;
+        if (cached_row0_valid) {
+            // term.first_scrollback_row is already current; nothing to do.
         } else if (term.wrote_since_redraw) {
-            term.first_scrollback_row_hash = computeFirstScrollbackRowHash(term);
+            term.first_scrollback_row_valid = readFirstScrollbackRow(term, &term.first_scrollback_row);
         }
-        // else: no writes, no cached hash → existing value is still current.
+        // else: no writes, no cached row → existing value is still current.
     } else {
-        term.first_scrollback_row_hash = 0;
+        term.first_scrollback_row_valid = false;
     }
 
     // Clear the write flag so the next redraw can detect "writes happened
