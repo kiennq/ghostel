@@ -5309,6 +5309,43 @@ hand nil to the native module."
                          (buffer-local-value 'ghostel--buffer-identity buf))))
       (kill-buffer buf))))
 
+;; -----------------------------------------------------------------------
+;; Test: ghostel and ghostel-project return the buffer
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-returns-buffer ()
+  "`ghostel' returns the (live) Ghostel buffer."
+  (let* ((ghostel-buffer-name "*ghostel-return-test*")
+         result)
+    (cl-letf (((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+              ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+              ((symbol-function 'pop-to-buffer) (lambda (&rest _) nil)))
+      (setq result (ghostel)))
+    (should (bufferp result))
+    (should (buffer-live-p result))
+    (should (string-match-p "ghostel-return-test" (buffer-name result)))
+    (kill-buffer result)))
+
+(ert-deftest ghostel-test-project-returns-buffer ()
+  "`ghostel-project' returns the (live) Ghostel buffer."
+  (require 'project)
+  (let* ((ghostel-buffer-name "*ghostel*")
+         result)
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (&optional _) '(transient . "/tmp/retproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'project-prefixed-buffer-name)
+               (lambda (name) (format "*retproj-%s*" name)))
+              ((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+              ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+              ((symbol-function 'pop-to-buffer) (lambda (&rest _) nil)))
+      (setq result (ghostel-project)))
+    (should (bufferp result))
+    (should (buffer-live-p result))
+    (should (string-match-p "retproj" (buffer-name result)))
+    (kill-buffer result)))
+
 (ert-deftest ghostel-test-first-creation-respects-display-buffer-alist ()
   "First `ghostel' creation exposes `ghostel-mode' to display rules."
   (let ((saved (current-window-configuration))
@@ -7366,6 +7403,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-project-reuses-identity-match-after-rename
     ghostel-test-init-buffer-sets-identity
     ghostel-test-first-creation-respects-display-buffer-alist
+    ghostel-test-returns-buffer
+    ghostel-test-project-returns-buffer
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build

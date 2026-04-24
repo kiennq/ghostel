@@ -3477,7 +3477,8 @@ buffer creation time — see `ghostel--buffer-identity'."
 With a non-numeric prefix arg, create a new buffer.
 With a numeric prefix ARG, switch to the buffer with that number or
 create it if it doesn't exist yet.
-The name of the buffer is determined by the value of `ghostel-buffer-name'."
+The name of the buffer is determined by the value of `ghostel-buffer-name'.
+Returns the buffer."
   (interactive "P")
   (ghostel--load-module t)
   (let* ((fresh (and arg (not (numberp arg))))
@@ -3493,7 +3494,8 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
       (ghostel--prepare-buffer buffer identity))
     (pop-to-buffer buffer (append display-buffer--same-window-action
                                   '((category . comint))))
-    (ghostel--init-buffer buffer identity)))
+    (ghostel--init-buffer buffer identity)
+    buffer))
 
 (defun ghostel-exec (buffer program &optional args)
   "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.
@@ -3534,7 +3536,8 @@ If a buffer already exists for this project, switch to it.
 Otherwise create a new Ghostel buffer.  ARG is passed through to
 `ghostel' and accepts the same universal argument conventions.
 To add this to `project-switch-commands':
-  (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
+  (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)
+Returns the buffer."
   (interactive "P")
   (let ((default-directory (project-root (project-current t)))
         (ghostel-buffer-name (project-prefixed-buffer-name
