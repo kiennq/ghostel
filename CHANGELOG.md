@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.18.0] — 2026-04-24
 
 ### Breaking
 - Repository layout reorganized.  Elisp sources now live under `lisp/`
@@ -11,7 +11,8 @@ All notable changes to this project will be documented in this file.
   bundled compiled terminfo moved from `terminfo/` to `etc/terminfo/`;
   shell-integration assets restructured into `etc/shell/ghostel.{bash,
   fish,zsh}` (user-sourced rc files) and `etc/shell/bootstrap/` (env-
-  hook shims for local auto-injection).
+  hook shims for local auto-injection)
+  ([266e3e9](https://github.com/dakra/ghostel/commit/266e3e9)).
 - Users who source ghostel's shell rc files manually from their own
   shell configuration must update the path: `etc/ghostel.{bash,zsh,
   fish}` → `etc/shell/ghostel.{bash,zsh,fish}`.
@@ -25,17 +26,92 @@ All notable changes to this project will be documented in this file.
   'evil-ghostel)` and any `ghostel-evil-mode` calls with
   `evil-ghostel-mode`.
 
+### Added
+- `ghostel-environment` user option (mirrors `vterm-environment`):
+  list of `KEY=VALUE` strings prepended to `process-environment`
+  before spawning the shell.  Honors `.dir-locals.el` via
+  `hack-dir-local-variables`, propagates to TRAMP remote shells, and
+  applies to both shell spawns and `ghostel-compile` spawns.  User
+  entries take precedence over ghostel's own `TERM`/`INSIDE_EMACS`.
+  Closes [#176](https://github.com/dakra/ghostel/issues/176)
+  ([87c99e5](https://github.com/dakra/ghostel/commit/87c99e5)).
+- `ghostel-default` face (inherits `default`) as the per-buffer
+  customization point for terminal foreground/background, allowing
+  e.g. a dark terminal inside a light Emacs without resorting to
+  `defadvice`.  Closes
+  [#178](https://github.com/dakra/ghostel/issues/178)
+  ([7c3fa5b](https://github.com/dakra/ghostel/commit/7c3fa5b)).
+
+### Changed
+- `ghostel` and `ghostel-project` now explicitly return the buffer
+  they create or switch to, so callers can use the buffer
+  programmatically without relying on `pop-to-buffer` side effects.
+  Closes [#185](https://github.com/dakra/ghostel/issues/185)
+  ([fdfb68f](https://github.com/dakra/ghostel/commit/fdfb68f)).
+- ANSI color faces now inherit from `ansi-color-*` instead of
+  `term-color-*`.  Themes (notably modus) deliberately remap
+  `term-color-black` / `term-color-white` to bright palette entries
+  to keep them distinct from `term.el`'s buffer face — that
+  accommodation made e.g. htop's status bar render gray-on-green and
+  unreadable.  `ansi-color-*` is the canonical ANSI face family
+  since Emacs 28.1 and themes customize it to the proper palette.
+  Closes [#175](https://github.com/dakra/ghostel/issues/175)
+  ([a27f2fa](https://github.com/dakra/ghostel/commit/a27f2fa)).
+
 ### Fixed
-- `ghostel` and `ghostel-project` reuse an existing terminal buffer even
-  after `ghostel--set-title-default` has renamed it.  Buffers now carry
-  a sticky `ghostel--buffer-identity` set at creation time, and lookup
-  matches on identity rather than current buffer name
-  ([#168](https://github.com/dakra/ghostel/issues/168)).
-- Bind `[xterm-paste]` to a ghostel-aware handler so clipboard pastes
-  delivered by the host terminal (TTY Emacs with bracketed paste) reach
-  the inferior shell instead of being inserted into the renderer-owned
-  buffer and wiped on the next redraw
-  ([#172](https://github.com/dakra/ghostel/issues/172)).
+- Scrollback no longer leaves stale rows after `CSI 3J`
+  (clear-scrollback) followed by enough new output to restore the
+  same scrollback depth.  A unified `rebuild_pending` flag now
+  tracks all scrollback-validity signals (resize, CSI 3J, rotation
+  hash mismatch); the surgical-trim fallback that misbehaved on
+  reflow is replaced with a single full-erase path.  Closes
+  [#160](https://github.com/dakra/ghostel/issues/160)
+  ([f5524ef](https://github.com/dakra/ghostel/commit/f5524ef)).
+- A ghostel buffer that received output while hidden no longer
+  shows a stale pre-hide screen on re-show.  A per-window snap list
+  populated via `window-buffer-change-functions` forces the next
+  redraw to anchor to the latest output.  Closes
+  [#177](https://github.com/dakra/ghostel/issues/177)
+  ([63e008f](https://github.com/dakra/ghostel/commit/63e008f)).
+- The first ghostel buffer in a session now respects
+  `display-buffer-alist`.  Fixes
+  [#179](https://github.com/dakra/ghostel/issues/179)
+  ([d33052d](https://github.com/dakra/ghostel/commit/d33052d)).
+- `ghostel` and `ghostel-project` reuse an existing terminal buffer
+  even after `ghostel--set-title-default` has renamed it.  Buffers
+  now carry a sticky `ghostel--buffer-identity` set at creation
+  time, and lookup matches on identity rather than current buffer
+  name.  Fixes
+  [#168](https://github.com/dakra/ghostel/issues/168)
+  ([465030e](https://github.com/dakra/ghostel/commit/465030e)).
+- Bind `[xterm-paste]` to a ghostel-aware handler so clipboard
+  pastes delivered by the host terminal (TTY Emacs with bracketed
+  paste) reach the inferior shell instead of being inserted into
+  the renderer-owned buffer and wiped on the next redraw.  Fixes
+  [#172](https://github.com/dakra/ghostel/issues/172)
+  ([5546b97](https://github.com/dakra/ghostel/commit/5546b97)).
+- Meta-modified keys (`M-x`, `M-DEL`, …) now reach the terminal in
+  TTY Emacs.  TTY Emacs delivers `M-<key>` as an ESC prefix that
+  consumes the meta modifier before the binding fires; the dispatch
+  path now detects the `esc-map` lookup via
+  `this-command-keys-vector` and re-injects meta.  Follow-up to
+  [43220db](https://github.com/dakra/ghostel/commit/43220db); fixes
+  [#48](https://github.com/dakra/ghostel/issues/48)
+  ([c42451e](https://github.com/dakra/ghostel/commit/c42451e)).
+- Fish auto-inject now installs `xterm-ghostty` terminfo on remote
+  hosts via the `ssh` wrapper (parity with bash/zsh), and no longer
+  leaks fish's internal vendor-conf `xdg_data_dirs` (with `/fish`
+  appended) into `XDG_DATA_DIRS` for every spawned subprocess.  The
+  vendor-conf shim now chains to `etc/ghostel.fish` instead of
+  carrying a drifting inline copy
+  ([d9fd009](https://github.com/dakra/ghostel/commit/d9fd009)).
+- `package-vc-install` on Emacs 30.x no longer fails byte-compiling
+  `test/`, `bench/`, and `extensions/`.  A `.elpaignore` scopes
+  recompilation to the package's lisp directory via
+  `byte-compile-ignore-files`.  Emacs 31 fixed this upstream
+  ([573acd97](https://cgit.git.savannah.gnu.org/cgit/emacs.git/commit/?id=573acd97e54ceead6d11b330909ffb8e744247cc));
+  the `.elpaignore` covers the un-backported case
+  ([bcba725](https://github.com/dakra/ghostel/commit/bcba725)).
 
 ## [0.17.0] — 2026-04-21
 
@@ -679,7 +755,7 @@ Initial tagged release.
 - GPL3 license and expanded commentary section ([1d676df](https://github.com/dakra/ghostel/commit/1d676df)).
 - README with build instructions, features, and configuration ([c43bf6a](https://github.com/dakra/ghostel/commit/c43bf6a)).
 
-[Unreleased]: https://github.com/dakra/ghostel/compare/v0.17.0...HEAD
+[0.18.0]: https://github.com/dakra/ghostel/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/dakra/ghostel/compare/v0.16.3...v0.17.0
 [0.16.3]: https://github.com/dakra/ghostel/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/dakra/ghostel/compare/v0.16.1...v0.16.2
