@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.18.0
+;; Version: 0.18.1
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -364,6 +364,14 @@ candidate would require a remote `file-exists-p' round-trip per
 redraw."
   :type 'boolean)
 
+(defcustom ghostel-plain-link-detection-delay 0.1
+  "Delay in seconds before redraw-triggered plain-text link detection runs.
+Redraws queue URL/file detection through
+`ghostel--schedule-link-detection' so multiple updates can be
+coalesced into a single scan.  Set to 0 to scan immediately after each
+redraw.  Native OSC-8 hyperlinks remain applied during redraw."
+  :type 'number)
+
 (defcustom ghostel-file-detection-path-regex
   "[[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
   "Regex matching the PATH portion of a file:line[:col] reference.
@@ -546,7 +554,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.18.0"
+(defconst ghostel--minimum-module-version "0.18.1"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -850,6 +858,15 @@ Updated whenever the terminal is created or resized.")
 
 (defvar-local ghostel--redraw-timer nil
   "Timer for delayed redraw.")
+
+(defvar-local ghostel--plain-link-detection-timer nil
+  "Timer for delayed redraw-triggered plain-text link detection.")
+
+(defvar-local ghostel--plain-link-detection-begin nil
+  "Queued start bound for redraw-triggered plain-text link detection.")
+
+(defvar-local ghostel--plain-link-detection-end nil
+  "Queued end bound for redraw-triggered plain-text link detection.")
 
 (defvar-local ghostel--force-next-redraw nil
   "When non-nil, redraw regardless of synchronized output mode.")
@@ -1919,9 +1936,12 @@ Wraps to `point-max' when no link is found before point."
 BEGIN and END default to `point-min' and `point-max' respectively.
 Skips regions that already have a `help-echo' property (e.g. from OSC 8).
 Bounding the scan keeps streaming output from re-scanning the entire
-materialized scrollback on every redraw."
+materialized scrollback on every redraw.
+Binds `inhibit-read-only' so the scan can attach text properties even
+when called from the deferred-detection timer outside the redraw scope."
   (let ((begin (or begin (point-min)))
-        (end (or end (point-max))))
+        (end (or end (point-max)))
+        (inhibit-read-only t))
     (save-excursion
       ;; Pass 1: http(s) URLs
       (when ghostel-enable-url-detection
@@ -1972,6 +1992,37 @@ materialized scrollback on every redraw."
                                          (concat "fileref:" abs-path)))
                     (put-text-property beg mend 'mouse-face 'highlight)
                     (put-text-property beg mend 'keymap ghostel-link-map)))))))))))
+
+(defun ghostel--run-queued-plain-link-detection (buffer)
+  "Run any queued redraw-triggered plain-text link detection for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((begin ghostel--plain-link-detection-begin)
+            (end ghostel--plain-link-detection-end))
+        (setq ghostel--plain-link-detection-timer nil
+              ghostel--plain-link-detection-begin nil
+              ghostel--plain-link-detection-end nil)
+        (when (and begin end (<= begin end))
+          (ghostel--detect-urls begin end))))))
+
+(defun ghostel--queue-plain-link-detection (begin end)
+  "Coalesce redraw-triggered plain-text link detection for BEGIN..END."
+  (when (and begin end (<= begin end))
+    (setq ghostel--plain-link-detection-begin
+          (if ghostel--plain-link-detection-begin
+              (min ghostel--plain-link-detection-begin begin)
+            begin)
+          ghostel--plain-link-detection-end
+          (if ghostel--plain-link-detection-end
+              (max ghostel--plain-link-detection-end end)
+            end))
+    (unless ghostel--plain-link-detection-timer
+      (if (<= ghostel-plain-link-detection-delay 0)
+          (ghostel--run-queued-plain-link-detection (current-buffer))
+        (setq ghostel--plain-link-detection-timer
+              (run-with-timer ghostel-plain-link-detection-delay nil
+                              #'ghostel--run-queued-plain-link-detection
+                              (current-buffer)))))))
 
 
 (defun ghostel--compensate-wide-chars ()
@@ -2394,7 +2445,8 @@ Call this after changing the Emacs theme so terminals match."
         (ghostel--apply-palette ghostel--term)
         (when (not ghostel--copy-mode-active)
           (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term)))))))
+            (ghostel--redraw ghostel--term)
+            (ghostel--schedule-link-detection)))))))
 
 (defun ghostel--on-theme-change (&rest _args)
   "Hook function to sync terminal colors after theme change."
@@ -2508,6 +2560,11 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--input-timer
           (cancel-timer ghostel--input-timer)
           (setq ghostel--input-timer nil))
+        (when ghostel--plain-link-detection-timer
+          (cancel-timer ghostel--plain-link-detection-timer)
+          (setq ghostel--plain-link-detection-timer nil
+                ghostel--plain-link-detection-begin nil
+                ghostel--plain-link-detection-end nil))
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
             (kill-buffer buf)
@@ -3086,6 +3143,17 @@ position COL columns into the first matched line."
         (forward-line (- (1- tr)))
         (line-beginning-position)))))
 
+(defun ghostel--schedule-link-detection (&optional begin end)
+  "Schedule deferred plain-text link detection over BEGIN..END.
+BEGIN defaults to the current viewport start (or `point-min' if the
+buffer has no viewport yet).  END defaults to `point-max'.  Covers
+plain-text URL and file:line detection; native OSC-8 hyperlink spans
+remain handled inside the renderer."
+  (when (or ghostel-enable-url-detection ghostel-enable-file-detection)
+    (ghostel--queue-plain-link-detection
+     (or begin (ghostel--viewport-start) (point-min))
+     (or end (point-max)))))
+
 (defsubst ghostel--window-anchored-p (win)
   "Non-nil if WIN is auto-following the viewport.
 A window counts as anchored when `ghostel--snap-requested' is set
@@ -3251,7 +3319,8 @@ following the viewport."
                   (ghostel--restore-scrollback-window
                    win (assq win non-anchored-states))))
               (when vs
-                (setq ghostel--last-anchor-position vs))))
+                (setq ghostel--last-anchor-position vs))
+              (ghostel--schedule-link-detection vs (point-max))))
           (setq ghostel--snap-requested nil)
           (setq ghostel--windows-needing-snap nil))))))
 
@@ -3263,7 +3332,8 @@ following the viewport."
     (let ((inhibit-read-only t))
       (ghostel--redraw ghostel--term ghostel-full-redraw))
     (when ghostel--has-wide-chars
-      (ghostel--compensate-wide-chars))))
+      (ghostel--compensate-wide-chars))
+    (ghostel--schedule-link-detection)))
 
 
 ;;; Window resize

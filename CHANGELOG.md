@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.18.1] — 2026-04-25
+
+### Added
+- `ghostel-plain-link-detection-delay` user option (default 0.1s)
+  controls how long ghostel waits after a redraw before scanning for
+  plain-text URLs and file paths.  Set to 0 to restore the previous
+  synchronous behavior
+  ([671d3ee](https://github.com/dakra/ghostel/commit/671d3ee)).
+
+### Changed
+- Plain-text link detection is now deferred off the redraw path and
+  coalesced via a single timer, so bursts of redraws collapse into one
+  scan instead of running detection on every dirty redraw.  Native
+  OSC-8 hyperlink spans continue to be handled inside the renderer.
+  The process sentinel cancels the pending detection timer so it
+  cannot fire against a buffer that is about to be killed
+  ([671d3ee](https://github.com/dakra/ghostel/commit/671d3ee)).
+- Scrollback rotation detection now snapshots the first scrollback
+  row directly (`std.mem.eql` over all `term.cols` cells) instead of
+  hashing the first 16 cells with FNV-1a.  Removes a small collision
+  probability and the arbitrary 16-cell sample that could miss
+  rotation when two rows shared the same opening cells; the
+  cached-read optimisation that skips the end-of-redraw round trip is
+  preserved
+  ([4b1a0ba](https://github.com/dakra/ghostel/commit/4b1a0ba)).
+
 ## [0.18.0] — 2026-04-24
 
 ### Breaking

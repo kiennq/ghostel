@@ -319,7 +319,6 @@ pub const Sym = struct {
     // Ghostel symbols
     @"ghostel-link-map": Value,
     @"ghostel--set-buffer-face": Value,
-    @"ghostel--detect-urls": Value,
     @"ghostel--has-wide-chars": Value,
     @"ghostel--set-cursor-style": Value,
     @"ghostel--update-directory": Value,

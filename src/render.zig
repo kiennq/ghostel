@@ -1270,16 +1270,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         }
     }
 
-    // Auto-detect plain-text URLs — only on the viewport region. Scrollback
-    // rows are skipped to keep streaming O(viewport) per redraw instead of
-    // O(buffer); rows that have already scrolled past stay as plain text
-    // and remain searchable, just not clickable.
     if (dirty != gt.DIRTY_FALSE) {
-        _ = env.call2(
-            emacs.sym.@"ghostel--detect-urls",
-            env.makeInteger(viewport_start_int),
-            env.pointMax(),
-        );
         if (has_wide_chars) {
             _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());
         }
