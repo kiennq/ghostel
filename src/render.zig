@@ -5,7 +5,7 @@
 /// Emacs buffer.  See `redraw' below for the per-redraw algorithm
 /// (viewport parking, scrollback sync, dirty-row reuse).
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Terminal = @import("terminal.zig");
 
@@ -237,6 +237,38 @@ fn isRowPrompt(term: *Terminal) !bool {
     return try gt.row.get(c_int, raw_row, gt.ROW_DATA_SEMANTIC_PROMPT) != 0;
 }
 
+/// Whether the row at `cy` would render to no visible buffer content.
+///
+/// Assumes the caller has refreshed the render state (via
+/// `ghostty_render_state_update`). Drives the row iterator, so callers
+/// must not rely on iterator position after this call.
+pub fn isRowEmptyAt(term: *Terminal, cy: u16) !bool {
+    try gt.rs.read(term.render_state, gt.RS_DATA_ROW_ITERATOR, &term.row_iterator);
+
+    var ri: u16 = 0;
+    while (ri <= cy) : (ri += 1) {
+        if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+            return false;
+        }
+    }
+
+    try gt.rs_row.read(term.row_iterator, gt.RS_ROW_DATA_CELLS, &term.row_cells);
+
+    while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) {
+        const graphemes_len = try gt.rs_row_cells.get(u32, term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
+        if (graphemes_len > 0) {
+            return false;
+        }
+
+        const raw_cell = try gt.rs_row_cells.get(gt.c.GhosttyCell, term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW);
+        const wide = try gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE);
+        if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
+        if (try readCellStyle(term.row_cells, raw_cell) != null) return false;
+    }
+
+    return true;
+}
+
 /// Result from buildRowContent: byte length for make_string, char count for properties.
 const RowContent = struct {
     byte_len: usize,
@@ -254,9 +286,9 @@ const RowContent = struct {
 
 fn getStyleKey(cell: gt.c.GhosttyCell) !CellStyleKey {
     return CellStyleKey{ // zig fmt: off
-        .style_id = try gt.cell.getOpt(gt.c.GhosttyStyleId, cell, gt.c.GHOSTTY_CELL_DATA_STYLE_ID) orelse 0,
-        .hyperlink = try gt.cell.getOpt(bool, cell, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK) orelse false
-    }; // zig fmt: on
+.style_id = try gt.cell.getOpt(gt.c.GhosttyStyleId, cell, gt.c.GHOSTTY_CELL_DATA_STYLE_ID) orelse 0,
+.hyperlink = try gt.cell.getOpt(bool, cell, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK) orelse false
+}; // zig fmt: on
 }
 
 /// Build text content and style runs for the current row in the iterator.
@@ -555,12 +587,18 @@ const BgFg = struct {
 
 fn getDefaultColors(term: *Terminal) !BgFg {
     // zig fmt: off
-    const fg , const bg = try gt.rs.getMulti(term.render_state, &[_]gt.Multi{
-        .{ gt.RS_DATA_COLOR_FOREGROUND, gt.ColorRgb },
-        .{ gt.RS_DATA_COLOR_BACKGROUND, gt.ColorRgb }
-    });
-    // zig fmt: on
+const fg , const bg = try gt.rs.getMulti(term.render_state, &[_]gt.Multi{
+.{ gt.RS_DATA_COLOR_FOREGROUND, gt.ColorRgb },
+.{ gt.RS_DATA_COLOR_BACKGROUND, gt.ColorRgb }
+});
+// zig fmt: on
     return BgFg{ .fg = fg, .bg = bg };
+}
+
+fn temporarilyWritableBuffer(env: emacs.Env) bool {
+    const was_read_only = env.bufferReadOnly();
+    if (was_read_only) env.setBufferReadOnly(false);
+    return was_read_only;
 }
 
 pub fn render(env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) !void {
@@ -616,8 +654,13 @@ pub fn render(env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) !v
         try gt.rs.set(term.render_state, gt.RS_OPT_DIRTY, gt.DIRTY_FALSE);
     }
 
-    if (dirty != gt.DIRTY_FALSE and has_wide_chars) {
-        _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());
+    // Plain-text URL/file detection is deferred and coalesced from Elisp
+    // after redraw so interactive typing does not pay the regex/property
+    // application cost inline. OSC-8 hyperlinks still stay native here.
+    if (dirty != gt.DIRTY_FALSE) {
+        if (has_wide_chars) {
+            _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());
+        }
     }
 }
 
@@ -725,6 +768,8 @@ fn gotoActiveStart(env: emacs.Env, term: *Terminal) void {
 /// When `force_full` is true, the viewport region is fully re-rendered
 /// instead of using the incremental dirty-row path.
 pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) !void {
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
     // Snapshot the buffer's mark across the destructive ops below.  Both
     // paths — full (eraseBuffer / deleteRegion over the viewport) and
     // partial (per-row deleteRegion + insert) — move every marker in the
@@ -830,4 +875,84 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) !void {
     // the old active area, and advancing by 1 reaches the new one.
     term.scrollViewport(gt.SCROLL_BOTTOM, 0);
     term.scrollViewport(gt.SCROLL_DELTA, -1);
+}
+
+pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) !i64 {
+    const total_rows = try term.getTotalRows();
+    if (total_rows == 0) return 1;
+
+    // Save current viewport position
+    const sb = try term.getScrollbar();
+    const saved_offset = sb.offset;
+
+    try gt.renderStateUpdate(term.render_state, term.terminal);
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
+    const default_colors = try getDefaultColors(term);
+
+    // Set buffer default face
+    var fg_hex: [7]u8 = undefined;
+    var bg_hex: [7]u8 = undefined;
+    _ = env.call2(
+        emacs.sym.@"ghostel--set-buffer-face",
+        env.makeString(formatColor(default_colors.fg, &fg_hex)),
+        env.makeString(formatColor(default_colors.bg, &bg_hex)),
+    );
+
+    // Erase buffer
+    env.eraseBuffer();
+
+    // Scroll to top of scrollback
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+
+    var rendered: usize = 0;
+
+    while (rendered < total_rows) {
+        // Query actual viewport position
+        const cur_sb = try term.getScrollbar();
+        const viewport_start = cur_sb.offset;
+
+        // Update render state for current viewport
+        try gt.renderStateUpdate(term.render_state, term.terminal);
+
+        // Get row iterator
+        try gt.rs.read(term.render_state, gt.RS_DATA_ROW_ITERATOR, &term.row_iterator);
+
+        // How many rows to skip (already rendered from previous page overlap)
+        const viewport_rows: usize = term.size.rows;
+        const skip: usize = if (rendered > viewport_start) rendered - viewport_start else 0;
+        if (skip >= viewport_rows) break; // no new rows in this viewport
+        // How many rows to take from this viewport
+        const take: usize = @min(viewport_rows - skip, total_rows - rendered);
+        if (take == 0) break; // no progress possible
+
+        var row_in_page: usize = 0;
+        while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+            defer row_in_page += 1;
+
+            if (row_in_page < skip) {
+                continue;
+            }
+            if (row_in_page >= skip + take) {
+                break;
+            }
+
+            _ = try insertAndStyle(env, term, &default_colors);
+            rendered += 1;
+        }
+
+        if (rendered >= total_rows) break;
+
+        // Scroll down by viewport size for next page
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(term.size.rows));
+    }
+
+    // Restore viewport to saved position
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    if (saved_offset > 0) {
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
+
+    // Return 1-based line number of the original viewport top
+    return @as(i64, @intCast(saved_offset)) + 1;
 }
