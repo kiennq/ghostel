@@ -2,7 +2,7 @@
 const std = @import("std");
 
 pub const c = @cImport({
-@cInclude("ghostty/vt.h");
+    @cInclude("ghostty/vt.h");
 });
 
 // Re-export commonly used types
@@ -161,50 +161,50 @@ pub const FORMATTER_FORMAT_HTML: c_int = c.GHOSTTY_FORMATTER_FORMAT_HTML;
 pub const Error = error{ OutOfMemory, InvalidValue, NoValue, OutOfSpace, Unknown };
 
 pub fn toError(c_error: c_int) Error!void {
-switch (c_error) {
-SUCCESS => return,
-OUT_OF_MEMORY => return Error.OutOfMemory,
-INVALID_VALUE => return Error.InvalidValue,
-NO_VALUE => return Error.NoValue,
-OUT_OF_SPACE => return Error.OutOfSpace,
-else => return Error.Unknown,
-}
+    switch (c_error) {
+        SUCCESS => return,
+        OUT_OF_MEMORY => return Error.OutOfMemory,
+        INVALID_VALUE => return Error.InvalidValue,
+        NO_VALUE => return Error.NoValue,
+        OUT_OF_SPACE => return Error.OutOfSpace,
+        else => return Error.Unknown,
+    }
 }
 
 pub const Multi = struct { c_uint, type };
 
 fn Accessor(comptime Target: type, getter: anytype, setter: anytype, multi_getter: anytype) type {
-return struct {
-pub fn get(comptime T: type, target: Target, data: c_uint) !T {
-comptime if (@TypeOf(getter) == void) @compileError("Not readable");
-var value: T = undefined;
-try toError(@call(.auto, getter, .{ target, data, @as(?*anyopaque, @ptrCast(&value)) }));
-return value;
-}
+    return struct {
+        pub fn get(comptime T: type, target: Target, data: c_uint) !T {
+            comptime if (@TypeOf(getter) == void) @compileError("Not readable");
+            var value: T = undefined;
+            try toError(@call(.auto, getter, .{ target, data, @as(?*anyopaque, @ptrCast(&value)) }));
+            return value;
+        }
 
-pub fn getOpt(comptime T: type, target: Target, data: c_uint) !?T {
-comptime if (@TypeOf(getter) == void) @compileError("Not readable");
-if (get(T, target, data)) |value| {
-return value;
-} else |err| return switch (err) {
-Error.NoValue => null,
-else => err,
-};
-}
+        pub fn getOpt(comptime T: type, target: Target, data: c_uint) !?T {
+            comptime if (@TypeOf(getter) == void) @compileError("Not readable");
+            if (get(T, target, data)) |value| {
+                return value;
+            } else |err| return switch (err) {
+                Error.NoValue => null,
+                else => err,
+            };
+        }
 
-fn MultiValues(comptime data: anytype) type {
-var fields: [data.len]std.builtin.Type.StructField = undefined;
-for (data, 0..) |d, i| {
-fields[i] = std.builtin.Type.StructField{
-.name = std.fmt.comptimePrint("{d}", .{i}),
-.type = d[1],
-.default_value_ptr = null,
-.is_comptime = false,
-.alignment = @alignOf(d[1]),
-};
-}
+        fn MultiValues(comptime data: anytype) type {
+            var fields: [data.len]std.builtin.Type.StructField = undefined;
+            for (data, 0..) |d, i| {
+                fields[i] = std.builtin.Type.StructField{
+                    .name = std.fmt.comptimePrint("{d}", .{i}),
+                    .type = d[1],
+                    .default_value_ptr = null,
+                    .is_comptime = false,
+                    .alignment = @alignOf(d[1]),
+                };
+            }
 
-// zig fmt: off
+            // zig fmt: off
 return @Type(std.builtin.Type{.@"struct" = .{
 .layout = .auto,
 .fields = &fields,
@@ -212,33 +212,33 @@ return @Type(std.builtin.Type{.@"struct" = .{
 .is_tuple = true
 }});
 // zig fmt: on
-}
+        }
 
-pub fn getMulti(target: Target, comptime keys_types: []const Multi) !MultiValues(keys_types) {
-comptime if (@TypeOf(getter) == void) @compileError("Not multi gettable");
-var keys: [keys_types.len]c_uint = undefined;
-var values: MultiValues(keys_types) = undefined;
-var ptrs: [keys_types.len]?*anyopaque = undefined;
-inline for (keys_types, 0..) |key_type, i| {
-keys[i] = key_type[0];
-ptrs[i] = &values[i];
-}
+        pub fn getMulti(target: Target, comptime keys_types: []const Multi) !MultiValues(keys_types) {
+            comptime if (@TypeOf(getter) == void) @compileError("Not multi gettable");
+            var keys: [keys_types.len]c_uint = undefined;
+            var values: MultiValues(keys_types) = undefined;
+            var ptrs: [keys_types.len]?*anyopaque = undefined;
+            inline for (keys_types, 0..) |key_type, i| {
+                keys[i] = key_type[0];
+                ptrs[i] = &values[i];
+            }
 
-var num_written: usize = 0;
-try toError(@call(.auto, multi_getter, .{ target, keys_types.len, &keys, &ptrs, &num_written }));
-return if (num_written == keys_types.len) values else error.IncompleteRead;
-}
+            var num_written: usize = 0;
+            try toError(@call(.auto, multi_getter, .{ target, keys_types.len, &keys, &ptrs, &num_written }));
+            return if (num_written == keys_types.len) values else error.IncompleteRead;
+        }
 
-pub fn read(target: Target, data: c_uint, out_ptr: anytype) !void {
-comptime if (@TypeOf(getter) == void) @compileError("Not readable");
-try toError(@call(.auto, getter, .{ target, data, @as(?*anyopaque, @ptrCast(out_ptr)) }));
-}
+        pub fn read(target: Target, data: c_uint, out_ptr: anytype) !void {
+            comptime if (@TypeOf(getter) == void) @compileError("Not readable");
+            try toError(@call(.auto, getter, .{ target, data, @as(?*anyopaque, @ptrCast(out_ptr)) }));
+        }
 
-pub fn set(target: Target, data: c_uint, value: anytype) !void {
-comptime if (@TypeOf(setter) == void) @compileError("Not writable");
-try toError(@call(.auto, setter, .{ target, data, @as(?*const anyopaque, @ptrCast(&value)) }));
-}
-};
+        pub fn set(target: Target, data: c_uint, value: anytype) !void {
+            comptime if (@TypeOf(setter) == void) @compileError("Not writable");
+            try toError(@call(.auto, setter, .{ target, data, @as(?*const anyopaque, @ptrCast(&value)) }));
+        }
+    };
 }
 
 pub const terminal_data = Accessor(c.GhosttyTerminal, c.ghostty_terminal_get, void, void);
@@ -251,16 +251,16 @@ pub const rs_row = Accessor(RenderStateRowIterator, c.ghostty_render_state_row_g
 pub const rs_row_cells = Accessor(RenderStateRowCells, c.ghostty_render_state_row_cells_get, void, void);
 
 pub fn terminalModeGet(term: c.GhosttyTerminal, mode: c.GhosttyMode) !bool {
-var enabled: bool = false;
-try toError(c.ghostty_terminal_mode_get(term, mode, &enabled));
-return enabled;
+    var enabled: bool = false;
+    try toError(c.ghostty_terminal_mode_get(term, mode, &enabled));
+    return enabled;
 }
 
 pub const rs_row_cells_next = c.ghostty_render_state_row_cells_next;
 pub const rs_row_next = c.ghostty_render_state_row_iterator_next;
 
 pub fn renderStateUpdate(state: RenderState, terminal: Terminal) !void {
-try toError(c.ghostty_render_state_update(state, terminal));
+    try toError(c.ghostty_render_state_update(state, terminal));
 }
 
 pub const term_resize = c.ghostty_terminal_resize;
