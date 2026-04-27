@@ -36,19 +36,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          base_ver="$(grep -Po '^;; Version: \K[\d.]+' ghostel.el)"
+          base_ver="$(grep -Po '^;; Version: \K[\d.]+' lisp/ghostel.el)"
           sha="${GITHUB_SHA::6}"
           should_release=true
           latest_tag=$([[ "${{ steps.cur_release.outcome }}" == "failure" ]] && echo "" || echo "${{ steps.cur_release.outputs.release }}")
 
             if [[ -n "$latest_tag" ]] && git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null; then
               if git diff --quiet "$latest_tag"...HEAD -- \
-                ghostel.el \
+                lisp/ghostel.el \
                 build.zig \
                 build.zig.zon \
                 .github/workflows/release.yml \
                 .github/workflows/ci.yml \
-                include \
+                vendor \
                 src
             then
               should_release=false
@@ -130,7 +130,7 @@ jobs:
           path: |
             ${{ env.ZIG_GLOBAL_CACHE_DIR }}
             ${{ env.ZIG_LOCAL_CACHE_DIR }}
-          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'include/**', '.github/workflows/release.yml') }}
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/**', '.github/workflows/release.yml') }}
           restore-keys: |
             release-${{ runner.os }}-${{ matrix.platform }}-
 
@@ -162,6 +162,7 @@ jobs:
           )
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             files+=(conpty-module${{ matrix.suffix }})
+            files+=(conpty-module.json)
           fi
           tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
