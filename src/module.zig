@@ -9,6 +9,8 @@ const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
 const render = @import("render.zig");
 const input = @import("input.zig");
+const kitty_graphics = @import("kitty_graphics.zig");
+const sys = @import("sys.zig");
 
 const c = emacs.c;
 
@@ -29,9 +31,9 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     const env = emacs.Env.init(raw_env);
 
     // Register functions
-    env.bindFunction("ghostel--new", 2, 3, &fnNew, "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK)");
+    env.bindFunction("ghostel--new", 2, 5, &fnNew, "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK KITTY-STORAGE-LIMIT KITTY-MEDIUMS)\n\nKITTY-STORAGE-LIMIT is the kitty graphics image storage cap in bytes (default 320 MiB); 0 disables kitty graphics entirely.\nKITTY-MEDIUMS is a bitfield: bit 0 = file medium, bit 1 = temp-file medium, bit 2 = shared-memory medium (default 0 = direct only).");
     env.bindFunction("ghostel--write-input", 2, 2, &fnWriteInput, "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)");
-    env.bindFunction("ghostel--set-size", 3, 3, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)");
+    env.bindFunction("ghostel--set-size", 3, 5, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS &optional CELL-W CELL-H)");
     env.bindFunction("ghostel--get-title", 1, 1, &fnGetTitle, "Get the terminal title.\n\n(ghostel--get-title TERM)");
     env.bindFunction("ghostel--get-pwd", 1, 1, &fnGetPwd, "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)");
     env.bindFunction("ghostel--redraw", 1, 2, &fnRedraw, "Redraw the terminal into the current buffer.\n\n(ghostel--redraw TERM &optional FULL)");
@@ -52,6 +54,10 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--native-uri-at", 3, 3, &fnUriAt, "Get URI at ROW-from-bottom and COL.\n\n(ghostel--native-uri-at TERM ROW COL)");
 
     emacs.initSymbols(env);
+
+    // Install system callbacks (PNG decoder for kitty graphics, logging).
+    sys.init();
+
     env.provide("ghostel-module");
     return 0;
 }
@@ -66,15 +72,44 @@ export const plugin_is_GPL_compatible: c_int = 0;
 // Exported Elisp functions
 // ---------------------------------------------------------------------------
 
-/// (ghostel--new ROWS COLS &optional MAX-SCROLLBACK)
+/// (ghostel--new ROWS COLS &optional MAX-SCROLLBACK KITTY-STORAGE-LIMIT)
 fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
-    const rows: u16 = @intCast(env.extractInteger(args[0]));
-    const cols: u16 = @intCast(env.extractInteger(args[1]));
+    // Reject out-of-range row/col counts rather than wrapping/panicking.
+    const rows = std.math.cast(u16, env.extractInteger(args[0])) orelse {
+        env.signalError("ghostel: rows out of range");
+        return env.nil();
+    };
+    const cols = std.math.cast(u16, env.extractInteger(args[1])) orelse {
+        env.signalError("ghostel: cols out of range");
+        return env.nil();
+    };
     const max_scrollback: usize = if (nargs > 2 and env.isNotNil(args[2]))
-        @intCast(env.extractInteger(args[2]))
+        (std.math.cast(usize, env.extractInteger(args[2])) orelse {
+            env.signalError("ghostel: max-scrollback out of range");
+            return env.nil();
+        })
     else
         5 * 1024 * 1024; // ~5 MB, roughly 5k rows on an 80-column terminal
+
+    // Default 320 MiB; explicit 0 disables kitty graphics entirely
+    // (skips the storage allocation in libghostty's screen state).
+    const kitty_storage_limit: usize = if (nargs > 3 and env.isNotNil(args[3]))
+        (std.math.cast(usize, env.extractInteger(args[3])) orelse {
+            env.signalError("ghostel: kitty-storage-limit out of range");
+            return env.nil();
+        })
+    else
+        320 * 1024 * 1024;
+
+    // Bit 0 = file medium, bit 1 = temp_file, bit 2 = shared_mem.
+    // Default 0 — only the direct medium (base64 inline) is enabled.
+    // The other mediums let a remote program instruct ghostel to read
+    // arbitrary local files / SHM regions, so opt-in only.
+    const kitty_mediums: u32 = if (nargs > 4 and env.isNotNil(args[4]))
+        (std.math.cast(u32, env.extractInteger(args[4])) orelse 0)
+    else
+        0;
 
     const term = std.heap.c_allocator.create(Terminal) catch {
         env.signalError("ghostel: out of memory");
@@ -94,6 +129,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
         term.setBell(&bellCallback) catch break :blk false;
         term.setTitleChanged(&titleChangedCallback) catch break :blk false;
         term.setDeviceAttributes(&deviceAttributesCallback) catch break :blk false;
+        term.setSize(&sizeCallback) catch break :blk false;
         break :blk true;
     };
     if (!setup_ok) {
@@ -108,6 +144,16 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
     const default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
     term.setColorForeground(&default_fg) catch {};
     term.setColorBackground(&default_bg) catch {};
+
+    // Enable kitty graphics protocol if storage limit > 0.
+    if (kitty_storage_limit > 0) {
+        term.enableKittyGraphics(
+            kitty_storage_limit,
+            (kitty_mediums & 0x1) != 0,
+            (kitty_mediums & 0x2) != 0,
+            (kitty_mediums & 0x4) != 0,
+        ) catch {};
+    }
 
     return env.makeUserPtr(&Terminal.emacsFinalize, term);
 }
@@ -613,18 +659,40 @@ fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) voi
     }
 }
 
-/// (ghostel--set-size TERM ROWS COLS)
-fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+/// (ghostel--set-size TERM ROWS COLS &optional CELL-W CELL-H)
+fn fnSetSize(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse {
         env.signalError("ghostel: invalid terminal handle");
         return env.nil();
     };
 
-    const rows: u16 = @intCast(env.extractInteger(args[1]));
-    const cols: u16 = @intCast(env.extractInteger(args[2]));
+    const rows = std.math.cast(u16, env.extractInteger(args[1])) orelse {
+        env.signalError("ghostel: rows out of range");
+        return env.nil();
+    };
+    const cols = std.math.cast(u16, env.extractInteger(args[2])) orelse {
+        env.signalError("ghostel: cols out of range");
+        return env.nil();
+    };
 
-    term.resize(cols, rows) catch {
+    // Clamp cell dimensions to at least 1.  A zero (or negative,
+    // pre-cast) value would propagate into the OPT_SIZE answer, and
+    // some apps treat zero cell sizes as "kitty graphics not
+    // supported" and fall back to half-block rendering.
+    const cell_w: u32 = if (nargs > 3 and env.isNotNil(args[3])) blk: {
+        const raw = env.extractInteger(args[3]);
+        if (raw < 1) break :blk 1;
+        break :blk std.math.cast(u32, raw) orelse 1;
+    } else 1;
+
+    const cell_h: u32 = if (nargs > 4 and env.isNotNil(args[4])) blk: {
+        const raw = env.extractInteger(args[4]);
+        if (raw < 1) break :blk 1;
+        break :blk std.math.cast(u32, raw) orelse 1;
+    } else 1;
+
+    term.resize(cols, rows, cell_w, cell_h) catch {
         env.signalError("ghostel: resize failed");
         return env.nil();
     };
@@ -669,6 +737,23 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
         defer vt_log_env = null;
     }
     render.redraw(env, term, force_full);
+    // `redraw' parks the libghostty viewport one row above the active
+    // area for the next-redraw incremental change detection.  Kitty
+    // placement queries report `viewport_row' relative to the current
+    // viewport, so reading them with the parked offset shifts every
+    // placement up by 1, anchoring the resulting overlay one row too
+    // low and covering the prompt that sits just below the image.
+    // Restore to the active area (SCROLL_BOTTOM) for the kitty calls,
+    // then re-park afterwards.
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+    // Clear viewport-region kitty overlays after redraw so the cleared
+    // region is computed against the post-promotion `scrollback_in_buffer`.
+    // Running kitty-clear before redraw would use the pre-promotion viewport
+    // boundary, wiping the overlay on the row that's about to be promoted
+    // into scrollback — exactly the row we want to keep tagged.
+    _ = env.call0(emacs.sym.@"ghostel--kitty-clear");
+    kitty_graphics.emitPlacements(env, term);
+    term.scrollViewport(gt.SCROLL_DELTA, -1);
     return env.nil();
 }
 
@@ -1131,6 +1216,24 @@ fn deviceAttributesCallback(_: gt.Terminal, _: ?*anyopaque, out: [*c]gt.DeviceAt
     };
     attrs.tertiary = .{
         .unit_id = 0,
+    };
+    return true;
+}
+
+/// Called for XTWINOPS size queries (CSI 14/16/18 t).  libghostty
+/// invokes this to learn the terminal's row/column count and cell
+/// pixel dimensions, then encodes the appropriate response itself
+/// and writes it via the write_pty callback.  Image-rendering tools
+/// like timg use these queries to detect kitty graphics support and
+/// size images correctly — without a response they fall back to
+/// half-block rendering.
+fn sizeCallback(_: gt.Terminal, userdata: ?*anyopaque, out: [*c]gt.SizeReportSize) callconv(.c) bool {
+    const term: *Terminal = @ptrCast(@alignCast(userdata));
+    out[0] = .{
+        .rows = term.rows,
+        .columns = term.cols,
+        .cell_width = term.cell_width_px,
+        .cell_height = term.cell_height_px,
     };
     return true;
 }

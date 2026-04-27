@@ -8,12 +8,15 @@ ELC := lisp/ghostel.elc lisp/ghostel-debug.elc lisp/ghostel-compile.elc \
        lisp/ghostel-eshell.elc \
        extensions/evil-ghostel/evil-ghostel.elc
 
-.PHONY: all build test test-native test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-tui-partial clean regen-terminfo
+.PHONY: all build test test-native test-zig test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-tui-partial clean regen-terminfo
 
 all: build test-all test-evil lint
 
 build:
 	zig build -Doptimize=ReleaseFast -Dcpu=baseline
+
+test-zig:
+	zig build test
 
 # Pattern rule: rebuild .elc whenever its .el source is newer.
 # Make's timestamp tracking keeps the byte-compiled files in sync, so
@@ -37,7 +40,7 @@ test: $(ELC)
 test-native: build $(ELC)
 	$(EMACS) --batch -Q -L lisp -l ert -l test/ghostel-test.el -f ghostel-test-run-native
 
-test-all: test test-native
+test-all: test test-zig test-native
 
 test-evil: build $(ELC) | $(EVIL_DIR)
 	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \

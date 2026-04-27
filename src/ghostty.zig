@@ -34,6 +34,8 @@ pub const BellFn = c.GhosttyTerminalBellFn;
 pub const TitleChangedFn = c.GhosttyTerminalTitleChangedFn;
 pub const DeviceAttributesFn = c.GhosttyTerminalDeviceAttributesFn;
 pub const DeviceAttributes = c.GhosttyDeviceAttributes;
+pub const SizeFn = c.GhosttyTerminalSizeFn;
+pub const SizeReportSize = c.GhosttySizeReportSize;
 
 // Grid reference types
 pub const GridRef = c.GhosttyGridRef;
@@ -56,6 +58,7 @@ pub const OPT_BELL = c.GHOSTTY_TERMINAL_OPT_BELL;
 pub const OPT_TITLE_CHANGED = c.GHOSTTY_TERMINAL_OPT_TITLE_CHANGED;
 pub const OPT_DEVICE_ATTRIBUTES = c.GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES;
 pub const OPT_XTVERSION = c.GHOSTTY_TERMINAL_OPT_XTVERSION;
+pub const OPT_SIZE = c.GHOSTTY_TERMINAL_OPT_SIZE;
 pub const OPT_PWD = c.GHOSTTY_TERMINAL_OPT_PWD;
 pub const OPT_COLOR_FOREGROUND = c.GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND;
 pub const OPT_COLOR_BACKGROUND = c.GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND;
@@ -63,6 +66,21 @@ pub const OPT_COLOR_PALETTE = c.GHOSTTY_TERMINAL_OPT_COLOR_PALETTE;
 pub const DATA_COLOR_PALETTE = c.GHOSTTY_TERMINAL_DATA_COLOR_PALETTE;
 pub const DATA_COLOR_FOREGROUND = c.GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND;
 pub const DATA_COLOR_BACKGROUND = c.GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND;
+
+// Kitty graphics terminal options
+pub const OPT_KITTY_IMAGE_STORAGE_LIMIT = c.GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT;
+pub const OPT_KITTY_IMAGE_MEDIUM_FILE = c.GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE;
+pub const OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE = c.GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE;
+pub const OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM = c.GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM;
+pub const DATA_KITTY_GRAPHICS = c.GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS;
+
+// Kitty graphics types
+pub const KittyGraphics = c.GhosttyKittyGraphics;
+pub const KittyGraphicsImage = c.GhosttyKittyGraphicsImage;
+pub const KittyGraphicsPlacementIterator = c.GhosttyKittyGraphicsPlacementIterator;
+pub const KittyGraphicsPlacementRenderInfo = c.GhosttyKittyGraphicsPlacementRenderInfo;
+pub const KittyImageFormat = c.GhosttyKittyImageFormat;
+pub const KittyImageCompression = c.GhosttyKittyImageCompression;
 
 // Terminal data constants
 pub const DATA_COLS = c.GHOSTTY_TERMINAL_DATA_COLS;
@@ -94,7 +112,6 @@ pub const RS_ROW_DATA_CELLS = c.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS;
 pub const ROW_DATA_WRAP = c.GHOSTTY_ROW_DATA_WRAP;
 pub const ROW_DATA_SEMANTIC_PROMPT = c.GHOSTTY_ROW_DATA_SEMANTIC_PROMPT;
 pub const ROW_DATA_HYPERLINK = c.GHOSTTY_ROW_DATA_HYPERLINK;
-
 // Render state row cells data constants
 pub const RS_CELLS_DATA_STYLE = c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE;
 pub const RS_CELLS_DATA_GRAPHEMES_LEN = c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN;

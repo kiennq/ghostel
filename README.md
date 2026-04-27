@@ -29,7 +29,7 @@ process, keymap, and buffer.
 
 ## Requirements
 
-- Emacs 27.1+ with dynamic module support
+- Emacs 28.1+ with dynamic module support
 - macOS, Linux or FreeBSD
 
 The native module is **automatically downloaded** on first use.  Pre-built
@@ -490,6 +490,56 @@ output fast-path either.
 - Cursor position updates even without cell changes
 - Theme-aware color palette (syncs with Emacs theme via `ghostel-sync-theme`)
 
+### Inline Images (Kitty Graphics Protocol)
+
+Ghostel renders inline images using the [Kitty graphics
+protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) via libghostty.
+Supports both placement modes used by real-world tools:
+
+- **Traditional placements** — `timg`, `kitty +kitten icat`, and any tool that
+  emits direct kitty graphics commands.
+- **Unicode-placeholder placements** (U+10EEEE) — used by `yazi` and other
+  modern image previewers to anchor images to the buffer's text grid.
+
+Pixel data is rendered through Emacs's built-in image support: PNG payloads
+are decoded by a vendored stb_image, and raw RGB/RGBA/Gray/GrayAlpha
+transmissions are converted to PPM in the native module — no external
+ImageMagick dependency.
+
+XTWINOPS size queries (CSI 14 / 16 / 18 t) are answered so apps can detect
+graphics support and pick image dimensions; without that, `timg` falls back
+to half-block rendering even when `TERM_PROGRAM=ghostty`.
+
+Cell pixel sizes are reported as physical pixels via
+`ghostel-cell-pixel-scale` (default `auto`, derived from display DPI).
+On most displays this approximates standalone Ghostty's output; for
+pixel-perfect parity (especially on Linux Wayland with fractional scaling
+or non-standard DPI), set an explicit number.
+
+#### Limitations
+
+- **Alpha is dropped, not composited.** All formats — raw RGBA,
+  GrayAlpha, and PNG — go through an RGBA→PPM conversion that strips
+  the alpha channel (PNGs are decoded to RGBA by libghostty's PNG hook
+  at transmit time, then follow the same path).  Transparent pixels
+  render as whatever the underlying color value happens to be (most
+  decoders emit black).  Acceptable for thumbnails and screenshots;
+  not ideal for icons with semi-transparent edges.
+- **Source-rect cropping is not supported.** Atlas-style placements
+  that specify a sub-region of the source image (`x=`, `y=`, `w=`, `h=`
+  in the kitty protocol) are refused with an explicit error rather
+  than silently mis-rendering.  Full-image placements — what timg,
+  yazi, and `kitty +kitten icat` use — are unaffected.
+- **Multiple simultaneous virtual placements share rendering.**
+  Unicode-placeholder placements that coexist in the same buffer are
+  rendered as a single image; the most recent transmission wins.
+  `yazi`'s preview pane uses one image at a time, so this hasn't been
+  a problem in practice.
+- **Non-direct mediums are off by default** for safety.  Only the
+  inline (base64) medium is enabled; file / temp-file / shared-memory
+  mediums are opt-in via `ghostel-kitty-graphics-mediums`.  See its
+  docstring for the privilege-escalation reasoning.
+
 ### Calling Elisp from the Shell
 
 Shell scripts running inside ghostel can call whitelisted Elisp functions
@@ -636,6 +686,9 @@ inside a light Emacs):
 | `ghostel-immediate-redraw-interval`  | `0.05`           | Max seconds since last keystroke for immediate redraw    |
 | `ghostel-input-coalesce-delay`   | `0.003`              | Seconds to buffer rapid keystrokes before sending (0 to disable) |
 | `ghostel-full-redraw`            | `nil`                | Always do full redraws instead of incremental updates    |
+| `ghostel-cell-pixel-scale`       | `auto`               | Physical:logical pixel ratio for cell-size reporting (kitty graphics, XTWINOPS).  `auto` derives from display DPI |
+| `ghostel-kitty-graphics-storage-limit` | `320 MiB`      | Per-terminal cap on kitty graphics image storage.  Set to 0 to disable kitty graphics entirely (image transmissions are ignored, no storage allocated) |
+| `ghostel-kitty-graphics-mediums` | `nil`                | Opt-in image-loading mediums beyond the always-enabled inline base64.  A subset of `(file temp-file shared-mem)`.  Default `nil` keeps SSH sessions safe — the non-direct mediums let a remote program instruct ghostel to read arbitrary local paths or shared memory |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
@@ -1006,6 +1059,7 @@ powering Neovim's built-in terminal.
 | Plain-text URL/file detection | Yes       | No      |
 | OSC 9 / 777 notifications     | Yes       | No      |
 | OSC 9;4 progress reports      | Yes       | No      |
+| Kitty graphics protocol       | Yes       | No      |
 | Kitty keyboard protocol       | Yes       | No      |
 | Mouse passthrough (SGR)       | Yes       | No      |
 | Bracketed paste               | Yes       | Yes     |

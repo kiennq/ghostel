@@ -5,7 +5,6 @@
 const std = @import("std");
 const gt = @import("ghostty.zig");
 const emacs = @import("emacs.zig");
-
 const Self = @This();
 
 /// The libghostty terminal handle.
@@ -29,6 +28,13 @@ mouse_encoder: gt.c.GhosttyMouseEncoder,
 /// Terminal dimensions.
 cols: u16,
 rows: u16,
+
+/// Cell pixel dimensions, used to answer XTWINOPS CSI 14/16/18 t
+/// queries.  Updated on every resize.  Initialized to 1x1 — apps
+/// querying before the first resize will get a degenerate answer
+/// rather than zero (which some apps treat as "no support").
+cell_width_px: u32 = 1,
+cell_height_px: u32 = 1,
 
 /// Number of libghostty scrollback rows already materialized into the
 /// Emacs buffer above the viewport. Polled on each redraw; kept in sync
@@ -154,6 +160,11 @@ pub fn setDeviceAttributes(self: *Self, cb: gt.DeviceAttributesFn) !void {
     try self.terminalSet(gt.OPT_DEVICE_ATTRIBUTES, @ptrCast(cb));
 }
 
+/// Register the size-report callback (XTWINOPS CSI 14/16/18 t).
+pub fn setSize(self: *Self, cb: gt.SizeFn) !void {
+    try self.terminalSet(gt.OPT_SIZE, @ptrCast(cb));
+}
+
 /// Set default foreground color.
 pub fn setColorForeground(self: *Self, color: *const gt.ColorRgb) !void {
     try self.terminalSet(gt.OPT_COLOR_FOREGROUND, color);
@@ -172,6 +183,35 @@ pub fn setColorPalette(self: *Self, palette: *const [256]gt.ColorRgb) !void {
 /// Set the terminal's working directory (from OSC 7).
 pub fn setPwd(self: *Self, pwd: *const gt.GhosttyString) !void {
     try self.terminalSet(gt.OPT_PWD, pwd);
+}
+
+/// Enable kitty graphics protocol with the given storage limit (bytes).
+///
+/// `medium_file`/`medium_temp_file`/`medium_shared_mem` open additional
+/// image-loading paths beyond the default direct (base64-encoded inline)
+/// medium.  These extra mediums let a remote program instruct ghostel
+/// to read arbitrary local files or shared-memory regions, so leave
+/// them disabled unless the caller explicitly opts in.
+///
+/// Passing `&storage_limit_u64` and `&yes` (stack locals) is safe:
+/// libghostty's terminal_set dereferences the pointer and copies the
+/// value into the screen's image_limits before returning — it never
+/// retains the caller's pointer.  The header declares the storage
+/// limit as `uint64_t*`, so the local is widened to `u64` even when
+/// `usize` happens to be 64 bits on the host (the explicit cast keeps
+/// the ABI contract stable across 32-bit targets).
+pub fn enableKittyGraphics(
+    self: *Self,
+    storage_limit: usize,
+    medium_file: bool,
+    medium_temp_file: bool,
+    medium_shared_mem: bool,
+) !void {
+    const storage_limit_u64: u64 = storage_limit;
+    try self.terminalSet(gt.OPT_KITTY_IMAGE_STORAGE_LIMIT, @ptrCast(&storage_limit_u64));
+    try self.terminalSet(gt.OPT_KITTY_IMAGE_MEDIUM_FILE, @ptrCast(&medium_file));
+    try self.terminalSet(gt.OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, @ptrCast(&medium_temp_file));
+    try self.terminalSet(gt.OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, @ptrCast(&medium_shared_mem));
 }
 
 /// Get the current color palette (256 entries).
@@ -211,12 +251,20 @@ pub fn vtWrite(self: *Self, data: []const u8) void {
 /// Also sets `rebuild_pending` so the next `redraw()` erases the Emacs buffer
 /// under `inhibit-redisplay` and rebuilds scrollback from scratch — avoiding
 /// a visible blank frame between the resize and the first repaint.
-pub fn resize(self: *Self, cols: u16, rows: u16) !void {
-    if (gt.c.ghostty_terminal_resize(self.terminal, cols, rows, 1, 1) != gt.SUCCESS) {
+pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) !void {
+    if (gt.c.ghostty_terminal_resize(
+        self.terminal,
+        cols,
+        rows,
+        cell_w,
+        cell_h,
+    ) != gt.SUCCESS) {
         return error.ResizeFailed;
     }
     self.cols = cols;
     self.rows = rows;
+    self.cell_width_px = cell_w;
+    self.cell_height_px = cell_h;
     self.rebuild_pending = true;
     self.last_input_was_cr = false;
 }
