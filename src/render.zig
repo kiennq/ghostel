@@ -5,7 +5,7 @@
 /// Emacs buffer.  See `redraw' below for the per-redraw algorithm
 /// (viewport parking, scrollback sync, dirty-row reuse).
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Terminal = @import("terminal.zig");
 
@@ -262,6 +262,45 @@ fn isRowPrompt(term: *Terminal) bool {
     return semantic != 0;
 }
 
+/// Whether the row at `cy` would render to no visible buffer content.
+///
+/// Assumes the caller has refreshed the render state (via
+/// `ghostty_render_state_update`). Drives the row iterator, so callers
+/// must not rely on iterator position after this call.
+pub fn isRowEmptyAt(term: *Terminal, cy: u16) bool {
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+        return false;
+    }
+
+    var ri: u16 = 0;
+    while (ri <= cy) : (ri += 1) {
+        if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+            return false;
+        }
+    }
+
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+        return false;
+    }
+
+    while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) {
+        var graphemes_len: u32 = 0;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) == gt.SUCCESS and graphemes_len > 0) {
+            return false;
+        }
+
+        var raw_cell: gt.c.GhosttyCell = undefined;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell)) == gt.SUCCESS) {
+            var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
+            _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
+            if (!readCellStyle(term.row_cells, raw_cell).isDefault()) return false;
+        }
+    }
+
+    return true;
+}
+
 /// Result from buildRowContent: byte length for make_string, char count for properties.
 const RowContent = struct {
     byte_len: usize,
@@ -424,7 +463,7 @@ fn insertAndStyle(
     var runs: [512]RunInfo = undefined;
     var text_buf: [16384]u8 = undefined;
     var run_count: usize = 0;
-    var content = buildRowContent(term, &text_buf, &runs, &run_count);
+    var content = buildRowContent(term, text_buf[0..], runs[0..], &run_count);
 
     // Append the trailing newline to the row buffer so the row
     // text + newline insert through a single env.insert call
@@ -570,6 +609,12 @@ fn getDefaultColors(term: *Terminal) BgFg {
     return bgfg;
 }
 
+fn temporarilyWritableBuffer(env: emacs.Env) bool {
+    const was_read_only = env.bufferReadOnly();
+    if (was_read_only) env.setBufferReadOnly(false);
+    return was_read_only;
+}
+
 pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, skip: usize, force_full: bool) void {
     const default_colors = getDefaultColors(term);
 
@@ -633,6 +678,9 @@ pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, ski
         _ = gt.c.ghostty_render_state_set(render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
     }
 
+    // Plain-text URL/file detection is deferred and coalesced from Elisp
+    // after redraw so interactive typing does not pay the regex/property
+    // application cost inline. OSC-8 hyperlinks still stay native here.
     if (dirty != gt.DIRTY_FALSE) {
         if (has_wide_chars) {
             _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());
@@ -704,6 +752,8 @@ pub fn renderCursor(env: emacs.Env, term: *Terminal) void {
 /// When `force_full` is true, the viewport region is fully re-rendered
 /// instead of using the incremental dirty-row path.
 pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
     // Snapshot the buffer's mark across the destructive ops below.  Both
     // paths — full (eraseBuffer / deleteRegion over the viewport) and
     // partial (per-row deleteRegion + insert) — move every marker in the
@@ -815,4 +865,94 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     // the old active area, and advancing by 1 reaches the new one.
     term.scrollViewport(gt.SCROLL_BOTTOM, 0);
     term.scrollViewport(gt.SCROLL_DELTA, -1);
+}
+
+
+pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
+    const total_rows = term.getTotalRows();
+    if (total_rows == 0) return 1;
+
+    // Save current viewport position
+    const sb = term.getScrollbar() orelse return 1;
+    const saved_offset = sb.offset;
+
+    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
+        return 1;
+    }
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
+    const default_colors = getDefaultColors(term);
+
+    // Set buffer default face
+    var fg_hex: [7]u8 = undefined;
+    var bg_hex: [7]u8 = undefined;
+    _ = env.call2(
+        emacs.sym.@"ghostel--set-buffer-face",
+        env.makeString(formatColor(default_colors.fg, &fg_hex)),
+        env.makeString(formatColor(default_colors.bg, &bg_hex)),
+    );
+
+    // Erase buffer
+    env.eraseBuffer();
+
+    // Scroll to top of scrollback
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+
+    var rendered: usize = 0;
+
+    while (rendered < total_rows) {
+        // Query actual viewport position
+        const cur_sb = term.getScrollbar() orelse break;
+        const viewport_start = cur_sb.offset;
+
+        // Update render state for current viewport
+        if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
+            break;
+        }
+
+        // Get row iterator
+        if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+            break;
+        }
+
+        // How many rows to skip (already rendered from previous page overlap)
+        const viewport_rows: usize = term.rows;
+        const skip: usize = if (rendered > viewport_start) rendered - viewport_start else 0;
+        if (skip >= viewport_rows) break; // no new rows in this viewport
+        // How many rows to take from this viewport
+        const take: usize = @min(viewport_rows - skip, total_rows - rendered);
+        if (take == 0) break; // no progress possible
+
+        var row_in_page: usize = 0;
+        while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+            defer row_in_page += 1;
+
+            if (row_in_page < skip) {
+                continue;
+            }
+            if (row_in_page >= skip + take) {
+                break;
+            }
+
+            if (insertAndStyle(env, term, &default_colors) == null) {
+                rendered += 1;
+                continue;
+            }
+            rendered += 1;
+        }
+
+        if (rendered >= total_rows) break;
+
+        // Scroll down by viewport size for next page
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(term.rows));
+    }
+
+    // Restore viewport to saved position
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    if (saved_offset > 0) {
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
+
+    // Return 1-based line number of the original viewport top
+    return @as(i64, @intCast(saved_offset)) + 1;
 }
