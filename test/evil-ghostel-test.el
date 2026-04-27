@@ -144,7 +144,8 @@ the native full-redraw path does at the Emacs level — every marker in
 the buffer snaps to `point-min' across the call."
   `(cl-letf (((symbol-function 'ghostel--redraw)
               (lambda (_term &optional _full)
-                (let ((text (buffer-string)))
+                (let ((text (buffer-string))
+                      (inhibit-read-only t))
                   (erase-buffer)
                   (insert text))))
              ((symbol-function 'ghostel--mode-enabled)
@@ -154,7 +155,7 @@ the buffer snaps to `point-min' across the call."
 (ert-deftest evil-ghostel-test-around-redraw-preserves-point-in-normal ()
   "Point is restored in non-terminal states after the native redraw call."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (evil-normal-state)
    (goto-char (point-min))
    (search-forward "three")
@@ -166,25 +167,26 @@ the buffer snaps to `point-min' across the call."
 (ert-deftest evil-ghostel-test-around-redraw-lets-point-follow-in-emacs ()
   "Point is NOT preserved in `emacs'/`insert' — it follows the TUI cursor."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (evil-emacs-state)
    (goto-char (point-min))
    (search-forward "three")
    (evil-ghostel-test--simulating-redraw
-    ;; Mock redraw places point at point-min (like eraseBuffer does).
-    (evil-ghostel--around-redraw
-     (lambda (_term &optional _full)
-       (let ((text (buffer-string)))
-         (erase-buffer)
-         (insert text)
-         (goto-char (point-min))))
-     nil))
+     ;; Mock redraw places point at point-min (like eraseBuffer does).
+     (evil-ghostel--around-redraw
+      (lambda (_term &optional _full)
+        (let ((text (buffer-string))
+              (inhibit-read-only t))
+          (erase-buffer)
+          (insert text)
+          (goto-char (point-min))))
+      nil))
    (should (= (point-min) (point)))))
 
 (ert-deftest evil-ghostel-test-around-redraw-preserves-visual-markers ()
   "`evil-visual-beginning'/`evil-visual-end' are restored in visual state."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (goto-char (point-min))
    (search-forward "two")
    (let ((vb-target (point)))
@@ -204,13 +206,14 @@ the buffer snaps to `point-min' across the call."
 Fullscreen TUIs own the screen and drive their own redraw cycle; the
 advice must not restore point or visual markers there."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (evil-normal-state)
    (goto-char (point-min))
    (search-forward "three")
    (cl-letf (((symbol-function 'ghostel--redraw)
               (lambda (_term &optional _full)
-                (let ((text (buffer-string)))
+                (let ((text (buffer-string))
+                      (inhibit-read-only t))
                   (erase-buffer)
                   (insert text)
                   (goto-char (point-min)))))
