@@ -152,11 +152,26 @@ jobs:
             zig build -Doptimize=ReleaseFast -Dcpu=baseline
           fi
 
-      - name: Upload module artifact
+      - name: Upload Windows module artifact
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: ghostel-module${{ matrix.suffix }}
+          path: |
+            zig-out/bin/dyn-loader-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module.json
+            zig-out/bin/conpty-module${{ matrix.suffix }}
+            zig-out/bin/conpty-module.json
+      - name: Upload module artifact
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostel-module-${{ matrix.platform }}
+          path: |
+            zig-out/bin/dyn-loader-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module${{ matrix.suffix }}
+            zig-out/bin/ghostel-module.json
 
   test-native:
     needs: build-native
@@ -195,10 +210,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
+          path: zig-out/bin
 
       - name: Run native module tests
         run: |
           emacs --batch -Q -L lisp \
+            --eval '(setq ghostel-module-dir (expand-file-name "zig-out/bin" default-directory))' \
             -l ert \
             -l test/ghostel-test.el \
             -f ghostel-test-run-native
