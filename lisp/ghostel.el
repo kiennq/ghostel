@@ -3454,7 +3454,8 @@ window (not when it has just been deselected)."
              ghostel--term
              ghostel--process
              (process-live-p ghostel--process))
-    (let ((height (window-body-height window))
+    (let ((height (with-selected-window window
+                    (floor (window-screen-lines))))
           (width (window-max-chars-per-line window))
           (buf (current-buffer)))
       (unless (and (eql height ghostel--term-rows)
@@ -3471,41 +3472,6 @@ window (not when it has just been deselected)."
           (setq ghostel--redraw-timer nil))
         (let ((ghostel--redraw-resize-active t))
           (ghostel--delayed-redraw buf))))))
-
-(defun ghostel--reconcile-display-size (window)
-  "Reconcile terminal size when this buffer is (re-)displayed in WINDOW.
-Buffer migration to a window of a different size produces no
-window-size-change event — Emacs's `adjust-window-size-function'
-machinery does not fire — but `window-buffer-change-functions' does.
-Catch it here and resize libghostty + PTY to match WINDOW.
-
-Intended for buffer-local `window-buffer-change-functions'.  The
-single-window guard avoids ping-pong if the buffer is shown in two
-differently-sized windows simultaneously — that case is handled by
-the existing `window-adjust-process-window-size-smallest' path."
-  (when (and (window-live-p window)
-             (eq (window-buffer window) (current-buffer))
-             ghostel--term
-             ghostel--process
-             (process-live-p ghostel--process)
-             (= 1 (length (get-buffer-window-list (current-buffer) nil t))))
-    (let ((height (window-body-height window))
-          (width (window-max-chars-per-line window)))
-      (unless (and (eql height ghostel--term-rows)
-                   (eql width ghostel--term-cols))
-        (ghostel--set-size ghostel--term (max 1 height) (max 1 width))
-        (setq ghostel--term-rows height
-              ghostel--term-cols width
-              ghostel--force-next-redraw t)
-        (set-process-window-size ghostel--process
-                                 (max 1 height) (max 1 width))
-        (when ghostel--redraw-timer
-          (cancel-timer ghostel--redraw-timer)
-          (setq ghostel--redraw-timer nil))
-        (let ((ghostel--redraw-resize-active t))
-          (ghostel--delayed-redraw (current-buffer)))))))
-
-
 
 ;;; Major mode
 
@@ -3543,8 +3509,6 @@ the existing `window-adjust-process-window-size-smallest' path."
             #'ghostel--commit-cropped-size nil t)
   (add-hook 'window-buffer-change-functions
             #'ghostel--reshow-snap nil t)
-  (add-hook 'window-buffer-change-functions
-            #'ghostel--reconcile-display-size nil t)
   (ghostel--suppress-interfering-modes)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
@@ -3584,17 +3548,31 @@ buffer can be found again after title-tracking renames it."
 (defun ghostel--init-buffer (buffer &optional identity)
   "Initialize BUFFER as a ghostel terminal if no terminal handle exists yet.
 Terminal dimensions come from BUFFER's displayed window when one
-exists, otherwise from the selected window.  Subsequent migrations
-to differently-sized windows are reconciled by
-`ghostel--reconcile-display-size' on `window-buffer-change-functions'.
+exists, otherwise from the selected window.  Height uses
+`window-screen-lines' (the metric the standard
+`adjust-window-size-function' path also uses), not
+`window-body-height'.  The former divides the window's pixel height
+by the buffer's `default-line-height', which respects
+`face-remapping-alist' and `:height' on the default face; the latter
+divides by frame char height.  When a theme remaps default —
+`nano-light' / `nano-dark' do this — the two metrics disagree, and
+using `window-body-height' would size the terminal to N rows only to
+have the standard adjust-fn immediately resize to N-K, sending a
+startup SIGWINCH that some TUI apps (Claude Code's /tui fullscreen)
+handle imperfectly (issue #192).
 IDENTITY, if given, is stored as `ghostel--buffer-identity' so the
 buffer can be found again after title-tracking renames it."
   (with-current-buffer buffer
     (unless ghostel--term
       (ghostel--prepare-buffer buffer identity)
       (let* ((w (or (get-buffer-window buffer t) (selected-window)))
-             (height (if (window-live-p w) (window-body-height w) 24))
-             (width  (if (window-live-p w) (window-max-chars-per-line w) 80)))
+             (height (max 1 (if (window-live-p w)
+                                (with-selected-window w
+                                  (floor (window-screen-lines)))
+                              24)))
+             (width  (max 1 (if (window-live-p w)
+                                (window-max-chars-per-line w)
+                              80))))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
         (setq ghostel--term-rows height)
@@ -3658,7 +3636,11 @@ Signals `user-error' if BUFFER already has a live ghostel process."
   (let ((window (or (get-buffer-window buffer t) (selected-window))))
     (with-current-buffer buffer
       (ghostel--prepare-buffer buffer nil)
-      (let* ((height (max 1 (window-body-height window)))
+      ;; Use `window-screen-lines' (not `window-body-height') so the
+      ;; height matches the unit `window-adjust-process-window-size-smallest'
+      ;; uses — see `ghostel--init-buffer' for why.
+      (let* ((height (max 1 (with-selected-window window
+                              (floor (window-screen-lines)))))
              (width (max 1 (window-max-chars-per-line window)))
              (remote-p (file-remote-p default-directory)))
         (setq ghostel--term

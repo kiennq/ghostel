@@ -570,11 +570,13 @@ ghostel settings into *ghostel-debug* for pasting into bug reports."
                                     (if copy "active" "off"))))
                 (insert "Term handle:         nil (no terminal)\n"))
               ;; Size sync — surfaces #192-class bugs.
-              ;; If body-rows ≠ term-rows but cur=recorded body pixels, then
-              ;; Emacs already absorbed the chrome change but ghostel didn't
-              ;; reconcile (a real ghostel bug).  If both differ, the next
-              ;; redisplay will fire `window-{size,configuration}-change-hook'
-              ;; and `--window-adjust-process-window-size' will reconcile.
+              ;; Compare term-rows against `floor(window-screen-lines)' (what
+              ;; `window-adjust-process-window-size-smallest' uses), NOT
+              ;; `window-body-height': the latter divides by frame char
+              ;; height while screen-lines divides by `default-line-height'
+              ;; (face-remap-aware).  When a theme remaps the default face
+              ;; height, the two disagree and the body-height comparison
+              ;; cries wolf.
               (when (and term (window-live-p win))
                 (insert "\n--- Size sync ---\n")
                 (let* ((cur-body-px (window-body-height win t))
@@ -584,12 +586,21 @@ ghostel settings into *ghostel-debug* for pasting into bug reports."
                        (screen-lines (with-selected-window win
                                        (window-screen-lines)))
                        (body-rows (window-body-height win))
-                       (rows-match (eql body-rows term-rows))
+                       (frame-ch (frame-char-height))
+                       (default-lh (with-selected-window win
+                                     (default-line-height)))
+                       (target-rows (floor screen-lines))
+                       (rows-match (eql target-rows term-rows))
                        (px-match (eql cur-body-px old-body-px)))
-                  (insert (format "Body rows:           %d (window) vs %s (term) %s\n"
-                                  body-rows term-rows
+                  (insert (format "screen-lines:        %.3f → target %d (term=%s) %s\n"
+                                  screen-lines target-rows term-rows
                                   (if rows-match "[in sync]" "[MISMATCH]")))
-                  (insert (format "window-screen-lines: %s\n" screen-lines))
+                  (insert (format "Body rows (frame):   %d (window-body-height — frame chars)\n"
+                                  body-rows))
+                  (insert (format "Line height:         frame=%d px  default-face=%d px%s\n"
+                                  frame-ch default-lh
+                                  (if (eql frame-ch default-lh) ""
+                                    " [face-remap or theme bumps height]")))
                   (insert (format "Body pixels:         cur=%d  recorded=%d %s\n"
                                   cur-body-px old-body-px
                                   (if px-match "" "[redisplay pending]")))
@@ -599,8 +610,8 @@ ghostel settings into *ghostel-debug* for pasting into bug reports."
                    (rows-match
                     (insert "Diagnosis:           in sync\n"))
                    (px-match
-                    (insert "Diagnosis:           Emacs absorbed the chrome change\n")
-                    (insert "                     but ghostel didn't reconcile (#192)\n"))
+                    (insert "Diagnosis:           Emacs absorbed the change but\n")
+                    (insert "                     ghostel didn't reconcile (#192)\n"))
                    (t
                     (insert "Diagnosis:           pending redisplay; hooks will fire\n")
                     (insert "                     on next paint\n"))))))))

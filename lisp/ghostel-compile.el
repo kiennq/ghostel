@@ -548,7 +548,9 @@ so there is no remote-integration round-trip on TRAMP buffers."
   (ghostel--load-module t)
   (let* ((buffer (get-buffer-create name))
          (win (or (get-buffer-window buffer t) (selected-window)))
-         (height (if (window-live-p win) (window-body-height win) 24))
+         (height (if (window-live-p win)
+                     (with-selected-window win (floor (window-screen-lines)))
+                   24))
          (width  (if (window-live-p win) (window-max-chars-per-line win) 80)))
     (with-current-buffer buffer
       ;; Set `default-directory' before `ghostel-mode' so the mode's
@@ -626,7 +628,8 @@ honour custom compile-mode subclasses the caller passed to
       ;; column and look garbled until the user's first resize triggers
       ;; `ghostel--window-adjust-process-window-size'.
       (when (and outwin ghostel--term)
-        (let ((oh (max 1 (window-body-height outwin)))
+        (let ((oh (max 1 (with-selected-window outwin
+                           (floor (window-screen-lines)))))
               (ow (max 1 (window-max-chars-per-line outwin))))
           (ghostel--set-size ghostel--term oh ow)
           (setq ghostel--term-rows oh)))
@@ -659,8 +662,9 @@ honour custom compile-mode subclasses the caller passed to
       ;; window, e.g. `allow-no-window').  Use `window-max-chars-per-line'
       ;; as the canonical width measure, matching `ghostel--spawn-pty'.
       (let* ((height (max 1 (if outwin
-                                (window-body-height outwin)
-                              (window-body-height))))
+                                (with-selected-window outwin
+                                  (floor (window-screen-lines)))
+                              (floor (window-screen-lines)))))
              (width (max 1 (if outwin
                                (window-max-chars-per-line outwin)
                              (window-max-chars-per-line))))
