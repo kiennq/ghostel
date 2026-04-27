@@ -4,7 +4,7 @@
 /// each redraw cycle, converts pixel data to PPM for Emacs display,
 /// and calls into Elisp to apply image overlays.
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
 const ppm = @import("ppm.zig");
