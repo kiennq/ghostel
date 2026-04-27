@@ -8,12 +8,15 @@ ELC := lisp/ghostel.elc lisp/ghostel-debug.elc lisp/ghostel-compile.elc \
        lisp/ghostel-eshell.elc \
        extensions/evil-ghostel/evil-ghostel.elc
 
-.PHONY: all build test test-native test-zig test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial clean regen-terminfo
+.PHONY: all build check test test-native test-zig test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-tui-partial clean regen-terminfo
 
 all: build test-all test-evil lint
 
 build:
-	zig build -Doptimize=ReleaseFast -Dcpu=baseline
+	zig build
+
+check:
+	zig build check
 
 test-zig:
 	zig build test
@@ -126,7 +129,8 @@ bench-tui-partial:
 		--eval '(progn (setq ghostel-bench-include-vterm nil ghostel-bench-include-eat nil ghostel-bench-include-term nil) (ghostel-bench--load-backends) (ghostel-bench--run-tui-partial-scenarios))'
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f conpty-module.dll conpty-module.dylib conpty-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache
 
