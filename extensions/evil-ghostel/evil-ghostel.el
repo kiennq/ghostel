@@ -27,6 +27,11 @@
 (require 'evil)
 (require 'ghostel)
 
+(declare-function ghostel--cursor-position "ghostel-module")
+(declare-function ghostel--mode-enabled "ghostel-module")
+
+(defvar evil-ghostel-mode)
+
 ;; ---------------------------------------------------------------------------
 ;; Customization
 ;; ---------------------------------------------------------------------------
@@ -160,7 +165,7 @@ In alt-screen mode, defer to the terminal's cursor style."
 
 (defvar evil-ghostel--sync-inhibit nil
   "When non-nil, skip arrow-key sync in the insert-state-entry hook.
-Set by the `I'/`A' advice which send Home/End directly.")
+Set by the I/A advice which send Home/End directly.")
 
 (defun evil-ghostel--insert-state-entry ()
   "Sync terminal cursor to Emacs point when entering `emacs-state'.

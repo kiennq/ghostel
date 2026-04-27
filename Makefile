@@ -5,9 +5,10 @@ MELPAZOID_DIR  ?= $(XDG_CACHE_HOME)/melpazoid
 EVIL_DIR       ?= $(XDG_CACHE_HOME)/evil
 
 ELC := lisp/ghostel.elc lisp/ghostel-debug.elc lisp/ghostel-compile.elc \
-       lisp/ghostel-eshell.elc
+       lisp/ghostel-eshell.elc \
+       extensions/evil-ghostel/evil-ghostel.elc
 
-.PHONY: all build test test-native test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile bench bench-quick clean regen-terminfo
+.PHONY: all build test test-native test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick clean regen-terminfo
 
 all: build test-all test-evil lint
 
@@ -18,8 +19,17 @@ build:
 # Make's timestamp tracking keeps the byte-compiled files in sync, so
 # test targets never load stale .elc (Emacs prefers .elc over .el
 # even when the source is newer, which silently masks edits).
-%.elc: %.el
+lisp/%.elc: lisp/%.el
 	$(EMACS) --batch -Q -L lisp --eval "(setq byte-compile-error-on-warn t)" -f batch-byte-compile $<
+
+# Extension packages depend on third-party libraries; reuse the evil
+# checkout that `test-evil' manages.
+$(EVIL_DIR):
+	git clone --depth 1 https://github.com/emacs-evil/evil.git "$@"
+
+extensions/evil-ghostel/%.elc: extensions/evil-ghostel/%.el | $(EVIL_DIR)
+	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \
+		--eval "(setq byte-compile-error-on-warn t)" -f batch-byte-compile $<
 
 test: $(ELC)
 	$(EMACS) --batch -Q -L lisp -l ert -l test/ghostel-test.el -f ghostel-test-run-elisp
@@ -29,23 +39,20 @@ test-native: build $(ELC)
 
 test-all: test test-native
 
-test-evil:
-	@if [ ! -d "$(EVIL_DIR)" ]; then \
-		git clone --depth 1 https://github.com/emacs-evil/evil.git "$(EVIL_DIR)"; \
-	fi
+test-evil: build $(ELC) | $(EVIL_DIR)
 	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \
 		-l ert -l test/evil-ghostel-test.el -f evil-ghostel-test-run
 
 byte-compile: $(ELC)
 
-lint: byte-compile package-lint checkdoc
+lint: byte-compile package-lint checkdoc docquotes
 
 package-lint:
 	$(EMACS) --batch -Q \
 		--eval "(package-initialize)" \
 		--eval "(require 'package-lint)" \
 		-f package-lint-batch-and-exit \
-		lisp/ghostel.el
+		lisp/ghostel.el extensions/evil-ghostel/evil-ghostel.el
 
 checkdoc:
 	$(EMACS) --batch -Q \
@@ -62,6 +69,26 @@ checkdoc:
 		      (setq ok nil) \
 		      (with-current-buffer \"*Warnings*\" \
 		        (message \"%s\" (buffer-string))))) \
+		  (unless ok (kill-emacs 1)))"
+
+# Mirrors melpazoid's "Only use back/front quotes to link to top-level
+# elisp symbols" check, widened to also catch identifiers with
+# underscores like INSIDE_EMACS — env-var and macro-style names that
+# melpazoid's stricter [A-Z]+ regex skips.
+docquotes:
+	$(EMACS) --batch -Q \
+		--eval "(let ((ok t)) \
+		  (dolist (f '(\"lisp/ghostel.el\" \"lisp/ghostel-debug.el\" \"lisp/ghostel-compile.el\" \"lisp/ghostel-eshell.el\" \"extensions/evil-ghostel/evil-ghostel.el\")) \
+		    (with-temp-buffer \
+		      (insert-file-contents f) \
+		      (setq case-fold-search nil) \
+		      (goto-char (point-min)) \
+		      (while (re-search-forward \"\`[A-Z_]+'\" nil t) \
+		        (setq ok nil) \
+		        (message \"%s:%d:%d: Only use back/front quotes to link to top-level elisp symbols (%s)\" \
+		                 f (line-number-at-pos) \
+		                 (1+ (- (match-beginning 0) (line-beginning-position))) \
+		                 (match-string 0))))) \
 		  (unless ok (kill-emacs 1)))"
 
 melpazoid: melpazoid-ghostel melpazoid-evil-ghostel

@@ -33,8 +33,9 @@
 (require 'lisp-mnt)
 (require 'ghostel)
 
-(declare-function ghostel--module-version "ghostel-module")
+(declare-function ghostel--alt-screen-p "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
+(declare-function ghostel--module-version "ghostel-module")
 
 (defvar ghostel-debug--log-buffer nil
   "Buffer used for ghostel debug logging.")

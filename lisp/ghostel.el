@@ -131,8 +131,8 @@ A list of \"KEY=VALUE\" strings, prepended to `process-environment'
 before spawning the shell.  A bare \"KEY\" (no `=') unsets the variable.
 
 For local spawns, entries here take precedence over ghostel's own
-variables (`TERM', `INSIDE_EMACS', `EMACS_GHOSTEL_PATH',
-shell-integration vars), so a user who sets `TERM' here wins — which
+variables (TERM, INSIDE_EMACS, EMACS_GHOSTEL_PATH,
+shell-integration vars), so a user who sets TERM here wins — which
 will also disable ghostel's shell integration if the chosen TERM
 breaks its assumptions.
 
@@ -140,10 +140,10 @@ Also honored via `dir-locals.el' for per-project overrides.
 
 TRAMP caveats:
 - Entries with `=' are propagated to the remote shell.
-- `TERM' is always reset by TRAMP to `tramp-terminal-type' (see
+- TERM is always reset by TRAMP to `tramp-terminal-type' (see
   `tramp-handle-make-process'); overrides in `ghostel-environment'
   do not win remotely.
-- `INSIDE_EMACS' is rewritten by TRAMP via `tramp-inside-emacs',
+- INSIDE_EMACS is rewritten by TRAMP via `tramp-inside-emacs',
   which appends `,tramp:VER' to whatever value is in scope.  For
   ghostel that means the remote shell sees `ghostel,tramp:VER'
   rather than the bare `ghostel' set locally — the leading
