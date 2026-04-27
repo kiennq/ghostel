@@ -7373,10 +7373,11 @@ It must also raise `read-process-output-max'.  Same reason as
         (should-not set-size-called)
         (should-not swsize-called)))))
 
-(ert-deftest ghostel-test-reconcile-initial-size-resizes-on-mismatch ()
-  "If the buffer's window size differs from the captured value, resize.
-Models the issue #192 race where `ghostel--init-buffer' captured a
-stale popup size that the layout settled past before the timer fired."
+(ert-deftest ghostel-test-reconcile-display-size-resizes-on-mismatch ()
+  "If the new window's body differs from the captured value, resize.
+Models the issue #192 case where the buffer migrates to a window of
+a different size — no `window-size-change-functions' fires because no
+window's recorded size changed, only the buffer-to-window mapping did."
   (with-temp-buffer
     (let ((ghostel--term 'fake)
           (ghostel--process 'fake-proc)
@@ -7394,12 +7395,13 @@ stale popup size that the layout settled past before the timer fired."
                 ((symbol-function 'process-live-p) (lambda (_p) t))
                 ((symbol-function 'set-process-window-size)
                  (lambda (_p h w) (setq swsize-args (list h w))))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (_b _f) 'test-win))
                 ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-buffer) (lambda (_w) buf))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(test-win)))
                 ((symbol-function 'window-body-height) (lambda (&rest _) 34))
                 ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 87)))
-        (ghostel--reconcile-initial-size buf)
+        (ghostel--reconcile-display-size 'test-win)
         (should (equal '(34 87) set-size-args))
         (should (equal '(34 87) swsize-args))
         (should (eql ghostel--term-rows 34))
@@ -7407,7 +7409,7 @@ stale popup size that the layout settled past before the timer fired."
         (should ghostel--force-next-redraw)
         (should redraw-called)))))
 
-(ert-deftest ghostel-test-reconcile-initial-size-noop-on-match ()
+(ert-deftest ghostel-test-reconcile-display-size-noop-on-match ()
   "If the window size already matches the captured value, do nothing."
   (with-temp-buffer
     (let ((ghostel--term 'fake)
@@ -7423,19 +7425,21 @@ stale popup size that the layout settled past before the timer fired."
                 ((symbol-function 'process-live-p) (lambda (_p) t))
                 ((symbol-function 'set-process-window-size)
                  (lambda (_p _h _w) (setq swsize-called t)))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (_b _f) 'test-win))
                 ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-buffer) (lambda (_w) buf))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(test-win)))
                 ((symbol-function 'window-body-height) (lambda (&rest _) 34))
                 ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 87)))
-        (ghostel--reconcile-initial-size buf)
+        (ghostel--reconcile-display-size 'test-win)
         (should-not set-size-called)
         (should-not swsize-called)))))
 
-(ert-deftest ghostel-test-reconcile-initial-size-noop-when-not-displayed ()
-  "If the buffer is not in any window, do nothing.
-Late timer firing after the user already killed the window must not
-crash or pick a wrong window."
+(ert-deftest ghostel-test-reconcile-display-size-noop-on-multi-window ()
+  "If the buffer is in more than one window, defer to smallest-window logic.
+Ping-ponging libghostty between two differently-sized windows would
+cause flicker; the existing `adjust-window-size-function' path uses
+`window-adjust-process-window-size-smallest' to pick a stable size."
   (with-temp-buffer
     (let ((ghostel--term 'fake)
           (ghostel--process 'fake-proc)
@@ -7447,16 +7451,19 @@ crash or pick a wrong window."
                  (lambda (_term _h _w) (setq set-size-called t)))
                 ((symbol-function 'ghostel--delayed-redraw) #'ignore)
                 ((symbol-function 'process-live-p) (lambda (_p) t))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (_b _f) nil)))
-        (ghostel--reconcile-initial-size buf)
+                ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-buffer) (lambda (_w) buf))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(test-win other-win)))
+                ((symbol-function 'window-body-height) (lambda (&rest _) 34))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 87)))
+        (ghostel--reconcile-display-size 'test-win)
         (should-not set-size-called)))))
 
-(ert-deftest ghostel-test-reconcile-initial-size-noop-when-process-dead ()
-  "If the process died before the timer fires, do nothing.
-The shell can exit between `--start-process' and the idle tick (e.g.
-exec'd PROGRAM that crashes immediately); reconciliation must not
-SIGWINCH a corpse."
+(ert-deftest ghostel-test-reconcile-display-size-noop-when-process-dead ()
+  "If the process died, do nothing.
+Hook firing after the shell exited (e.g. exec'd PROGRAM crashed,
+sentinel queued for next idle) must not SIGWINCH a corpse."
   (with-temp-buffer
     (let ((ghostel--term 'fake)
           (ghostel--process 'fake-proc)
@@ -7471,19 +7478,20 @@ SIGWINCH a corpse."
                 ((symbol-function 'process-live-p) (lambda (_p) nil))
                 ((symbol-function 'set-process-window-size)
                  (lambda (_p _h _w) (setq swsize-called t)))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (_b _f) 'test-win))
                 ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-buffer) (lambda (_w) buf))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(test-win)))
                 ((symbol-function 'window-body-height) (lambda (&rest _) 34))
                 ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 87)))
-        (ghostel--reconcile-initial-size buf)
+        (ghostel--reconcile-display-size 'test-win)
         (should-not set-size-called)
         (should-not swsize-called)))))
 
-(ert-deftest ghostel-test-reconcile-initial-size-noop-when-term-nil ()
+(ert-deftest ghostel-test-reconcile-display-size-noop-when-term-nil ()
   "If `ghostel--term' was never created, do nothing.
-The `when-let*' must short-circuit before calling `ghostel--set-size'
-on a nil terminal."
+The early-`when' guard must short-circuit before calling
+`ghostel--set-size' on a nil terminal."
   (with-temp-buffer
     (let ((ghostel--term nil)
           (ghostel--process 'fake-proc)
@@ -7495,12 +7503,13 @@ on a nil terminal."
                  (lambda (_term _h _w) (setq set-size-called t)))
                 ((symbol-function 'ghostel--delayed-redraw) #'ignore)
                 ((symbol-function 'process-live-p) (lambda (_p) t))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (_b _f) 'test-win))
                 ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-buffer) (lambda (_w) buf))
+                ((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(test-win)))
                 ((symbol-function 'window-body-height) (lambda (&rest _) 34))
                 ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 87)))
-        (ghostel--reconcile-initial-size buf)
+        (ghostel--reconcile-display-size 'test-win)
         (should-not set-size-called)))))
 
 ;;; SIGWINCH delivery tests — verify the PTY actually sends the signal
@@ -7900,11 +7909,11 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-commit-cropped-size-noop-outside-minibuffer
     ghostel-test-commit-cropped-size-noop-on-deselect
     ghostel-test-commit-cropped-size-noop-when-matched
-    ghostel-test-reconcile-initial-size-resizes-on-mismatch
-    ghostel-test-reconcile-initial-size-noop-on-match
-    ghostel-test-reconcile-initial-size-noop-when-not-displayed
-    ghostel-test-reconcile-initial-size-noop-when-process-dead
-    ghostel-test-reconcile-initial-size-noop-when-term-nil
+    ghostel-test-reconcile-display-size-resizes-on-mismatch
+    ghostel-test-reconcile-display-size-noop-on-match
+    ghostel-test-reconcile-display-size-noop-on-multi-window
+    ghostel-test-reconcile-display-size-noop-when-process-dead
+    ghostel-test-reconcile-display-size-noop-when-term-nil
     ghostel-test-sigwinch-reaches-shell-basic
     ghostel-test-sigwinch-reaches-shell-ghostel-style
     ghostel-test-sigwinch-reaches-child-process
