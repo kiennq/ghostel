@@ -1848,7 +1848,9 @@ stripped so the copied text matches the original terminal content."
   "Keymap for clickable hyperlinks in ghostel buffers.")
 
 (defun ghostel--native-link-help-echo (window _ pos)
-  "help-echo handler for OSC8 hyperlinks. Retrieves native URI from libghostty."
+  "Return the native OSC8 URI for the link at POS in WINDOW.
+Used as the `help-echo' handler for OSC8 hyperlinks; retrieves the
+URI from libghostty."
   (with-current-buffer (window-buffer window)
     (ghostel--native-uri-at-pos pos)))
 

@@ -2,11 +2,9 @@
 
 ;;; Commentary:
 
-;; Run with:
-;;   `emacs --batch -Q -L lisp -l ert -l test/ghostel-test.el -f ghostel-test-run'
-;;
-;; Pure Elisp tests only (no native module):
-;;   `emacs --batch -Q -L lisp -l ert -l test/ghostel-test.el -f ghostel-test-run-elisp'
+;; Run via `make test' (pure Elisp, no native module required) or
+;; `make test-native' (requires the built native module).  See the
+;; Makefile for the underlying Emacs invocation.
 
 ;;; Code:
 
@@ -556,11 +554,11 @@ scrolling libghostty's viewport."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-scrollback-eviction-chunked ()
-  "Scrollback eviction works when writing happens in little chunks with
-renders in between.  Writes a small batch, renders, then writes a large
-batch across many small writes interspersed with renders.  The accumulated
-scrollback from the second phase must evict the first phase from the
-Emacs buffer."
+  "Scrollback eviction works for chunked writes with interleaved renders.
+Writes a small batch, renders, then writes a large batch across many
+small writes interspersed with renders.  The accumulated scrollback
+from the second phase must evict the first phase from the Emacs
+buffer."
   (let ((buf (generate-new-buffer " *ghostel-test-sb-evict*")))
     (unwind-protect
         (with-current-buffer buf
@@ -581,11 +579,10 @@ Emacs buffer."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-scrollback-eviction-bulk ()
-  "Scrollback eviction works when a single large write pushes all rows
-out of libghostty's scrollback cap at once.  Writes a small batch,
-renders, then writes a massive amount in one go that gets evicted in
-one fell swoop.  The second redraw must evict the first-batch rows from
-the Emacs buffer."
+  "Scrollback eviction works for a single large bulk write.
+Writes a small batch, renders, then writes a massive amount in one go
+that pushes all rows out of libghostty's scrollback cap at once.  The
+second redraw must evict the first-batch rows from the Emacs buffer."
   (let ((buf (generate-new-buffer " *ghostel-test-sb-evict*")))
     (unwind-protect
         (with-current-buffer buf
@@ -605,8 +602,10 @@ the Emacs buffer."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-no-stale-lines-in-scrollback ()
-  "Rows that have been materialized in a previous render and are then modified
-and scrolled out in a single write should not scroll out the stale row."
+  "Rows modified and scrolled out in one write must not leak stale text.
+A row that has been materialized in a previous render and is then
+modified and scrolled out in a single write should not scroll out the
+stale row."
   (let ((buf (generate-new-buffer " *ghostel-test-sb-buffer*")))
     (unwind-protect
         (with-current-buffer buf
@@ -1239,7 +1238,7 @@ Mirrors the real zsh case where the directory still contains a
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-fish-auto-inject-loads-integration ()
-  "Fish auto-inject shim must chain to etc/shell/ghostel.fish and clean XDG_DATA_DIRS.
+  "Fish auto-inject shim chains to ghostel.fish and cleans XDG_DATA_DIRS.
 Regression test: the vendor_conf.d shim previously (a) inlined a
 partial copy of the integration and silently dropped the outbound
 \\='ssh' wrapper, and (b) used a temp variable name (\\='xdg_data_dirs')
@@ -3925,7 +3924,7 @@ declare that variable buffer-locally so the live buffer qualifies."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-resize-redraw-alt-screen ()
-  "After resize on alt screen, the app's SIGWINCH-triggered redraw renders correctly.
+  "Resize on alt screen: SIGWINCH-triggered redraw renders correctly.
 Simulates: alt-screen TUI fills screen → window resize → app redraws
 for new size inside BSU/ESU → verify buffer shows new content."
   (let ((buf (generate-new-buffer " *ghostel-test-resize-redraw*")))
@@ -6539,7 +6538,7 @@ rather than the selected window's buffer."
   (should (lookup-key ghostel-mode-map (kbd "C-@"))))
 
 (ert-deftest ghostel-test-c-g-binding ()
-  "The quit key is bound to `ghostel-send-C-g' in `ghostel-mode-map'."
+  "`ghostel-mode-map' binds the quit key to a dedicated send handler."
   (should (eq (lookup-key ghostel-mode-map (kbd "C-g"))
               #'ghostel-send-C-g)))
 
@@ -6559,7 +6558,7 @@ rather than the selected window's buffer."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-c-g-deactivates-mark ()
-  "`ghostel-send-C-g' should clear an active region and `quit-flag'.
+  "The quit-key send handler clears an active region and `quit-flag'.
 `keyboard-quit' is bypassed because `inhibit-quit' is set, so both
 side effects have to happen explicitly inside the command."
   (let ((buf (generate-new-buffer " *ghostel-test-c-g-mark*"))
@@ -7662,9 +7661,10 @@ printf '\\033[H\\033[2J'; exec %s"
         (kill-buffer buf)))))
 
 (ert-deftest ghostel-test-sigwinch-via-ghostel-resize-handler ()
-  "SIGWINCH reaches child processes via `ghostel--window-adjust-process-window-size'.
-This is the full path Emacs takes: call the adjust-window-size-function,
-get (width . height), then call `set-process-window-size'."
+  "SIGWINCH reaches child processes via the resize handler.
+Exercises `ghostel--window-adjust-process-window-size', the full
+path Emacs takes: call the adjust-window-size-function, get
+\(width . height), then call `set-process-window-size'."
   (skip-unless (not (eq system-type 'windows-nt)))
   (skip-unless (file-executable-p "/bin/sh"))
   (let* ((buf (generate-new-buffer " *sigwinch-gh-handler*"))

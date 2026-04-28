@@ -29,6 +29,30 @@ jobs:
             lisp/ghostel.el lisp/ghostel-compile.el \
             lisp/ghostel-debug.el lisp/ghostel-eshell.el
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: '29.4'
+
+      - name: Install lint deps
+        # `package-lint' resolves cross-package deps via
+        # `package-archive-contents' and `package-alist'.  Installing
+        # ghostel from the local checkout adds it to `package-alist' so
+        # evil-ghostel's `(ghostel "0.8.0")' Package-Require resolves —
+        # ghostel itself isn't on any ELPA.
+        run: |
+          emacs --batch -Q \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'package-lint)" \
+            --eval "(package-install-file (expand-file-name \"lisp/ghostel.el\"))"
+
+      - name: Run package-lint, checkdoc, docquotes
+        run: make package-lint checkdoc docquotes
+
   test:
     runs-on: ubuntu-latest
     strategy:
