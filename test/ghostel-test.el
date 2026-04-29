@@ -7831,6 +7831,29 @@ while :; do sleep 0.1; done'\n")
             (should (nth 6 captured))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-exec-uses-default-size-when-buffer-not-displayed ()
+  "`ghostel-exec' on an undisplayed buffer uses the 80x24 default.
+Falling back to (selected-window) sized the PTY from whatever window
+happened to be focused at call time, which rarely matches where the
+buffer eventually shows up."
+  (let ((buf (generate-new-buffer "ghostel-exec-test"))
+        captured)
+    (unwind-protect
+        (progn
+          ;; Sanity: the buffer is not displayed in any window.
+          (should-not (get-buffer-window buf t))
+          (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
+                    ((symbol-function 'ghostel--new)
+                     (lambda (&rest args) (setq captured args) 'fake-term))
+                    ((symbol-function 'ghostel--apply-palette) #'ignore)
+                    ((symbol-function 'ghostel--spawn-pty)
+                     (lambda (&rest _) 'fake-proc)))
+            (ghostel-exec buf "ls" nil)
+            ;; ghostel--new is called as (height width max-scrollback).
+            (should (equal (nth 0 captured) 24))
+            (should (equal (nth 1 captured) 80))))
+      (kill-buffer buf))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-eshell integration
 ;; -----------------------------------------------------------------------
@@ -8092,6 +8115,7 @@ COLORTERM, INSIDE_EMACS, …) plus pass-through LANG/LC_*."
     ghostel-test-exec-errors-on-live-process
     ghostel-test-exec-calls-spawn-pty-with-expected-args
     ghostel-test-exec-threads-remote-p-from-tramp-dir
+    ghostel-test-exec-uses-default-size-when-buffer-not-displayed
     ghostel-test-environment-precedes-internal-env
     ghostel-test-environment-applies-to-compile
     ghostel-test-environment-honors-dir-locals

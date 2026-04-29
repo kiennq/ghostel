@@ -3687,12 +3687,12 @@ Returns the buffer."
   "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.
 
 BUFFER is switched into `ghostel-mode' (if not already) and a new
-terminal is created sized to the window displaying BUFFER, falling
-back to the selected window if BUFFER is not displayed.  No shell
-integration is applied — PROGRAM is exec'd directly via
-`ghostel--spawn-pty'.  PROGRAM is shell-quoted before it is passed
-to `/bin/sh -c', so shell metacharacters are not interpreted; pass
-extra tokens via ARGS, a list of strings.  Returns the process.
+terminal is created sized to the window displaying BUFFER, or
+80x24 if BUFFER is not currently displayed.  No shell integration
+is applied — PROGRAM is exec'd directly via `ghostel--spawn-pty'.
+PROGRAM is shell-quoted before it is passed to `/bin/sh -c', so
+shell metacharacters are not interpreted; pass extra tokens via
+ARGS, a list of strings.  Returns the process.
 
 Signals `user-error' if BUFFER already has a live ghostel process."
   (ghostel--load-module t)
@@ -3700,15 +3700,19 @@ Signals `user-error' if BUFFER already has a live ghostel process."
              (process-live-p (buffer-local-value 'ghostel--process buffer)))
     (user-error "Buffer %s already has a running ghostel process"
                 (buffer-name buffer)))
-  (let ((window (or (get-buffer-window buffer t) (selected-window))))
+  (let ((window (get-buffer-window buffer t)))
     (with-current-buffer buffer
       (ghostel--prepare-buffer buffer nil)
       ;; Use `window-screen-lines' (not `window-body-height') so the
       ;; height matches the unit `window-adjust-process-window-size-smallest'
       ;; uses — see `ghostel--init-buffer' for why.
-      (let* ((height (max 1 (with-selected-window window
-                              (floor (window-screen-lines)))))
-             (width (max 1 (window-max-chars-per-line window)))
+      (let* ((height (if window
+                         (max 1 (with-selected-window window
+                                  (floor (window-screen-lines))))
+                       24))
+             (width (if window
+                        (max 1 (window-max-chars-per-line window))
+                      80))
              (remote-p (file-remote-p default-directory)))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
