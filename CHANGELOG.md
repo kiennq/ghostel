@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.20.0] — 2026-04-29
+
+### Added
+- Kitty graphics protocol support — render images inline in the
+  ghostel buffer for both traditional non-virtual placements
+  (timg, kitty +kitten icat, applications using direct kitty
+  graphics) and unicode-placeholder placements (yazi, modern image
+  previewers).  All decoding, storage, and protocol parsing flow
+  through libghostty's kitty graphics C API; ghostel queries the
+  placement iterator each redraw and applies image overlays in
+  Emacs.  Non-PNG pixel data (RGBA / RGB / GrayAlpha / Gray) is
+  converted to PPM (P6) for Emacs's built-in image renderer; PNGs
+  go through libghostty's PNG-decode hook backed by vendored
+  stb_image.  Per-row slicing (`:ascent 'center` plus a
+  `line-height` clamp on the trailing newline) keeps image rows
+  flush even when the placeholder line's `line-pixel-height` is
+  pulled above `frame-char-height` by a fallback font or nerd-font
+  icon on the same line
+  ([57ef5a7](https://github.com/dakra/ghostel/commit/57ef5a7)).
+- `ghostel-cell-pixel-scale` controls the physical:logical pixel
+  ratio reported to apps that probe XTWINOPS CSI 14/16/18 t.
+  Apps like timg and yazi expect cell dimensions in *physical*
+  pixels (what standalone Ghostty advertises via the OS window
+  server's backing scale factor), but Emacs only exposes logical
+  pixels — reporting them unscaled makes apps either fall back to
+  half-blocks (timg) or fill many more cells than expected with
+  upscaled, blocky output (yazi).  The `auto` default derives a
+  float scale from display DPI (`display-pixel-width` /
+  `display-mm-width` compared to the 96 DPI reference); a numeric
+  override is available for pixel-perfect parity with standalone
+  Ghostty
+  ([57ef5a7](https://github.com/dakra/ghostel/commit/57ef5a7)).
+- File detection recognises tilde-prefixed paths
+  (`~/file.el:42`) — `~` is added to the leading character class
+  and leading anchor of `ghostel-file-detection-path-regex`
+  ([abae518](https://github.com/dakra/ghostel/commit/abae518)).
+
+### Changed
+- `OPT_SIZE` (XTWINOPS CSI 14/16/18 t) is now answered by ghostel,
+  alongside the existing `OPT_DEVICE_ATTRIBUTES` reply.  Image-
+  rendering tools probe these queries to detect kitty graphics
+  support and pick image dimensions; without a response timg fell
+  back to half-block rendering even when `TERM_PROGRAM=ghostty`.
+  Cell pixel dimensions are stored on the Terminal struct and
+  updated on every resize, and `ghostel--set-size` is seeded once
+  between `ghostel--new` and the process spawn so the very first
+  output (e.g. timg's transmit-and-place) reports authoritative
+  values rather than zero
+  ([57ef5a7](https://github.com/dakra/ghostel/commit/57ef5a7)).
+
+### Fixed
+- `ghostel-exec` uses the universal 80×24 default when BUFFER is
+  not displayed in any window, instead of sizing the PTY from
+  `(selected-window)`.  The selected window had nothing to do with
+  where the agent buffer would eventually be shown — programs
+  ending up in a different window had to rely on SIGWINCH to
+  recover, and TUIs that latch initial dimensions at startup
+  rendered against the wrong size.  Matches eat's behaviour; the
+  displayed-buffer path is unchanged
+  ([a8bf9ae](https://github.com/dakra/ghostel/commit/a8bf9ae)).
+
 ## [0.19.0] — 2026-04-29
 
 ### Added

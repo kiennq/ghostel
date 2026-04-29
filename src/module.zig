@@ -15,7 +15,7 @@ const sys = @import("sys.zig");
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.19.0";
+const version = "0.20.0";
 
 // ---------------------------------------------------------------------------
 // Module entry point
