@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Claude Code's progress reports now update `mode-line-process` in
+  ghostel buffers.  Claude Code gates OSC 9;4 progress emission on
+  `TERM_PROGRAM_VERSION` parsing as semver `>= 1.2.0`; ghostel
+  advertised `TERM_PROGRAM=ghostty` without the version, so the
+  gate failed and progress was silently dropped.  Ghostel now also
+  exports `TERM_PROGRAM_VERSION` matching the vendored libghostty
+  pin, satisfying Claude Code's check and any other consumer that
+  applies the same probe.
+
 ## [0.20.0] — 2026-04-29
 
 ### Added

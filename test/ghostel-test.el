@@ -6995,6 +6995,14 @@ start-up size and breaks live resize."
                                       captured-env))
                 (should (member "TERM=xterm-ghostty" captured-env))
                 (should (member "TERM_PROGRAM=ghostty" captured-env))
+                ;; Match by regex so version bumps don't break the test —
+                ;; the contract is "exported and parseable as semver",
+                ;; not a literal string.
+                (should (seq-some (lambda (s)
+                                    (string-match-p
+                                     "\\`TERM_PROGRAM_VERSION=[0-9]+\\.[0-9]+\\.[0-9]+\\'"
+                                     s))
+                                  captured-env))
                 (should (seq-some (lambda (s) (string-prefix-p "TERMINFO=" s))
                                   captured-env))
                 (should (member "COLORTERM=truecolor" captured-env)))
@@ -7027,7 +7035,10 @@ falsely conclude that ghostty is the controlling terminal."
                 (should (member "COLORTERM=truecolor" captured-env))
                 (should-not (seq-some (lambda (s) (string-prefix-p "TERMINFO=" s))
                                       captured-env))
-                (should-not (member "TERM_PROGRAM=ghostty" captured-env)))
+                (should-not (member "TERM_PROGRAM=ghostty" captured-env))
+                (should-not (seq-some (lambda (s)
+                                        (string-prefix-p "TERM_PROGRAM_VERSION=" s))
+                                      captured-env)))
             (when (process-live-p proc)
               (delete-process proc))))))))
 

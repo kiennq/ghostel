@@ -3329,6 +3329,7 @@ wrapper that would re-claim ghostty over ssh."
                     (list "TERM=xterm-ghostty"
                           (concat "TERMINFO=" tinfo)
                           "TERM_PROGRAM=ghostty"
+                          "TERM_PROGRAM_VERSION=1.3.2"
                           "COLORTERM=truecolor"))
                    (t
                     (unless ghostel--terminfo-warned
