@@ -209,7 +209,6 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // pair split across two writes — chunk A ending with \r, chunk B
     // starting with \n — is not mis-normalized into \r\r\n.  The final
     // value is persisted back for the next call. An empty input
-
     // round-trips the flag unchanged.
     var seg_start: usize = 0;
     var prev_was_cr: bool = term.last_input_was_cr;
@@ -692,14 +691,7 @@ fn fnSetSize(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?
         break :blk std.math.cast(u32, raw) orelse 1;
     } else 1;
 
-    term.resize(cols, rows, cell_w, cell_h) catch {
-        env.signalError("ghostel: resize failed");
-        return env.nil();
-    };
-    // Reflow invalidates the materialized scrollback — terminal.resize()
-    // sets rebuild_pending so the next redraw() erases and rebuilds under
-    // inhibit-redisplay, avoiding a visible blank frame.
-
+    term.resize(cols, rows, cell_w, cell_h);
     return env.nil();
 }
 
@@ -1230,8 +1222,8 @@ fn deviceAttributesCallback(_: gt.Terminal, _: ?*anyopaque, out: [*c]gt.DeviceAt
 fn sizeCallback(_: gt.Terminal, userdata: ?*anyopaque, out: [*c]gt.SizeReportSize) callconv(.c) bool {
     const term: *Terminal = @ptrCast(@alignCast(userdata));
     out[0] = .{
-        .rows = term.rows,
-        .columns = term.cols,
+        .rows = term.size.rows,
+        .columns = term.size.cols,
         .cell_width = term.cell_width_px,
         .cell_height = term.cell_height_px,
     };
@@ -1333,7 +1325,7 @@ fn fnUriAt(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyop
     const col = env.extractInteger(args[2]);
     const total_rows = term.getTotalRows();
 
-    if (col < 0 or col >= term.cols) return env.nil();
+    if (col < 0 or col >= term.size.cols) return env.nil();
     // The Emacs buffer always carries a trailing newline, so the line
     // immediately after the last content row produces row_from_bottom == 0.
     if (row_from_bottom <= 0 or row_from_bottom > total_rows) return env.nil();

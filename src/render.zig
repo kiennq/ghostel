@@ -611,7 +611,11 @@ fn getDefaultColors(term: *Terminal) BgFg {
     return bgfg;
 }
 
-pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, skip: usize, force_full: bool) void {
+pub fn render(env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) void {
+    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
+        return;
+    }
+
     const default_colors = getDefaultColors(term);
 
     // Check dirty state.
@@ -619,7 +623,7 @@ pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, ski
     // sync / resize / rotation above, so we must rebuild even if
     // libghostty considers the cells clean.
     var dirty: c_int = gt.DIRTY_FALSE;
-    _ = gt.c.ghostty_render_state_get(render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty));
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty));
     var has_wide_chars: bool = false;
 
     if (dirty != gt.DIRTY_FALSE or force_full) {
@@ -633,7 +637,7 @@ pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, ski
         );
 
         // Get row iterator
-        if (gt.c.ghostty_render_state_get(render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+        if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
             return;
         }
 
@@ -671,7 +675,7 @@ pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, ski
 
         // Reset dirty state
         const dirty_false: c_int = gt.DIRTY_FALSE;
-        _ = gt.c.ghostty_render_state_set(render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
+        _ = gt.c.ghostty_render_state_set(term.render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
     }
 
     if (dirty != gt.DIRTY_FALSE) {
@@ -684,9 +688,8 @@ pub fn render(env: emacs.Env, term: *Terminal, render_state: gt.RenderState, ski
 pub fn renderCursor(env: emacs.Env, term: *Terminal) void {
 
     // Walk to the current viewport start
-    env.gotoChar(env.pointMax());
-    _ = env.forwardLine(-@as(i64, @intCast(term.rows)));
-    const viewport_start_int = env.extractInteger(env.point());
+    gotoActiveStart(env, term);
+    const active_start_int = env.extractInteger(env.point());
 
     // Batch-fetch cursor style/visibility (always available).
     var cursor_visible: bool = true;
@@ -703,7 +706,7 @@ pub fn renderCursor(env: emacs.Env, term: *Terminal) void {
         _ = gt.c.ghostty_render_state_get_multi(term.render_state, cursor_keys.len, &cursor_keys, @ptrCast(&cursor_values), null);
     }
 
-    // Position cursor (viewport-relative row -> absolute line).
+    // Position cursor (active-relative row -> absolute line).
     // X/Y are only valid when HAS_VALUE is true, so query separately
     // to avoid stopping the style batch above on NO_VALUE.
     var cursor_has_value: bool = false;
@@ -714,7 +717,7 @@ pub fn renderCursor(env: emacs.Env, term: *Terminal) void {
         _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_X, @ptrCast(&cx));
         _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y, @ptrCast(&cy));
 
-        env.gotoCharN(viewport_start_int);
+        env.gotoCharN(active_start_int);
         _ = env.forwardLine(@as(i64, cy));
         if (!positionCursorByCell(env, term, cx, cy)) {
             env.moveToColumn(@as(i64, cx));
@@ -726,6 +729,59 @@ pub fn renderCursor(env: emacs.Env, term: *Terminal) void {
         env.makeInteger(@as(i64, cursor_style)),
         if (cursor_visible) env.t() else env.nil(),
     );
+}
+
+// Render content from the current viewport scroll position all the way to
+// the active area at the current Emacs point.
+fn renderToEnd(env: emacs.Env, term: *Terminal, force_full: bool) usize {
+    const scrollbar = term.getScrollbar() orelse return 0;
+    if (scrollbar.len == 0) return 0;
+    const offset_max = scrollbar.total - scrollbar.len;
+    // Walk from the current viewport position to offset_max in viewport-sized
+    // steps, rendering each chunk into the Emacs buffer. Consecutive positions
+    // overlap by `scrollbar.len - step` rows when the remaining range is
+    // smaller than a full viewport; `skip` tracks how many leading rows of the
+    // next position were already rendered at the tail of the previous one.
+    // After the loop the viewport sits at offset_max (the active area).
+    const total_range = scrollbar.total - scrollbar.offset;
+    const num_viewports = (total_range + scrollbar.len - 1) / scrollbar.len;
+    var skip: usize = 0;
+    var rendered_rows: usize = 0;
+    var current_offset = scrollbar.offset;
+    for (0..num_viewports) |_| {
+        render(env, term, skip, force_full);
+        rendered_rows += (scrollbar.len - skip);
+
+        const max_step = offset_max - current_offset;
+        const step = @min(max_step, scrollbar.len);
+        skip = scrollbar.len - step;
+
+        current_offset += step;
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(step));
+    }
+
+    return rendered_rows;
+}
+
+fn commitResize(term: *Terminal) void {
+    if (term.pending_resize) |resize| {
+        _ = gt.c.ghostty_terminal_resize(
+            term.terminal,
+            resize.cols,
+            resize.rows,
+            term.cell_width_px,
+            term.cell_height_px,
+        );
+        term.size = resize;
+        term.pending_resize = null;
+    }
+}
+
+/// Position the Emacs point at the start of the active area: `term.size.rows`
+/// lines back from `point-max`.
+fn gotoActiveStart(env: emacs.Env, term: *Terminal) void {
+    env.gotoChar(env.pointMax());
+    _ = env.forwardLine(-@as(i64, @intCast(term.size.rows)));
 }
 
 /// Redraw the terminal into the current Emacs buffer.
@@ -766,80 +822,74 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         }
     }
 
-    var force_full = force_full_arg;
+    var force_full = false;
 
     // ---- Scrollback validity ------------------------------------------------
     // There are three cases where we clear scrollback:
-    // 1. It was explicitly requested through `rebuild_pending`
+    // 1. The terminal width/cols changed.
     // 2. We had some scrollback but the scrollbar was reset from the parked
     //    MAX - 1 position. This indicates that libghostty cleared its
     //    scrollback and we follow after by clearing too.
     // 3. We had some scrollback but the scrollbar ended up at offset = 0, which
     //    means that we got so much scrolling that we scrolled all the way up
     //    and do not know how much we missed.
-    var scrollbar = term.getScrollbar() orelse return;
-    const scrollbar_reset = term.scrollback_in_buffer > 0 and scrollbar.len + scrollbar.offset == scrollbar.total;
-    const scrollbar_hit_cap = term.scrollback_in_buffer > 0 and scrollbar.offset == 0;
-    if (term.rebuild_pending or scrollbar_reset or scrollbar_hit_cap) {
+    const scrollbar = term.getScrollbar() orelse return;
+    const cols_changed = if (term.pending_resize) |resize| resize.cols != term.size.cols else false;
+    const had_scrollback = term.rows_in_buffer > scrollbar.len;
+    const scrollbar_reset = had_scrollback and scrollbar.len + scrollbar.offset == scrollbar.total;
+    const scrollbar_hit_cap = had_scrollback and scrollbar.offset == 0;
+    if (force_full_arg or cols_changed or scrollbar_reset or scrollbar_hit_cap) {
         env.eraseBuffer();
-        term.scrollback_in_buffer = 0;
+        // Commit any pending resize since we're doing a rebuild anyway.
+        commitResize(term);
+
+        term.rows_in_buffer = 0;
         force_full = true;
-        term.rebuild_pending = false;
     }
 
     // Unpark the viewport. When we have scrollback the viewport is sitting at
     // `max_offset - 1`; advance by 1 to reach the old active area, which is
     // also where the Emacs buffer currently ends. When we have no scrollback
     // there was no parking, so go to the top instead.
-    if (term.scrollback_in_buffer > 0) {
+    if (term.rows_in_buffer > term.size.rows) {
         term.scrollViewport(gt.SCROLL_DELTA, 1);
-        scrollbar.offset += 1;
         env.gotoChar(env.pointMax());
         _ = env.forwardLine(-@as(i64, @intCast(scrollbar.len)));
     } else {
         term.scrollViewport(gt.SCROLL_TOP, 0);
-        scrollbar.offset = 0;
         env.gotoChar(env.pointMin());
     }
 
-    if (scrollbar.len == 0) return;
-    const offset_max = scrollbar.total - scrollbar.len;
-    // Walk from the current viewport position to offset_max in viewport-sized
-    // steps, rendering each chunk into the Emacs buffer. Consecutive positions
-    // overlap by `scrollbar.len - step` rows when the remaining range is
-    // smaller than a full viewport; `skip` tracks how many leading rows of the
-    // next position were already rendered at the tail of the previous one.
-    // After the loop the viewport sits at offset_max (the active area).
-    const total_range = scrollbar.total - scrollbar.offset;
-    const num_viewports = (total_range + scrollbar.len - 1) / scrollbar.len;
-    var skip: usize = 0;
-    var rendered_rows: usize = 0;
-    for (0..num_viewports) |_| {
-        if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
-            return;
-        }
-        render(env, term, term.render_state, skip, force_full);
-        rendered_rows += (scrollbar.len - skip);
-
-        const max_step = offset_max - scrollbar.offset;
-        const step = @min(max_step, scrollbar.len);
-        skip = scrollbar.len - step;
-
-        scrollbar.offset += step;
-        term.scrollViewport(gt.SCROLL_DELTA, @intCast(step));
+    const rendered_rows = renderToEnd(env, term, force_full);
+    // Now that we rendered, even if we cleared the buffer above, we now have at
+    // least the rows in the active area:
+    term.rows_in_buffer = @max(term.rows_in_buffer, term.size.rows);
+    // But we might also have added scrollback rows - that is, rows that we
+    // rendered that was not active area. Guard the subtraction: when
+    // renderToEnd is a no-op (scrollbar.len == 0 or empty range) it returns 0,
+    // and there are no new scrollback rows to add.
+    if (rendered_rows > term.size.rows) {
+        term.rows_in_buffer += rendered_rows - term.size.rows;
     }
-    // rendered_rows covers all rows from the old active area to the new bottom,
-    // so subtracting one viewport's worth gives the count of newly added
-    // scrollback rows.
-    term.scrollback_in_buffer += (rendered_rows - scrollbar.len);
+
+    // If we have a pending resize, commit it now and just rerender the active
+    // since the scrollback is already up to date.
+    if (term.pending_resize != null) {
+        commitResize(term);
+        term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+        gotoActiveStart(env, term);
+        render(env, term, 0, false);
+        // There is now at least term.size.rows number of rows
+        term.rows_in_buffer = @max(term.rows_in_buffer, term.size.rows);
+    }
 
     // Evict old scrollback if libghostty also did
-    const libghostty_scrollback = term.getScrollbackRows();
-    if (libghostty_scrollback < term.scrollback_in_buffer) {
+    const libghostty_rows = term.getTotalRows();
+    if (libghostty_rows < term.rows_in_buffer) {
         env.gotoChar(env.pointMin());
-        _ = env.forwardLine(@as(i64, @intCast(term.scrollback_in_buffer - libghostty_scrollback)));
+        _ = env.forwardLine(@as(i64, @intCast(term.rows_in_buffer - libghostty_rows)));
         env.deleteRegion(env.pointMin(), env.point());
-        term.scrollback_in_buffer = libghostty_scrollback;
+        term.rows_in_buffer = libghostty_rows;
     }
 
     renderCursor(env, term);

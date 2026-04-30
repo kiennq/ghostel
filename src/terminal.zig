@@ -25,9 +25,11 @@ key_encoder: gt.c.GhosttyKeyEncoder,
 /// Mouse encoder for translating mouse events to escape sequences.
 mouse_encoder: gt.c.GhosttyMouseEncoder,
 
-/// Terminal dimensions.
-cols: u16,
-rows: u16,
+/// Terminal viewport dimensions.
+size: ViewportSize,
+
+/// Any pending resize as `.{cols, rows}`. Resizes are comitted on next redraw.
+pending_resize: ?ViewportSize = null,
 
 /// Cell pixel dimensions, used to answer XTWINOPS CSI 14/16/18 t
 /// queries.  Updated on every resize.  Initialized to 1x1 — apps
@@ -36,16 +38,10 @@ rows: u16,
 cell_width_px: u32 = 1,
 cell_height_px: u32 = 1,
 
-/// Number of libghostty scrollback rows already materialized into the
-/// Emacs buffer above the viewport. Polled on each redraw; kept in sync
-/// by appending newly-scrolled-off rows and trimming rows evicted by
-/// libghostty's scrollback cap.
-scrollback_in_buffer: usize = 0,
-
-/// When true, the next redraw erases the Emacs buffer,
-/// resets scrollback state, and forces a full rebuild.  The erase is deferred
-/// so `inhibit-redisplay` can prevent a visible blank frame.
-rebuild_pending: bool = false,
+/// Number of libghostty rows already materialized into the Emacs buffer. Polled
+/// on each redraw; kept in sync by appending newly-scrolled-off rows and
+/// trimming rows evicted by libghostty's scrollback cap.
+rows_in_buffer: usize = 0,
 
 /// True iff the last byte of the previous `fnWriteInput` input was
 /// `\r`. Carries the bare-LF detection state across write-input calls
@@ -61,6 +57,8 @@ last_input_was_cr: bool = false,
 
 /// Cached Emacs env pointer — only valid during a callback from Emacs.
 env: ?emacs.Env = null,
+
+const ViewportSize = struct { cols: u16, rows: u16 };
 
 /// Create a new terminal with the given dimensions and scrollback.
 pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
@@ -113,8 +111,7 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
         .row_cells = row_cells,
         .key_encoder = key_encoder,
         .mouse_encoder = mouse_encoder,
-        .cols = cols,
-        .rows = rows,
+        .size = .{ .cols = cols, .rows = rows },
     };
 }
 
@@ -246,27 +243,13 @@ pub fn vtWrite(self: *Self, data: []const u8) void {
     gt.c.ghostty_terminal_vt_write(self.terminal, data.ptr, data.len);
 }
 
-/// Resize the terminal.
-///
-/// Also sets `rebuild_pending` so the next `redraw()` erases the Emacs buffer
-/// under `inhibit-redisplay` and rebuilds scrollback from scratch — avoiding
-/// a visible blank frame between the resize and the first repaint.
-pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) !void {
-    if (gt.c.ghostty_terminal_resize(
-        self.terminal,
-        cols,
-        rows,
-        cell_w,
-        cell_h,
-    ) != gt.SUCCESS) {
-        return error.ResizeFailed;
-    }
-    self.cols = cols;
-    self.rows = rows;
+/// Resize the terminal. The col/row size gets committed on next redraw in order
+/// to ensure that the we fully render the very latest state in case any rows
+/// get promoted to scrollback due to vertical shrinking of the viewport.
+pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void {
+    self.pending_resize = .{ .cols = cols, .rows = rows };
     self.cell_width_px = cell_w;
     self.cell_height_px = cell_h;
-    self.rebuild_pending = true;
-    self.last_input_was_cr = false;
 }
 
 /// Scroll the viewport.
@@ -319,7 +302,7 @@ pub fn isAltScreen(self: *Self) bool {
 pub fn getTotalRows(self: *Self) usize {
     var total: usize = 0;
     if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_TOTAL_ROWS, @ptrCast(&total)) != gt.SUCCESS) {
-        return self.rows;
+        return self.size.rows;
     }
     return total;
 }
@@ -328,7 +311,7 @@ pub fn getTotalRows(self: *Self) usize {
 pub fn getScrollbackRows(self: *Self) usize {
     var scrollback: usize = 0;
     if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_SCROLLBACK_ROWS, @ptrCast(&scrollback)) != gt.SUCCESS) {
-        return self.rows;
+        return self.size.rows;
     }
     return scrollback;
 }
