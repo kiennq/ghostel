@@ -2037,17 +2037,39 @@ Wraps to `point-max' when no link is found before point."
   (dotimes (_ (or n 1))
     (ghostel--goto-hyperlink 'previous)))
 
+(defun ghostel--detect-urls-skip-p (pos active-bounds)
+  "Return non-nil if link detection should leave POS alone.
+Skips spans already linkified (any `help-echo'), the shell's prompt
+decoration (`ghostel-prompt' — e.g. the cwd shown in the prompt is
+shell-generated, not content the user pointed at), and the active
+prompt's typed input within ACTIVE-BOUNDS (`ghostel-input').
+ACTIVE-BOUNDS is a (BOL . EOL) cons covering the cursor's line.
+Historical input retains `ghostel-input' from when it was active but
+stays linkifiable because it falls outside ACTIVE-BOUNDS."
+  (or (get-text-property pos 'help-echo)
+      (get-text-property pos 'ghostel-prompt)
+      (and active-bounds
+           (>= pos (car active-bounds))
+           (<= pos (cdr active-bounds))
+           (get-text-property pos 'ghostel-input))))
+
 (defun ghostel--detect-urls (&optional begin end)
   "Scan a buffer region for plain-text URLs and file:line references.
 BEGIN and END default to `point-min' and `point-max' respectively.
-Skips regions that already have a `help-echo' property (e.g. from OSC 8).
+Skips regions that already have a `help-echo' property (e.g. from OSC 8)
+and the user's active input on the current prompt line.
 Bounding the scan keeps streaming output from re-scanning the entire
 materialized scrollback on every redraw.
 Binds `inhibit-read-only' so the scan can attach text properties even
 when called from the deferred-detection timer outside the redraw scope."
-  (let ((begin (or begin (point-min)))
-        (end (or end (point-max)))
-        (inhibit-read-only t))
+  (let* ((begin (or begin (point-min)))
+         (end (or end (point-max)))
+         (inhibit-read-only t)
+         ;; Point sits at the live terminal cursor after a redraw, so its
+         ;; line is the prompt the user is currently editing.  Capture as
+         ;; buffer-position bounds so the per-match skip check is O(1).
+         (active-bounds (cons (line-beginning-position)
+                              (line-end-position))))
     (save-excursion
       ;; Pass 1: http(s) URLs
       (when ghostel-enable-url-detection
@@ -2057,7 +2079,7 @@ when called from the deferred-detection timer outside the redraw scope."
                 end t)
           (let ((beg (match-beginning 0))
                 (mend (match-end 0)))
-            (unless (get-text-property beg 'help-echo)
+            (unless (ghostel--detect-urls-skip-p beg active-bounds)
               (let ((url (match-string-no-properties 0)))
                 (put-text-property beg mend 'help-echo url)
                 (put-text-property beg mend 'mouse-face 'highlight)
@@ -2082,7 +2104,7 @@ when called from the deferred-detection timer outside the redraw scope."
           (while (re-search-forward full-regex end t)
             (let ((beg (match-beginning 1))
                   (mend (match-end 2)))
-              (unless (get-text-property beg 'help-echo)
+              (unless (ghostel--detect-urls-skip-p beg active-bounds)
                 (let* ((path (match-string-no-properties 1))
                        (loc (match-string-no-properties 2))
                        (abs-path (expand-file-name path))

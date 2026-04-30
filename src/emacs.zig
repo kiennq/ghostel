@@ -333,6 +333,7 @@ pub const Sym = struct {
     keymap: Value,
     @"ghostel-wrap": Value,
     @"ghostel-prompt": Value,
+    @"ghostel-input": Value,
 
     // Ghostel symbols
     @"ghostel-link-map": Value,

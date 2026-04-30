@@ -2496,6 +2496,86 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
         (should (equal test-file opened))
         (should (null moved))))))                    ; no line → no forward-line
 
+(ert-deftest ghostel-test-detect-urls-skips-active-input ()
+  "Link detection rules around prompts and user input (issue #199).
+- `ghostel-prompt' (shell-generated decoration): never linkified.
+- `ghostel-input' on the cursor's line (active typing): not linkified —
+  in tty Emacs RET on a linkified cell hijacks the keystroke.
+- `ghostel-input' on other lines (historical typed commands): still
+  linkified, so users can follow paths in past commands.
+- Output (no marker): always linkified."
+  (let ((test-file (locate-library "ghostel")))
+    ;; History line → both file ref and URL linkified.  Active line
+    ;; (cursor's line) → both skipped.  Same `ghostel-input' coverage
+    ;; on both lines, only the cursor's line is protected.
+    (with-temp-buffer
+      (let ((default-directory (file-name-directory test-file)))
+        (insert (format "$ ls %s https://hist.example\n" test-file)) ; line 1: history
+        (insert (format "$ cat %s https://live.example" test-file))  ; line 2: active
+        (put-text-property (point-min) (point-max) 'ghostel-input t)
+        (goto-char (point-max))                                       ; cursor on line 2
+        (let ((ghostel-enable-url-detection t)
+              (ghostel-enable-file-detection t))
+          (ghostel--detect-urls))
+        (goto-char (point-min))
+        (search-forward test-file nil t)
+        (let ((he (get-text-property (match-beginning 0) 'help-echo)))
+          (should (and he (string-prefix-p "fileref:" he)))) ; history file → linked
+        (search-forward "https://hist.example")
+        (should (equal "https://hist.example"
+                       (get-text-property (match-beginning 0) 'help-echo))) ; history URL → linked
+        (search-forward test-file nil t)
+        (should (null (get-text-property (match-beginning 0) 'help-echo))) ; active file → skipped
+        (search-forward "https://live.example")
+        (should (null (get-text-property (match-beginning 0) 'help-echo))))) ; active URL → skipped
+    ;; Intra-line partial skip: only the `ghostel-input'-marked span is
+    ;; protected, not the whole active line.  A URL outside the span on
+    ;; the same line still gets linkified.  No trailing newline — cursor
+    ;; stays on the typed line.
+    (with-temp-buffer
+      (insert "out https://before.example mid https://typed.example tail")
+      (let* ((typed (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "https://typed.example")
+                      (cons (match-beginning 0) (match-end 0)))))
+        (put-text-property (car typed) (cdr typed) 'ghostel-input t))
+      (goto-char (point-max))                                           ; cursor on line 1
+      (let ((ghostel-enable-url-detection t)
+            (ghostel-enable-file-detection nil))
+        (ghostel--detect-urls))
+      (goto-char (point-min))
+      (search-forward "https://before.example")
+      (should (equal "https://before.example"
+                     (get-text-property (match-beginning 0) 'help-echo))) ; outside span → linked
+      (search-forward "https://typed.example")
+      (should (null (get-text-property (match-beginning 0) 'help-echo)))) ; inside span → skipped
+    ;; `ghostel-prompt' (prompt prefix) is never linkified — neither on
+    ;; the active line nor in scrollback.  Path appears in the prompt's
+    ;; cwd display; output below is plain text and stays linkifiable.
+    (with-temp-buffer
+      (let ((default-directory (file-name-directory test-file)))
+        (insert (format "%s λ ls\n" test-file))           ; line 1: prompt prefix
+        (insert (format "%s\n" test-file))                ; line 2: output
+        (insert (format "%s λ " test-file))               ; line 3: live prompt
+        ;; Prompt rows carry `ghostel-prompt' on the prefix; output does not.
+        (save-excursion
+          (goto-char (point-min))
+          (let ((eol (line-end-position)))
+            (put-text-property (point-min) eol 'ghostel-prompt t))
+          (forward-line 2)
+          (put-text-property (point) (point-max) 'ghostel-prompt t))
+        (goto-char (point-max))
+        (let ((ghostel-enable-url-detection nil)
+              (ghostel-enable-file-detection t))
+          (ghostel--detect-urls))
+        (goto-char (point-min))
+        (search-forward test-file nil t)                  ; line 1: prompt prefix
+        (should (null (get-text-property (match-beginning 0) 'help-echo)))
+        (search-forward test-file nil t)                  ; line 2: output
+        (should (get-text-property (match-beginning 0) 'help-echo))
+        (search-forward test-file nil t)                  ; line 3: live prompt prefix
+        (should (null (get-text-property (match-beginning 0) 'help-echo)))))))
+
 (ert-deftest ghostel-test-delayed-redraw-defers-plain-link-detection ()
   "Redraw-triggered plain-text link detection should run after redraw."
   (let ((buf (generate-new-buffer " *ghostel-test-delayed-link*")))
@@ -2821,6 +2901,130 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
             ;; Check exit status stored
             (when ghostel--prompt-positions
               (should (equal 0 (cdr (car ghostel--prompt-positions))))))) ; exit status stored
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: OSC 133 input cells get ghostel-input property
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-osc133-input-text-property ()
+  "Cells between OSC 133 B and C should be marked `ghostel-input'.
+This is what keeps `ghostel--detect-urls' from linkifying the user's
+in-progress command line — the renderer marks input cells, the elisp
+scanner skips them."
+  (let ((buf (generate-new-buffer " *ghostel-test-osc133-input*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--write-input
+             term "\e]133;A\e\\$ \e]133;B\e\\cd src/main.rs")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (should (search-forward "cd src/main.rs" nil t))
+            (let ((path-beg (- (point) (length "cd src/main.rs")))
+                  (path-end (point)))
+              (should (get-text-property path-beg 'ghostel-input))
+              (should (get-text-property (1- path-end) 'ghostel-input))
+              ;; The "$ " prompt prefix should NOT be marked as input.
+              (should (null (get-text-property
+                             (point-min) 'ghostel-input))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-osc133-prompt-stops-at-input ()
+  "`ghostel-prompt' must end where `ghostel-input' begins on the row.
+Without this, the historical prompt row carries `ghostel-prompt'
+across the typed command, and `ghostel--detect-urls-skip-p' refuses
+to linkify paths in past commands — even though they are outside the
+active input range."
+  (let ((buf (generate-new-buffer " *ghostel-test-osc133-prompt-input*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--write-input
+             term "\e]133;A\e\\$ \e]133;B\e\\ls /etc/hosts")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (should (search-forward "ls /etc/hosts" nil t))
+            (let ((path-beg (- (point) (length "ls /etc/hosts")))
+                  (path-end (point)))
+              (should (get-text-property 1 'ghostel-prompt))            ; "$"
+              (should (get-text-property 2 'ghostel-prompt))            ; " "
+              (should (null (get-text-property path-beg 'ghostel-prompt)))
+              (should (null (get-text-property (1- path-end) 'ghostel-prompt)))
+              (should (get-text-property path-beg 'ghostel-input))
+              (should (get-text-property (1- path-end) 'ghostel-input)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-osc133-historical-input-linkifies ()
+  "Historical typed commands keep their links after the prompt advances.
+After the row scrolls past the active prompt the typed `/etc/hosts'
+must gain a `fileref:' help-echo when `ghostel--detect-urls' runs.
+Active prompt rows must NOT — RET on a linkified active-input cell
+hijacks the keystroke in tty Emacs."
+  (let ((buf (generate-new-buffer " *ghostel-test-osc133-historical-link*"))
+        (target "/etc/hosts"))
+    (skip-unless (file-exists-p target))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t)
+                 (ghostel-enable-url-detection nil)
+                 (ghostel-enable-file-detection t))
+            ;; First prompt: still the active row.  Cursor is on the typed
+            ;; line, so the path inside the input span must NOT be
+            ;; linkified.
+            (ghostel--write-input
+             term (format "\e]133;A\e\\$ \e]133;B\e\\ls %s" target))
+            (ghostel--redraw term)
+            (let ((path-beg (save-excursion
+                              (goto-char (point-min))
+                              (search-forward target)
+                              (- (point) (length target)))))
+              ;; Point sits at the live cursor after redraw; that is the
+              ;; row `ghostel--detect-urls' treats as active.  Don't move it.
+              (ghostel--detect-urls)
+              (should (null (get-text-property path-beg 'help-echo))))
+
+            ;; End the input, advance to a fresh prompt — the previous row
+            ;; is now history.  Its `/etc/hosts' should become a fileref.
+            (ghostel--write-input
+             term "\e]133;C\e\\\r\n\e]133;D;0\e\\\e]133;A\e\\$ \e]133;B\e\\")
+            (ghostel--redraw term)
+            (let ((path-beg (save-excursion
+                              (goto-char (point-min))
+                              (search-forward target)
+                              (- (point) (length target)))))
+              (ghostel--detect-urls)
+              (let ((he (get-text-property path-beg 'help-echo)))
+                (should (and he (string-prefix-p "fileref:" he)))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-osc133-input-wide-char-boundary ()
+  "Wide input chars take one Emacs char of `ghostel-input'.
+The libghostty spacer-tail cell that follows a wide char produces
+no Emacs char and must not extend the property region.  Trailing
+narrow input after the wide char keeps growing the region."
+  (let ((buf (generate-new-buffer " *ghostel-test-osc133-input-wide*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 100))
+                 (inhibit-read-only t))
+            (ghostel--write-input
+             term "\e]133;A\e\\$ \e]133;B\e\\日a")
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (should (search-forward "日a" nil t))
+            ;; "$ " is 2 narrow cells (positions 1-2); "日" is wide
+            ;; (1 emacs char at position 3, occupying terminal cols 2-3);
+            ;; "a" is narrow (position 4, terminal col 4).
+            (should (null (get-text-property 1 'ghostel-input))) ; "$"
+            (should (null (get-text-property 2 'ghostel-input))) ; " "
+            (should (get-text-property 3 'ghostel-input))         ; 日
+            (should (get-text-property 4 'ghostel-input))         ; a
+            ;; The newline after "a" is past the input range.
+            (should (null (get-text-property 5 'ghostel-input)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------

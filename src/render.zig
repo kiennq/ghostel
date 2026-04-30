@@ -260,6 +260,10 @@ const RowContent = struct {
     /// Number of leading characters that are semantic prompt content.
     /// Zero if the row has no prompt cells.
     prompt_char_len: usize,
+    /// Character range covering semantic-input cells (OSC 133 B..C).
+    /// `input_end_char == input_start_char` means no input cells on the row.
+    input_start_char: usize,
+    input_end_char: usize,
     /// True when the row contains at least one wide (2-cell) character.
     has_wide: bool,
 };
@@ -296,6 +300,14 @@ fn buildRowContent(
     var trim_char_len: usize = 0;
     var prompt_char_len: usize = 0; // chars that are semantic prompt
     var in_prompt: bool = true; // track contiguous leading prompt cells
+    // Track the smallest [start, end) char range covering input cells (OSC 133
+    // B..C). Set lazily on the first INPUT cell; subsequent INPUT cells extend
+    // `input_end_char`. Cells with other semantics between two input runs are
+    // included in the range — in practice INPUT cells are contiguous within a
+    // prompt line, so this never grows beyond the actual input span.
+    var input_start_char: usize = 0;
+    var input_end_char: usize = 0;
+    var saw_input: bool = false;
     var has_wide: bool = false;
     var current_style_key: ?CellStyleKey = null;
     run_count.* = 0;
@@ -310,13 +322,22 @@ fn buildRowContent(
             continue;
         }
 
+        // Read the cell's semantic-content tag once and reuse it for both
+        // prompt-prefix and input-range tracking. Cells without an explicit
+        // OSC 133 marker default to OUTPUT, so we only do real work on rows
+        // that the shell has annotated.
+        var semantic: c_int = gt.c.GHOSTTY_CELL_SEMANTIC_OUTPUT;
+        _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, @ptrCast(&semantic));
+
         // Track leading prompt characters via cell-level semantic content.
-        if (in_prompt) {
-            var semantic: c_int = 0; // GHOSTTY_CELL_SEMANTIC_OUTPUT
-            _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, @ptrCast(&semantic));
-            if (semantic != gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
-                in_prompt = false;
-            }
+        if (in_prompt and semantic != gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
+            in_prompt = false;
+        }
+
+        const cell_start_char = char_len;
+        if (semantic == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT and !saw_input) {
+            input_start_char = cell_start_char;
+            saw_input = true;
         }
 
         // We use a "key" that holds a minimum set of values that are cheap to
@@ -353,6 +374,7 @@ fn buildRowContent(
                 char_len += 1;
             }
             if (in_prompt) prompt_char_len = char_len;
+            if (saw_input and semantic == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT) input_end_char = char_len;
             // Empty cells are blank for trim purposes unless their
             // style has a visible attribute (e.g. colored background).
             if (runs[run_count.* - 1].style != null) {
@@ -377,6 +399,7 @@ fn buildRowContent(
             char_len += 1; // one codepoint = one Emacs character
         }
         if (in_prompt) prompt_char_len = char_len;
+        if (saw_input and semantic == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT) input_end_char = char_len;
         // Any cell that libghostty stored a grapheme for was written
         // explicitly by the terminal, so it anchors the trim point —
         // even if the grapheme happens to be a space (e.g. the space
@@ -387,15 +410,24 @@ fn buildRowContent(
         trim_char_len = char_len;
     }
 
-    // Trim trailing blank cells. Cap `prompt_char_len' at the new
-    // `char_len' so the "leading prompt" region never extends past the
-    // trimmed text. Style runs extending past the trim point are
-    // clipped by `insertAndStyle' via its `content.char_len' cap.
+    // Trim trailing blank cells. Cap `prompt_char_len' / input range at the
+    // new `char_len' so neither region extends past the trimmed text. Style
+    // runs extending past the trim point are clipped by `insertAndStyle' via
+    // its `content.char_len' cap.
     text_len = trim_text_len;
     char_len = trim_char_len;
     if (prompt_char_len > char_len) prompt_char_len = char_len;
+    if (input_end_char > char_len) input_end_char = char_len;
+    if (input_start_char > input_end_char) input_start_char = input_end_char;
 
-    return .{ .byte_len = text_len, .char_len = char_len, .prompt_char_len = prompt_char_len, .has_wide = has_wide };
+    return .{
+        .byte_len = text_len,
+        .char_len = char_len,
+        .prompt_char_len = prompt_char_len,
+        .input_start_char = input_start_char,
+        .input_end_char = input_end_char,
+        .has_wide = has_wide,
+    };
 }
 
 /// Insert row text and apply style runs.
@@ -464,10 +496,30 @@ fn insertAndStyle(
             env.t(),
         );
     } else if (isRowPrompt(term)) {
+        // When OSC 133 marked an input span on this row, paint
+        // `ghostel-prompt' only over the prefix preceding the input —
+        // otherwise the typed input gets covered too, defeating the
+        // historical-input linkification that the skip predicate is
+        // designed to allow (it short-circuits on `ghostel-prompt`).
+        const prompt_end: i64 = if (content.input_end_char > content.input_start_char)
+            row_start + @as(i64, @intCast(content.input_start_char))
+        else
+            after_insert - 1; // exclude trailing newline
+        if (prompt_end > row_start) {
+            env.putTextProperty(
+                env.makeInteger(row_start),
+                env.makeInteger(prompt_end),
+                emacs.sym.@"ghostel-prompt",
+                env.t(),
+            );
+        }
+    }
+
+    if (content.input_end_char > content.input_start_char) {
         env.putTextProperty(
-            env.makeInteger(row_start),
-            env.makeInteger(after_insert - 1), // exclude trailing newline
-            emacs.sym.@"ghostel-prompt",
+            env.makeInteger(row_start + @as(i64, @intCast(content.input_start_char))),
+            env.makeInteger(row_start + @as(i64, @intCast(content.input_end_char))),
+            emacs.sym.@"ghostel-input",
             env.t(),
         );
     }

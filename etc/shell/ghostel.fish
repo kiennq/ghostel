@@ -27,23 +27,33 @@ function __ghostel_postexec --on-event fish_postexec
     set -g __ghostel_last_status $status
 end
 
-# Emit "command finished" (D) + "prompt start" (A) before the prompt.
+# Emit "command finished" (D) for the previous command.
+# 133;A and 133;B are emitted by wrapping fish_prompt below so they fire
+# in lockstep with prompt rendering, including any redraws — emitting from
+# `--on-event fish_prompt` handlers (which fire only once per prompt cycle
+# and only before fish_prompt) would leave redraws outside the PROMPT scope.
 function __ghostel_prompt_start --on-event fish_prompt
     if test "$__ghostel_prompt_shown" = 1
         printf '\e]133;D;%s\e\\' "$__ghostel_last_status"
     end
-    printf '\e]133;A\e\\'
-end
-
-# Emit "prompt end / command start" (B) after the prompt.
-function __ghostel_prompt_end --on-event fish_prompt
-    printf '\e]133;B\e\\'
     set -g __ghostel_prompt_shown 1
 end
 
 # Emit "command output start" (C) before command runs.
 function __ghostel_preexec --on-event fish_preexec
     printf '\e]133;C\e\\'
+end
+
+# Wrap fish_prompt with 133;A at the start and 133;B at the end so they
+# fire in lockstep with prompt rendering. If the user redefines fish_prompt
+# later, they're responsible for re-sourcing this file.
+if functions -q fish_prompt; and not functions -q __ghostel_orig_fish_prompt
+    functions -c fish_prompt __ghostel_orig_fish_prompt
+    function fish_prompt
+        printf '\e]133;A\e\\'
+        __ghostel_orig_fish_prompt
+        printf '\e]133;B\e\\'
+    end
 end
 
 # Outbound `ssh' wrapper.  See etc/ghostel.bash for the full design

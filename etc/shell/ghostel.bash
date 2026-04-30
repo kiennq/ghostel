@@ -26,18 +26,17 @@ __ghostel_osc7() {
 
 # --- Semantic prompt markers (OSC 133) ---
 
-# Emit "command finished" (D) for the previous command, then "prompt start" (A).
+# Emit "command finished" (D) for the previous command.
 # D is skipped on the very first prompt (no previous command).
+# 133;A and 133;B are embedded in PS1 itself (see below) so they fire
+# in lockstep with prompt rendering, including readline redraws (bash 5.x
+# redraws the prompt after bracketed-paste-mode setup; if 133;A came from
+# PROMPT_COMMAND it would only fire once, leaving the redrawn prompt
+# cells outside the PROMPT scope).
 __ghostel_prompt_start() {
     if [[ -n "$__ghostel_prompt_shown" ]]; then
         printf '\e]133;D;%s\e\\' "$__ghostel_last_status"
     fi
-    printf '\e]133;A\e\\'
-}
-
-# Emit "prompt end / command start" (B).
-__ghostel_prompt_end() {
-    printf '\e]133;B\e\\'
     __ghostel_prompt_shown=1
 }
 
@@ -62,13 +61,30 @@ __ghostel_wrapped_prompt_command() {
     __ghostel_prompt_start
     __ghostel_osc7
     eval "${__ghostel_original_prompt_command:-}"
-    __ghostel_prompt_end
     __ghostel_in_prompt_command=0
 }
 
 # Preserve any existing PROMPT_COMMAND.
 __ghostel_original_prompt_command="${PROMPT_COMMAND:+$PROMPT_COMMAND}"
 PROMPT_COMMAND="__ghostel_wrapped_prompt_command"
+
+# Wrap PS1 with 133;A at the start and 133;B at the end. For multi-line
+# prompts we ALSO inject 133;A after every line break in PS1: bash 5.x
+# readline redraws only the last visual line of the prompt (CR + reprint,
+# no preceding 133;A). Without a 133;A on every line, the redrawn cells
+# fall outside the PROMPT scope and become INPUT-tagged.
+# We inject after both literal newlines and the bash `\n' PS1 escape
+# (which expands to a newline at prompt-render time).
+# \[ \] mark the OSC sequence as zero-width for readline's line-wrap math;
+# \a is BEL — a valid OSC terminator. We use BEL rather than ST (ESC \)
+# because `${var//pat/repl}' eats backslashes in the replacement, which
+# would break a multi-line ST-terminated marker.
+__ghostel_ps1_a='\[\e]133;A\a\]'
+__ghostel_ps1_b='\[\e]133;B\a\]'
+PS1="${PS1//$'\n'/$'\n'${__ghostel_ps1_a}}"
+PS1="${PS1//\\n/\\n${__ghostel_ps1_a}}"
+PS1="${__ghostel_ps1_a}${PS1}${__ghostel_ps1_b}"
+unset __ghostel_ps1_a __ghostel_ps1_b
 
 trap '__ghostel_preexec' DEBUG
 
