@@ -737,6 +737,144 @@ Prevents up/down arrows being sent as history navigation."
     (should (equal " world" (buffer-string)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ESC routing
+;; -----------------------------------------------------------------------
+
+(defmacro evil-ghostel-test--with-escape-stubs (alt-screen-p &rest body)
+  "Run BODY with `ghostel--mode-enabled' returning ALT-SCREEN-P for 1049
+and with `ghostel--send-encoded' captured into the local list `sent'."
+  (declare (indent 1) (debug t))
+  `(let ((sent '()))
+     (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                (lambda (_term mode) (and (= mode 1049) ,alt-screen-p)))
+               ((symbol-function 'ghostel--send-encoded)
+                (lambda (key mods &rest _) (push (cons key mods) sent))))
+       (setq-local ghostel--term t)
+       ,@body)))
+
+(ert-deftest evil-ghostel-test-escape-init-from-defcustom ()
+  "Activating the mode initializes `evil-ghostel--escape-mode' from defcustom."
+  (let ((evil-ghostel-escape 'terminal))
+    (evil-ghostel-test--with-evil-buffer
+     (should (eq 'terminal evil-ghostel--escape-mode)))))
+
+(ert-deftest evil-ghostel-test-escape-mode-terminal-sends-pty ()
+  "`terminal' mode always routes ESC to the PTY, regardless of alt-screen."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'terminal)
+   (evil-ghostel-test--with-escape-stubs nil
+     (evil-ghostel--escape)
+     (should (member '("escape" . "") sent)))))
+
+(ert-deftest evil-ghostel-test-escape-terminal-snaps-to-input ()
+  "Terminal-bound ESC must snap the viewport like every other typed key.
+Regression guard: dispatching directly via `ghostel--send-encoded'
+bypasses the snap that `ghostel-mode-map''s `<escape>' route applies."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'terminal)
+   (let ((snapped 0))
+     (cl-letf (((symbol-function 'ghostel--snap-to-input)
+                (lambda () (cl-incf snapped)))
+               ((symbol-function 'ghostel--send-encoded)
+                (lambda (&rest _))))
+       (setq-local ghostel--term t)
+       (evil-ghostel--escape)
+       (should (= 1 snapped))))))
+
+(ert-deftest evil-ghostel-test-escape-mode-evil-stays ()
+  "`evil' mode never routes ESC to the PTY and triggers evil's binding."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'evil)
+   (evil-insert-state)
+   (evil-ghostel-test--with-escape-stubs t
+     (evil-ghostel--escape)
+     (should-not (member '("escape" . "") sent))
+     (should-not (eq evil-state 'insert)))))
+
+(ert-deftest evil-ghostel-test-escape-auto-altscreen-sends-pty ()
+  "`auto' mode routes ESC to the PTY when alt-screen (1049) is active."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'auto)
+   (evil-ghostel-test--with-escape-stubs t
+     (evil-ghostel--escape)
+     (should (member '("escape" . "") sent)))))
+
+(ert-deftest evil-ghostel-test-escape-auto-no-altscreen-stays ()
+  "`auto' mode routes ESC to evil when alt-screen is not active."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'auto)
+   (evil-insert-state)
+   (evil-ghostel-test--with-escape-stubs nil
+     (evil-ghostel--escape)
+     (should-not (member '("escape" . "") sent))
+     (should-not (eq evil-state 'insert)))))
+
+(ert-deftest evil-ghostel-test-escape-toggle-cycle ()
+  "Calling toggle without a prefix cycles auto → terminal → evil → auto."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'auto)
+   (evil-ghostel-toggle-send-escape)
+   (should (eq 'terminal evil-ghostel--escape-mode))
+   (evil-ghostel-toggle-send-escape)
+   (should (eq 'evil evil-ghostel--escape-mode))
+   (evil-ghostel-toggle-send-escape)
+   (should (eq 'auto evil-ghostel--escape-mode))))
+
+(ert-deftest evil-ghostel-test-escape-toggle-prefix-set ()
+  "Numeric prefix sets the mode directly: 1=auto, 2=terminal, 3=evil."
+  (evil-ghostel-test--with-evil-buffer
+   (evil-ghostel-toggle-send-escape 2)
+   (should (eq 'terminal evil-ghostel--escape-mode))
+   (evil-ghostel-toggle-send-escape 3)
+   (should (eq 'evil evil-ghostel--escape-mode))
+   (evil-ghostel-toggle-send-escape 1)
+   (should (eq 'auto evil-ghostel--escape-mode))))
+
+(ert-deftest evil-ghostel-test-escape-toggle-prefix-invalid ()
+  "An out-of-range numeric prefix signals `user-error' and leaves state alone."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'auto)
+   (should-error (evil-ghostel-toggle-send-escape 7) :type 'user-error)
+   (should (eq 'auto evil-ghostel--escape-mode))))
+
+(ert-deftest evil-ghostel-test-escape-mode-buffer-local ()
+  "Setting the mode in one ghostel buffer must not leak into another."
+  (let ((buf-a (generate-new-buffer " *ghostel-a*"))
+        (buf-b (generate-new-buffer " *ghostel-b*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf-a
+            (ghostel-mode)
+            (setq-local ghostel--term-rows 100)
+            (evil-local-mode 1)
+            (evil-ghostel-mode 1)
+            (setq evil-ghostel--escape-mode 'terminal))
+          (with-current-buffer buf-b
+            (ghostel-mode)
+            (setq-local ghostel--term-rows 100)
+            (evil-local-mode 1)
+            (evil-ghostel-mode 1)
+            (setq evil-ghostel--escape-mode 'evil))
+          (with-current-buffer buf-a
+            (should (eq 'terminal evil-ghostel--escape-mode)))
+          (with-current-buffer buf-b
+            (should (eq 'evil evil-ghostel--escape-mode))))
+      (kill-buffer buf-a)
+      (kill-buffer buf-b))))
+
+(ert-deftest evil-ghostel-test-escape-evil-fallback-when-lookup-nil ()
+  "When `lookup-key' yields no command (user rebound ESC to a chord
+prefix), the dispatcher must fall back to `evil-force-normal-state'
+rather than silently dropping the keystroke."
+  (evil-ghostel-test--with-evil-buffer
+   (setq evil-ghostel--escape-mode 'evil)
+   (evil-insert-state)
+   (cl-letf (((symbol-function 'lookup-key)
+              (lambda (&rest _) nil)))
+     (evil-ghostel--escape)
+     (should (eq 'normal evil-state)))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -757,7 +895,18 @@ Prevents up/down arrows being sent as history navigation."
     evil-ghostel-test-paste-after
     evil-ghostel-test-undo-sends-ctrl-underscore
     evil-ghostel-test-change-whole-line
-    evil-ghostel-test-delete-no-op-outside-ghostel)
+    evil-ghostel-test-delete-no-op-outside-ghostel
+    evil-ghostel-test-escape-init-from-defcustom
+    evil-ghostel-test-escape-mode-terminal-sends-pty
+    evil-ghostel-test-escape-terminal-snaps-to-input
+    evil-ghostel-test-escape-mode-evil-stays
+    evil-ghostel-test-escape-auto-altscreen-sends-pty
+    evil-ghostel-test-escape-auto-no-altscreen-stays
+    evil-ghostel-test-escape-toggle-cycle
+    evil-ghostel-test-escape-toggle-prefix-set
+    evil-ghostel-test-escape-toggle-prefix-invalid
+    evil-ghostel-test-escape-mode-buffer-local
+    evil-ghostel-test-escape-evil-fallback-when-lookup-nil)
   "Tests that require only Elisp (no native module).")
 
 (defun evil-ghostel-test-run-elisp ()

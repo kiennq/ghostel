@@ -56,6 +56,22 @@ last-writer-wins."
          (set-default-toplevel-value sym val)
          (evil-set-initial-state 'ghostel-mode val)))
 
+(defcustom evil-ghostel-escape 'auto
+  "Where insert-state ESC is routed in ghostel buffers.
+
+`auto'      — when the inner app is in alt-screen mode (DECSET 1049,
+              used by vim, less, htop, nvim, etc.) ESC is sent to the
+              terminal; otherwise evil's binding runs and switches to
+              normal state.
+`terminal'  — always send ESC to the terminal.
+`evil'      — always run evil's binding (ESC stays with evil).
+
+Sets the initial value of the buffer-local state.  Use
+\\[evil-ghostel-toggle-send-escape] to change it for the current buffer."
+  :type '(choice (const :tag "Auto (alt-screen heuristic)" auto)
+                 (const :tag "Always to terminal" terminal)
+                 (const :tag "Always to evil" evil)))
+
 ;; Apply the current value at load.  Covers the case where the user set
 ;; the variable with plain `setq' before loading the package — in that
 ;; path `defcustom' preserves the value without invoking `:set'.
@@ -369,6 +385,62 @@ ORIG-FN is the advised `evil-redo' called with COUNT."
     (funcall orig-fn count)))
 
 ;; ---------------------------------------------------------------------------
+;; ESC routing: terminal vs evil
+;; ---------------------------------------------------------------------------
+
+(defvar-local evil-ghostel--escape-mode nil
+  "Buffer-local override for ESC routing.
+Initialized from `evil-ghostel-escape' when the minor mode turns on.
+Valid values: `auto', `terminal', `evil'.")
+
+(defconst evil-ghostel--escape-modes '(auto terminal evil)
+  "Cycle order for `evil-ghostel-toggle-send-escape'.")
+
+(defun evil-ghostel--escape ()
+  "Dispatch insert-state ESC based on `evil-ghostel--escape-mode'.
+Terminal-bound ESC is snapped to the live viewport like every other
+typed key in `ghostel-mode-map'.  When falling back to evil and the
+user's `evil-insert-state-map' binding is missing or a chord prefix
+\(e.g. `evil-escape''s `jk'), use `evil-force-normal-state' so the
+keystroke is never silently dropped."
+  (interactive)
+  (let* ((mode evil-ghostel--escape-mode)
+         (to-terminal (or (eq mode 'terminal)
+                          (and (eq mode 'auto)
+                               ghostel--term
+                               (ghostel--mode-enabled ghostel--term 1049)))))
+    (if to-terminal
+        (progn
+          (ghostel--snap-to-input)
+          (ghostel--send-encoded "escape" ""))
+      (let ((cmd (lookup-key evil-insert-state-map (kbd "<escape>"))))
+        (call-interactively (if (commandp cmd) cmd #'evil-force-normal-state))))))
+
+(defun evil-ghostel-toggle-send-escape (&optional arg)
+  "Cycle or set the ESC routing mode for the current buffer.
+Without ARG, cycle through `auto' → `terminal' → `evil' → `auto'.
+With numeric prefix 1, set to `auto'; 2 to `terminal'; 3 to `evil'.
+Other numeric prefixes signal a `user-error'.
+
+The mode is buffer-local; see `evil-ghostel-escape' for the default."
+  (interactive "P")
+  (let ((target
+         (if arg
+             (let ((n (prefix-numeric-value arg)))
+               (or (nth (1- n) evil-ghostel--escape-modes)
+                   (user-error
+                    "Invalid prefix %d; use 1 (auto), 2 (terminal), or 3 (evil)"
+                    n)))
+           (let ((next (cdr (memq evil-ghostel--escape-mode
+                                  evil-ghostel--escape-modes))))
+             (or (car next) (car evil-ghostel--escape-modes))))))
+    (setq evil-ghostel--escape-mode target)
+    (message "evil-ghostel ESC mode: %s" target)))
+
+(evil-define-key* 'insert evil-ghostel-mode-map
+                  (kbd "<escape>") #'evil-ghostel--escape)
+
+;; ---------------------------------------------------------------------------
 ;; Minor mode
 ;; ---------------------------------------------------------------------------
 
@@ -381,6 +453,7 @@ state transitions."
   :keymap evil-ghostel-mode-map
   (if evil-ghostel-mode
       (progn
+        (setq evil-ghostel--escape-mode evil-ghostel-escape)
         (evil-ghostel--escape-stay)
         (add-hook 'evil-insert-state-entry-hook
                   #'evil-ghostel--insert-state-entry nil t)
