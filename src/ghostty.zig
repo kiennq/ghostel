@@ -258,7 +258,7 @@ pub fn terminalModeGet(term: c.GhosttyTerminal, mode: c.GhosttyMode) !bool {
 pub const rs_row_cells_next = c.ghostty_render_state_row_cells_next;
 pub const rs_row_next = c.ghostty_render_state_row_iterator_next;
 
-pub fn rs_update(state: RenderState, terminal: Terminal) !void {
+pub fn renderStateUpdate(state: RenderState, terminal: Terminal) !void {
     try toError(c.ghostty_render_state_update(state, terminal));
 }
 

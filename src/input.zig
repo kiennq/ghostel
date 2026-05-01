@@ -12,14 +12,14 @@ const Key = gt.c.GhosttyKey;
 const Mods = gt.c.GhosttyMods;
 
 /// Encode a key event and send the result to the PTY via Elisp callback.
-/// Returns true if the key was encoded and sent.
-pub fn encodeAndSend(env: emacs.Env, term: *Terminal, key: Key, mods: Mods, utf8: ?[]const u8) bool {
+/// Returns true if bytes were sent, false if the key produces no output (not an error).
+pub fn encodeAndSend(env: emacs.Env, term: *Terminal, key: Key, mods: Mods, utf8: ?[]const u8) !bool {
     // Sync encoder options from terminal state (cursor key mode, kitty flags, etc.)
     gt.c.ghostty_key_encoder_setopt_from_terminal(term.key_encoder, term.terminal);
 
     // Create key event
     var event: gt.c.GhosttyKeyEvent = undefined;
-    if (gt.c.ghostty_key_event_new(null, &event) != gt.SUCCESS) return false;
+    try gt.toError(gt.c.ghostty_key_event_new(null, &event));
     defer gt.c.ghostty_key_event_free(event);
 
     gt.c.ghostty_key_event_set_action(event, gt.c.GHOSTTY_KEY_ACTION_PRESS);
@@ -33,15 +33,15 @@ pub fn encodeAndSend(env: emacs.Env, term: *Terminal, key: Key, mods: Mods, utf8
     // Encode
     var buf: [128]u8 = undefined;
     var written: usize = 0;
-    const result = gt.c.ghostty_key_encoder_encode(
+    try gt.toError(gt.c.ghostty_key_encoder_encode(
         term.key_encoder,
         event,
         &buf,
         buf.len,
         &written,
-    );
+    ));
 
-    if (result != gt.SUCCESS or written == 0) return false;
+    if (written == 0) return false;
 
     // Send encoded bytes to the PTY via Elisp
     const str = env.makeString(buf[0..written]);
@@ -51,8 +51,8 @@ pub fn encodeAndSend(env: emacs.Env, term: *Terminal, key: Key, mods: Mods, utf8
 }
 
 /// Encode a mouse event and send the result to the PTY.
-/// Returns true if the event was encoded and sent.
-pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: i64, row: i64, col: i64, mods_val: i64) bool {
+/// Returns true if bytes were sent, false if the event produces no output (not an error).
+pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: i64, row: i64, col: i64, mods_val: i64) !bool {
     // Sync encoder options (tracking mode, format) from terminal
     gt.c.ghostty_mouse_encoder_setopt_from_terminal(term.mouse_encoder, term.terminal);
 
@@ -72,7 +72,7 @@ pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: 
 
     // Create event
     var event: gt.c.GhosttyMouseEvent = undefined;
-    if (gt.c.ghostty_mouse_event_new(null, &event) != gt.SUCCESS) return false;
+    try gt.toError(gt.c.ghostty_mouse_event_new(null, &event));
     defer gt.c.ghostty_mouse_event_free(event);
 
     gt.c.ghostty_mouse_event_set_action(event, @intCast(action));
@@ -92,15 +92,15 @@ pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: 
     // Encode
     var buf: [128]u8 = undefined;
     var written: usize = 0;
-    const result = gt.c.ghostty_mouse_encoder_encode(
+    try gt.toError(gt.c.ghostty_mouse_encoder_encode(
         term.mouse_encoder,
         event,
         &buf,
         buf.len,
         &written,
-    );
+    ));
 
-    if (result != gt.SUCCESS or written == 0) return false;
+    if (written == 0) return false;
 
     // Send to PTY
     const str = env.makeString(buf[0..written]);

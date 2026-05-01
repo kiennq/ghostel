@@ -212,30 +212,20 @@ pub fn enableKittyGraphics(
 }
 
 /// Get the current color palette (256 entries).
-pub fn getColorPalette(self: *Self, palette: *[256]gt.ColorRgb) bool {
-    return gt.c.ghostty_terminal_get(
-        self.terminal,
-        gt.DATA_COLOR_PALETTE,
-        @ptrCast(palette),
-    ) == gt.SUCCESS;
+pub fn getColorPalette(self: *Self) ![256]gt.ColorRgb {
+    return gt.terminal_data.get([256]gt.ColorRgb, self.terminal, gt.DATA_COLOR_PALETTE);
 }
 
 /// Get the effective foreground color (honouring any OSC 10 override).
-pub fn getColorForeground(self: *Self, out: *gt.ColorRgb) bool {
-    return gt.c.ghostty_terminal_get(
-        self.terminal,
-        gt.DATA_COLOR_FOREGROUND,
-        @ptrCast(out),
-    ) == gt.SUCCESS;
+/// Returns null if no foreground color is configured (NO_VALUE).
+pub fn getColorForeground(self: *Self) !?gt.ColorRgb {
+    return gt.terminal_data.getOpt(gt.ColorRgb, self.terminal, gt.DATA_COLOR_FOREGROUND);
 }
 
 /// Get the effective background color (honouring any OSC 11 override).
-pub fn getColorBackground(self: *Self, out: *gt.ColorRgb) bool {
-    return gt.c.ghostty_terminal_get(
-        self.terminal,
-        gt.DATA_COLOR_BACKGROUND,
-        @ptrCast(out),
-    ) == gt.SUCCESS;
+/// Returns null if no background color is configured (NO_VALUE).
+pub fn getColorBackground(self: *Self) !?gt.ColorRgb {
+    return gt.terminal_data.getOpt(gt.ColorRgb, self.terminal, gt.DATA_COLOR_BACKGROUND);
 }
 
 /// Feed VT data from the PTY into the terminal.
@@ -260,69 +250,47 @@ pub fn scrollViewport(self: *Self, tag: c_int, delta: isize) void {
     gt.c.ghostty_terminal_scroll_viewport(self.terminal, behavior);
 }
 
-/// Get the terminal title as a borrowed string.
-pub fn getTitle(self: *Self) ?[]const u8 {
-    var title: gt.GhosttyString = undefined;
-    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_TITLE, &title) != gt.SUCCESS) {
-        return null;
-    }
+/// Get the terminal title as a borrowed string. Returns null if not set.
+pub fn getTitle(self: *Self) !?[]const u8 {
+    const title = try gt.terminal_data.get(gt.GhosttyString, self.terminal, gt.DATA_TITLE);
     if (title.len == 0) return null;
     return title.ptr[0..title.len];
 }
 
-/// Get the terminal's current working directory (from OSC 7).
-pub fn getPwd(self: *Self) ?[]const u8 {
-    var pwd: gt.GhosttyString = undefined;
-    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_PWD, &pwd) != gt.SUCCESS) {
-        return null;
-    }
+/// Get the terminal's current working directory (from OSC 7). Returns null if not set.
+pub fn getPwd(self: *Self) !?[]const u8 {
+    const pwd = try gt.terminal_data.get(gt.GhosttyString, self.terminal, gt.DATA_PWD);
     if (pwd.len == 0) return null;
     return pwd.ptr[0..pwd.len];
 }
 
-/// Check if a terminal mode is enabled.
-pub fn isModeEnabled(self: *Self, mode: gt.c.GhosttyMode) bool {
-    var enabled: bool = false;
-    if (gt.c.ghostty_terminal_mode_get(self.terminal, mode, &enabled) != gt.SUCCESS) {
-        return false;
-    }
-    return enabled;
+/// Check if a terminal mode is enabled. Error.InvalidValue means unknown mode.
+pub fn isModeEnabled(self: *Self, mode: gt.c.GhosttyMode) !bool {
+    return gt.terminalModeGet(self.terminal, mode);
 }
 
 /// Returns true if the terminal is on the alternate screen buffer
 /// (DEC private modes 1049, 1047, or legacy 47 set).  Used to decide
 /// whether full-screen apps (vim, htop, less) own the viewport.
-pub fn isAltScreen(self: *Self) bool {
-    return self.isModeEnabled(@as(gt.c.GhosttyMode, 1049)) or
-        self.isModeEnabled(@as(gt.c.GhosttyMode, 1047)) or
-        self.isModeEnabled(@as(gt.c.GhosttyMode, 47));
+pub fn isAltScreen(self: *Self) !bool {
+    return try self.isModeEnabled(@as(gt.c.GhosttyMode, 1049)) or
+        try self.isModeEnabled(@as(gt.c.GhosttyMode, 1047)) or
+        try self.isModeEnabled(@as(gt.c.GhosttyMode, 47));
 }
 
 /// Get the total number of rows (scrollback + active screen).
-pub fn getTotalRows(self: *Self) usize {
-    var total: usize = 0;
-    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_TOTAL_ROWS, @ptrCast(&total)) != gt.SUCCESS) {
-        return self.size.rows;
-    }
-    return total;
+pub fn getTotalRows(self: *Self) !usize {
+    return gt.terminal_data.get(usize, self.terminal, gt.DATA_TOTAL_ROWS);
 }
 
 /// Get the number of scrollback rows.
-pub fn getScrollbackRows(self: *Self) usize {
-    var scrollback: usize = 0;
-    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_SCROLLBACK_ROWS, @ptrCast(&scrollback)) != gt.SUCCESS) {
-        return self.size.rows;
-    }
-    return scrollback;
+pub fn getScrollbackRows(self: *Self) !usize {
+    return gt.terminal_data.get(usize, self.terminal, gt.DATA_SCROLLBACK_ROWS);
 }
 
 /// Get the scrollbar state (total, offset, len).
-pub fn getScrollbar(self: *Self) ?gt.TerminalScrollbar {
-    var sb: gt.TerminalScrollbar = undefined;
-    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_SCROLLBAR, @ptrCast(&sb)) != gt.SUCCESS) {
-        return null;
-    }
-    return sb;
+pub fn getScrollbar(self: *Self) !gt.TerminalScrollbar {
+    return gt.terminal_data.get(gt.TerminalScrollbar, self.terminal, gt.DATA_SCROLLBAR);
 }
 
 /// Emacs finalizer — called when the user-ptr is garbage collected.
