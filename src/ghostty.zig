@@ -243,7 +243,7 @@ fn Accessor(comptime Target: type, getter: anytype, setter: anytype, multi_gette
 pub const terminal_data = Accessor(c.GhosttyTerminal, c.ghostty_terminal_get, void, void);
 pub const kitty_graphics_data = Accessor(c.GhosttyKittyGraphics, c.ghostty_kitty_graphics_get, void, void);
 pub const kitty_placement_data = Accessor(c.GhosttyKittyGraphicsPlacementIterator, c.ghostty_kitty_graphics_placement_get, void, void);
-pub const row = Accessor(c.GhosttyRow, c.ghostty_row_get, void, void);
+pub const row = Accessor(c.GhosttyRow, c.ghostty_row_get, void, c.ghostty_row_get_multi);
 pub const cell = Accessor(c.GhosttyCell, c.ghostty_cell_get, void, void);
 pub const rs = Accessor(RenderState, c.ghostty_render_state_get, c.ghostty_render_state_set, c.ghostty_render_state_get_multi);
 pub const rs_row = Accessor(RenderStateRowIterator, c.ghostty_render_state_row_get, c.ghostty_render_state_row_set, void);

@@ -11,8 +11,8 @@ const Terminal = @import("terminal.zig");
 
 const FixedArrayList = @import("fixed_array_list.zig").FixedArrayList;
 
-/// Style attributes for a run of text.
-const CellStyle = struct {
+/// Properties for a run of cells.
+const CellProps = struct {
     fg: ?gt.ColorRgb = null,
     bg: ?gt.ColorRgb = null,
     bold: bool = false,
@@ -23,32 +23,26 @@ const CellStyle = struct {
     strikethrough: bool = false,
     inverse: bool = false,
     hyperlink: bool = false,
+    prompt: bool = false,
+    input: bool = false,
 
-    fn isDefault(self: CellStyle) bool {
-        return self.fg == null and
-            self.bg == null and
-            !self.bold and
-            !self.italic and
-            !self.faint and
-            self.underline == 0 and
-            !self.strikethrough and
-            !self.inverse and
-            !self.hyperlink;
+    fn isDefault(self: CellProps) bool {
+        return std.meta.eql(self, .{});
     }
 };
 
-// Unique identifier for what we consider a style. Normally, you would only use
-// style_id for this but we also use Emacs text properties for hyperlinks so
-// we include "hyperlink-ness" here.
-const CellStyleKey = struct { style_id: gt.c.GhosttyStyleId, hyperlink: bool };
+/// Unique identifier that is cheaper to read and compare relative to `CellProps`.
+/// We read this first and if it differs from the previous cell, we read the full
+/// `CellProps`.
+const CellPropKey = struct { style_id: ?gt.c.GhosttyStyleId, hyperlink: bool, prompt: bool, input: bool };
 
-/// Track style runs for propertizing after insertion.
+/// Track property runs for propertizing after insertion.
 /// Positions are in characters (codepoints), not bytes, because
 /// Emacs put-text-property works with character positions.
 const RunInfo = struct {
     start_char: usize,
     end_char: usize,
-    style: ?CellStyle,
+    props: ?CellProps,
 };
 
 fn colorEql(a: ?gt.ColorRgb, b: ?gt.ColorRgb) bool {
@@ -81,43 +75,43 @@ fn formatColor(color: gt.ColorRgb, buf: *[7]u8) []const u8 {
 }
 
 /// Read the style for the current cell from the render state.
-fn readCellStyle(cells: gt.RenderStateRowCells, raw: gt.c.GhosttyCell) !?CellStyle {
-    var style: CellStyle = .{};
+fn readCellProps(cells: gt.RenderStateRowCells, key: CellPropKey) !?CellProps {
+    var props: CellProps = .{};
 
-    style.fg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_FG_COLOR) catch |err| switch (err) {
+    props.fg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_FG_COLOR) catch |err| switch (err) {
         gt.Error.InvalidValue => null,
         else => return err,
     };
-    style.bg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_BG_COLOR) catch |err| switch (err) {
+    props.bg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_BG_COLOR) catch |err| switch (err) {
         gt.Error.InvalidValue => null,
         else => return err,
     };
 
     // Read style attributes
     if (try gt.rs_row_cells.getOpt(gt.Style, cells, gt.RS_CELLS_DATA_STYLE)) |gs| {
-        style.bold = gs.bold;
-        style.italic = gs.italic;
-        style.faint = gs.faint;
-        style.underline = gs.underline;
-        style.strikethrough = gs.strikethrough;
-        style.inverse = gs.inverse;
+        props.bold = gs.bold;
+        props.italic = gs.italic;
+        props.faint = gs.faint;
+        props.underline = gs.underline;
+        props.strikethrough = gs.strikethrough;
+        props.inverse = gs.inverse;
 
         // Underline color
         if (gs.underline_color.tag == gt.c.GHOSTTY_STYLE_COLOR_RGB) {
-            style.underline_color = gs.underline_color.value.rgb;
+            props.underline_color = gs.underline_color.value.rgb;
         }
     }
 
-    if (try gt.cell.getOpt(bool, raw, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK)) |hl| {
-        style.hyperlink = hl;
-    }
+    props.hyperlink = key.hyperlink;
+    props.prompt = key.prompt;
+    props.input = key.input;
 
-    return if (style.isDefault()) null else style;
+    return if (props.isDefault()) null else props;
 }
 
 /// Apply face properties to a region of the buffer.
 /// Uses (put-text-property START END 'face PLIST).
-fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_colors: *const BgFg) !void {
+fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_colors: *const BgFg) !void {
     if (start >= end) return;
 
     var face_props: FixedArrayList(emacs.Value, 32) = .{};
@@ -128,51 +122,51 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_co
     var bg_buf: [7]u8 = undefined;
     var dim_buf: [7]u8 = undefined;
 
-    const bg = style.bg orelse default_colors.bg;
-    const fg = style.fg orelse default_colors.fg;
-    const effective_fg = if (style.inverse) bg else fg;
-    const effective_bg = if (style.inverse) fg else bg;
+    const bg = props.bg orelse default_colors.bg;
+    const fg = props.fg orelse default_colors.fg;
+    const effective_fg = if (props.inverse) bg else fg;
+    const effective_bg = if (props.inverse) fg else bg;
 
     const s = &emacs.sym;
 
-    if (style.faint) {
+    if (props.faint) {
         // Dim text: blend foreground toward background to reduce intensity.
         // Always set :foreground since we modify the color itself.
         const dimmed = dimColor(effective_fg, effective_bg);
         const dim_str = formatColor(dimmed, &dim_buf);
         try face_props.append(s.@":foreground");
         try face_props.append(env.makeString(dim_str));
-    } else if (!colorEql(style.fg, null) or style.inverse) {
+    } else if (!colorEql(props.fg, null) or props.inverse) {
         const fg_str = formatColor(effective_fg, &fg_buf);
         try face_props.append(s.@":foreground");
         try face_props.append(env.makeString(fg_str));
     }
 
-    if (!colorEql(style.bg, null) or style.inverse) {
+    if (!colorEql(props.bg, null) or props.inverse) {
         const bg_str = formatColor(effective_bg, &bg_buf);
         try face_props.append(s.@":background");
         try face_props.append(env.makeString(bg_str));
     }
 
-    if (style.bold) {
+    if (props.bold) {
         try face_props.append(s.@":weight");
         try face_props.append(s.bold);
     }
 
-    if (style.italic) {
+    if (props.italic) {
         try face_props.append(s.@":slant");
         try face_props.append(s.italic);
     }
 
-    if (style.underline != 0) {
+    if (props.underline != 0) {
         try face_props.append(s.@":underline");
-        if (style.underline == 1 and style.underline_color == null) {
+        if (props.underline == 1 and props.underline_color == null) {
             try face_props.append(env.t());
         } else {
             var ul_props: FixedArrayList(emacs.Value, 4) = .{};
 
             try ul_props.append(s.@":style");
-            try ul_props.append(switch (style.underline) {
+            try ul_props.append(switch (props.underline) {
                 3 => s.wave,
                 2 => s.@"double-line",
                 4 => s.dot,
@@ -180,7 +174,7 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_co
                 else => s.line,
             });
 
-            if (style.underline_color) |uc| {
+            if (props.underline_color) |uc| {
                 var uc_buf: [7]u8 = undefined;
                 try ul_props.append(s.@":color");
                 try ul_props.append(env.makeString(formatColor(uc, &uc_buf)));
@@ -190,7 +184,7 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_co
         }
     }
 
-    if (style.strikethrough) {
+    if (props.strikethrough) {
         try face_props.append(s.@":strike-through");
         try face_props.append(env.t());
     }
@@ -200,10 +194,18 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_co
         env.putTextProperty(start_val, end_val, s.face, face);
     }
 
-    if (style.hyperlink) {
+    if (props.hyperlink) {
         env.putTextProperty(start_val, end_val, s.@"help-echo", s.@"ghostel--native-link-help-echo");
         env.putTextProperty(start_val, end_val, s.@"mouse-face", s.highlight);
         env.putTextProperty(start_val, end_val, s.keymap, env.call1(s.@"symbol-value", s.@"ghostel-link-map"));
+    }
+
+    if (props.prompt) {
+        env.putTextProperty(start_val, end_val, emacs.sym.@"ghostel-prompt", env.t());
+    }
+
+    if (props.input) {
+        env.putTextProperty(start_val, end_val, emacs.sym.@"ghostel-input", env.t());
     }
 }
 
@@ -211,12 +213,6 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_co
 fn isRowWrapped(term: *Terminal) !bool {
     const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, term.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
     return try gt.row.get(bool, raw_row, gt.ROW_DATA_WRAP);
-}
-
-/// Check if the current row in the iterator is a semantic prompt.
-fn isRowPrompt(term: *Terminal) !bool {
-    const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, term.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
-    return try gt.row.get(c_int, raw_row, gt.ROW_DATA_SEMANTIC_PROMPT) != 0;
 }
 
 /// Result from buildRowContent: byte length for make_string, char count for properties.
@@ -231,15 +227,6 @@ const RowContent = struct {
 
     /// A list of continuous property runs
     runs: FixedArrayList(RunInfo, 512) = .{},
-
-    /// Number of leading characters that are semantic prompt content.
-    /// Zero if the row has no prompt cells.
-    prompt_char_len: usize = 0,
-
-    /// Character range covering semantic-input cells (OSC 133 B..C).
-    /// `input_end_char == input_start_char` means no input cells on the row.
-    input_start_char: usize = 0,
-    input_end_char: usize = 0,
 
     /// True when the row contains at least one wide (2-cell) character.
     has_wide: bool = false,
@@ -259,11 +246,48 @@ const RowContent = struct {
     }
 };
 
-fn getStyleKey(cell: gt.c.GhosttyCell) !CellStyleKey {
-    return CellStyleKey{ // zig fmt: off
-        .style_id = try gt.cell.getOpt(gt.c.GhosttyStyleId, cell, gt.c.GHOSTTY_CELL_DATA_STYLE_ID) orelse 0,
-        .hyperlink = try gt.cell.getOpt(bool, cell, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK) orelse false
-    }; // zig fmt: on
+fn readPropKey(cell: gt.c.GhosttyCell, row_hints: RowHints) !CellPropKey {
+    var semantic_prompt: gt.c.GhosttyCellSemanticContent = gt.c.GHOSTTY_CELL_SEMANTIC_OUTPUT;
+    if (row_hints.row_semantic_prompt != gt.c.GHOSTTY_ROW_SEMANTIC_NONE) {
+        semantic_prompt = try gt.cell.get(gt.c.GhosttyCellSemanticContent, cell, gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT);
+    }
+
+    var style_id: ?gt.c.GhosttyStyleId = null;
+    if (row_hints.may_have_style) {
+        style_id = try gt.cell.get(gt.c.GhosttyStyleId, cell, gt.c.GHOSTTY_CELL_DATA_STYLE_ID);
+    }
+
+    var hyperlink = false;
+    if (row_hints.may_have_hyperlink) {
+        hyperlink = try gt.cell.get(bool, cell, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK);
+    }
+
+    return CellPropKey{
+        .style_id = style_id,
+        .hyperlink = hyperlink,
+        .prompt = semantic_prompt == gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT,
+        .input = semantic_prompt == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT,
+    };
+}
+
+const RowHints = struct {
+    row_semantic_prompt: gt.c.GhosttyRowSemanticPrompt,
+    may_have_hyperlink: bool,
+    may_have_style: bool,
+};
+
+fn readRowHints(row: gt.c.GhosttyRow) !RowHints {
+    const row_semantic_prompt, const maybe_hyperlink, const maybe_style = try gt.row.getMulti(row, &[_]gt.Multi{
+        .{ gt.c.GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, gt.c.GhosttyRowSemanticPrompt },
+        .{ gt.c.GHOSTTY_ROW_DATA_HYPERLINK, bool },
+        .{ gt.c.GHOSTTY_ROW_DATA_STYLED, bool },
+    });
+
+    return .{
+        .row_semantic_prompt = row_semantic_prompt,
+        .may_have_hyperlink = maybe_hyperlink,
+        .may_have_style = maybe_style,
+    };
 }
 
 /// Build text content and style runs for the current row in the iterator.
@@ -281,45 +305,33 @@ fn buildRowContent(term: *Terminal, content: *RowContent) !void {
     // discarded along with their default-style trailing padding.
     var trim_text_len: usize = 0;
     var trim_char_len: usize = 0;
-    var in_prompt: bool = true; // track contiguous leading prompt cells
-    var saw_input: bool = false;
-    var current_style_key: ?CellStyleKey = null;
 
+    const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, term.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
+    const row_hints = try readRowHints(raw_row);
+
+    var current_prop_key: ?CellPropKey = null;
     try gt.rs_row.read(term.row_iterator, gt.RS_ROW_DATA_CELLS, &term.row_cells);
     while (gt.rs_row_cells_next(term.row_cells)) {
-        const graphemes_len = try gt.rs_row_cells.get(u32, term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
         const raw_cell = try gt.rs_row_cells.get(gt.c.GhosttyCell, term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW);
-
-        const semantic = try gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT);
-
-        // Track leading prompt characters via cell-level semantic content.
-        if (in_prompt and semantic != gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
-            in_prompt = false;
-        }
-
-        const cell_start_char = content.emacs_char_len;
-        if (semantic == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT and !saw_input) {
-            content.input_start_char = cell_start_char;
-            saw_input = true;
-        }
 
         // We use a "key" that holds a minimum set of values that are cheap to
         // read and compare to detect style run breaks. Only when we detect a
         // break do we read the cell style, which is a more expensive operation
         // in such a tight loop.
-        const style_key: CellStyleKey = try getStyleKey(raw_cell);
-        if (!std.meta.eql(@as(?CellStyleKey, style_key), current_style_key)) {
+        const prop_key: CellPropKey = try readPropKey(raw_cell, row_hints);
+        if (!std.meta.eql(@as(?CellPropKey, prop_key), current_prop_key)) {
             try content.runs.append(.{
                 .start_char = content.emacs_char_len,
-                .end_char = content.emacs_char_len + 1,
-                .style = try readCellStyle(term.row_cells, raw_cell),
+                .end_char = content.emacs_char_len,
+                .props = try readCellProps(term.row_cells, prop_key),
             });
-            current_style_key = style_key;
-        } else {
-            content.runs.lastPtr().end_char += 1;
+            current_prop_key = prop_key;
         }
 
-        if (graphemes_len == 0) {
+        var codepoints: [32]u32 = undefined;
+        const graphemes_len = try gt.rs_row_cells.get(u32, term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
+        // If we have no graphemes, or too many graphemes for us to deal with, we treat that as a space.
+        if (graphemes_len == 0 or graphemes_len >= codepoints.len) {
             // Wide-character spacer tails occupy a terminal cell but must
             // not produce output — the preceding wide cell already accounts
             // for 2 visual columns in Emacs.
@@ -329,35 +341,19 @@ fn buildRowContent(term: *Terminal, content: *RowContent) !void {
                 content.has_wide = true;
                 continue;
             }
+
             try content.appendAsciiChar(' ');
-            if (in_prompt) content.prompt_char_len = content.emacs_char_len;
-            if (saw_input and semantic == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT) {
-                content.input_end_char = content.emacs_char_len;
-            }
-            // Empty cells are blank for trim purposes unless their
-            // style has a visible attribute (e.g. colored background).
-            if (content.runs.lastPtr().style != null) {
-                trim_text_len = content.text.len;
-                trim_char_len = content.emacs_char_len;
-            }
-            continue;
+        } else {
+            try gt.rs_row_cells.read(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, &codepoints);
+            try content.appendGraphemeCluster(codepoints[0..graphemes_len]);
         }
 
-        const codepoints = try gt.rs_row_cells.get([16]u32, term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF);
-        const cp_count = @min(graphemes_len, 16);
-        try content.appendGraphemeCluster(codepoints[0..cp_count]);
-        if (in_prompt) content.prompt_char_len = content.emacs_char_len;
-        if (saw_input and semantic == gt.c.GHOSTTY_CELL_SEMANTIC_INPUT) {
-            content.input_end_char = content.emacs_char_len;
+        // We trim cells that neither have content nor styling
+        if (graphemes_len > 0 or content.runs.lastPtr().props != null) {
+            trim_text_len = content.text.len;
+            trim_char_len = content.emacs_char_len;
         }
-        // Any cell that libghostty stored a grapheme for was written
-        // explicitly by the terminal, so it anchors the trim point —
-        // even if the grapheme happens to be a space (e.g. the space
-        // in a \"$ \" prompt, or a space the shell intentionally
-        // emitted as part of a layout). Only unwritten padding cells
-        // (the `graphemes_len == 0' branch above) are considered blank.
-        trim_text_len = content.text.len;
-        trim_char_len = content.emacs_char_len;
+        content.runs.lastPtr().end_char = content.emacs_char_len;
     }
 
     // Trim trailing blank cells. Cap `prompt_char_len' / input range at the
@@ -366,13 +362,13 @@ fn buildRowContent(term: *Terminal, content: *RowContent) !void {
     // its `content.char_len' cap.
     content.text.resize(trim_text_len);
     content.emacs_char_len = trim_char_len;
-    if (content.prompt_char_len > content.emacs_char_len) content.prompt_char_len = content.emacs_char_len;
-    if (content.input_end_char > content.emacs_char_len) content.input_end_char = content.emacs_char_len;
-    if (content.input_start_char > content.input_end_char) content.input_start_char = content.input_end_char;
+    if (content.runs.len > 0) {
+        content.runs.lastPtr().end_char = trim_char_len;
+    }
 }
 
-/// Insert row text and apply style runs.
-fn insertAndStyle(
+/// Insert row text and apply property runs.
+fn insertRow(
     env: emacs.Env,
     term: *Terminal,
     default_colors: *const BgFg,
@@ -380,16 +376,8 @@ fn insertAndStyle(
     var content: RowContent = .{};
     try buildRowContent(term, &content);
 
-    // Append the trailing newline to the row buffer so the row
-    // text + newline insert through a single env.insert call
-    // instead of two. This saves one Elisp FFI round-trip per
-    // inserted row, which is the dominant per-row cost in this
-    // hot loop. Style runs only cover the row's cells, so the
-    // unstyled trailing \n is harmless to insertAndStyle. If the
-    // row exactly filled text_buf, fall back to a separate
-    // env.insert("\n") so the "one row per line" invariant
-    // (relied on by the `after_insert - 1` property math below)
-    // always holds.
+    // Append the trailing newline to the row buffer if it fits so the row
+    // text + newline insert through a single env.insert call instead of two.
     const newline_in_buf = if (content.appendAsciiChar('\n')) true else |_| false;
 
     const row_start = env.extractInteger(env.point());
@@ -400,62 +388,22 @@ fn insertAndStyle(
     }
 
     for (content.runs.constItems()) |*run| {
-        if (run.start_char >= content.emacs_char_len) break;
-        const run_end = @min(run.end_char, content.emacs_char_len);
-        if (run_end <= run.start_char) continue;
+        if (run.end_char <= run.start_char) continue;
 
         const prop_start = row_start + @as(i64, @intCast(run.start_char));
-        const prop_end = row_start + @as(i64, @intCast(run_end));
-        if (run.style) |style| {
-            try applyStyle(env, prop_start, prop_end, style, default_colors);
+        const prop_end = row_start + @as(i64, @intCast(run.end_char));
+        if (run.props) |props| {
+            try applyProps(env, prop_start, prop_end, props, default_colors);
         }
     }
 
-    if (!newline_in_buf) {
-        env.insert("\n");
-    }
-    const after_insert = env.extractInteger(env.point());
+    if (!newline_in_buf) env.insert("\n");
+
     if (try isRowWrapped(term)) {
         // Mark newlines from soft-wrapped rows so copy mode can filter them
         const point = env.point();
         const nl_pos = env.makeInteger(env.extractInteger(point) - 1);
         env.putTextProperty(nl_pos, point, emacs.sym.@"ghostel-wrap", env.t());
-    }
-
-    if (content.prompt_char_len > 0) {
-        env.putTextProperty(
-            env.makeInteger(row_start),
-            env.makeInteger(row_start + @as(i64, @intCast(content.prompt_char_len))),
-            emacs.sym.@"ghostel-prompt",
-            env.t(),
-        );
-    } else if (try isRowPrompt(term)) {
-        // When OSC 133 marked an input span on this row, paint
-        // `ghostel-prompt' only over the prefix preceding the input —
-        // otherwise the typed input gets covered too, defeating the
-        // historical-input linkification that the skip predicate is
-        // designed to allow (it short-circuits on `ghostel-prompt`).
-        const prompt_end: i64 = if (content.input_end_char > content.input_start_char)
-            row_start + @as(i64, @intCast(content.input_start_char))
-        else
-            after_insert - 1; // exclude trailing newline
-        if (prompt_end > row_start) {
-            env.putTextProperty(
-                env.makeInteger(row_start),
-                env.makeInteger(prompt_end),
-                emacs.sym.@"ghostel-prompt",
-                env.t(),
-            );
-        }
-    }
-
-    if (content.input_end_char > content.input_start_char) {
-        env.putTextProperty(
-            env.makeInteger(row_start + @as(i64, @intCast(content.input_start_char))),
-            env.makeInteger(row_start + @as(i64, @intCast(content.input_end_char))),
-            emacs.sym.@"ghostel-input",
-            env.t(),
-        );
     }
 }
 
@@ -567,7 +515,7 @@ pub fn render(env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) !v
             const dirty_row = dirty_full or try gt.rs_row.get(bool, term.row_iterator, gt.RS_ROW_DATA_DIRTY);
             if (dirty_row) {
                 env.deleteRegion(env.point(), env.lineBeginningPosition2());
-                try insertAndStyle(env, term, &default_colors);
+                try insertRow(env, term, &default_colors);
             } else {
                 _ = env.forwardLine(1);
             }
@@ -582,7 +530,6 @@ pub fn render(env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) !v
 }
 
 pub fn renderCursor(env: emacs.Env, term: *Terminal) !void {
-
     // Walk to the current viewport start
     gotoActiveStart(env, term);
     const active_start_int = env.extractInteger(env.point());
