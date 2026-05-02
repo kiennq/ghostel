@@ -28,11 +28,6 @@ __ghostel_osc7() {
 
 # Emit "command finished" (D) for the previous command.
 # D is skipped on the very first prompt (no previous command).
-# 133;A and 133;B are embedded in PS1 itself (see below) so they fire
-# in lockstep with prompt rendering, including readline redraws (bash 5.x
-# redraws the prompt after bracketed-paste-mode setup; if 133;A came from
-# PROMPT_COMMAND it would only fire once, leaving the redrawn prompt
-# cells outside the PROMPT scope).
 __ghostel_prompt_start() {
     if [[ -n "$__ghostel_prompt_shown" ]]; then
         printf '\e]133;D;%s\e\\' "$__ghostel_last_status"
@@ -40,14 +35,41 @@ __ghostel_prompt_start() {
     __ghostel_prompt_shown=1
 }
 
-# Emit "command output start" (C) via the DEBUG trap.
+# Emit "command output start" (C) via the DEBUG trap, and restore the
+# unmarked PS1/PS2 so the user's command (and any other DEBUG-trap
+# observers) doesn't see our markers.  Mirror of the restore-on-precmd
+# logic in `__ghostel_wrapped_prompt_command'.
 # Guard: skip when running inside PROMPT_COMMAND itself.
 __ghostel_in_prompt_command=0
 __ghostel_preexec() {
     [[ "$__ghostel_in_prompt_command" = 1 ]] && return
+    if [[ -n "${__ghostel_marked_ps1+x}" && "$PS1" == "$__ghostel_marked_ps1" ]]; then
+        PS1=$__ghostel_saved_ps1
+        PS2=$__ghostel_saved_ps2
+    fi
     printf '\e]133;C\e\\'
 }
 
+# Wrap PS1/PS2 with 133;A at the start and 133;B at the end.  We inject
+# 133;A after every line break in PS1 too: bash 5.x readline redraws
+# only the last visual line of the prompt (CR + reprint, no preceding
+# 133;A).  Without a 133;A on every line, the redrawn cells fall outside
+# the PROMPT scope and become INPUT-tagged.  We inject after both
+# literal newlines and the bash `\n' PS1 escape.
+#
+# `\[ \]' mark the OSC sequence as zero-width for readline's line-wrap
+# math; `\a' is BEL — a valid OSC terminator.  We use BEL rather than
+# ST (ESC \) because `${var//pat/repl}' eats backslashes in the
+# replacement, which would break a multi-line ST-terminated marker.
+#
+# Re-wrap from PROMPT_COMMAND each cycle: `.bashrc' or a prompt theme
+# loaded after this file commonly reassigns PS1, stripping our wrap.
+# Each cycle:
+#   1. Restore the unmarked PS1/PS2 if nobody touched them since our
+#      last wrap — keeps user PROMPT_COMMAND additions and themes that
+#      pattern-match $PS1 from seeing markers.
+#   2. Run the user's captured PROMPT_COMMAND (may rewrite $PS1).
+#   3. Re-wrap.  Skip if PS1 already has our marker (defensive).
 __ghostel_wrapped_prompt_command() {
     # Capture $? FIRST.  A bare assignment such as
     # `__ghostel_in_prompt_command=1' on its own line counts as a
@@ -58,33 +80,39 @@ __ghostel_wrapped_prompt_command() {
     local __ghostel_status=$?
     __ghostel_in_prompt_command=1
     __ghostel_last_status=$__ghostel_status
+
+    if [[ -n "${__ghostel_marked_ps1+x}" && "$PS1" == "$__ghostel_marked_ps1" ]]; then
+        PS1=$__ghostel_saved_ps1
+        PS2=$__ghostel_saved_ps2
+    fi
+
     __ghostel_prompt_start
     __ghostel_osc7
+
     eval "${__ghostel_original_prompt_command:-}"
+
+    local __ghostel_marker='\[\e]133;A\a\]'
+    if [[ "$PS1" != *"$__ghostel_marker"* ]]; then
+        __ghostel_saved_ps1=$PS1
+        __ghostel_saved_ps2=$PS2
+        local __ghostel_ps1_a='\[\e]133;A\a\]'
+        local __ghostel_ps1_b='\[\e]133;B\a\]'
+        PS1="${PS1//$'\n'/$'\n'${__ghostel_ps1_a}}"
+        PS1="${PS1//\\n/\\n${__ghostel_ps1_a}}"
+        PS1="${__ghostel_ps1_a}${PS1}${__ghostel_ps1_b}"
+        # PS2 (continuation): wrap with the same A/B markers so multi-line
+        # input still has a known prompt-prefix → input boundary.
+        PS2="${__ghostel_ps1_a}${PS2}${__ghostel_ps1_b}"
+        __ghostel_marked_ps1=$PS1
+        __ghostel_marked_ps2=$PS2
+    fi
+
     __ghostel_in_prompt_command=0
 }
 
 # Preserve any existing PROMPT_COMMAND.
 __ghostel_original_prompt_command="${PROMPT_COMMAND:+$PROMPT_COMMAND}"
 PROMPT_COMMAND="__ghostel_wrapped_prompt_command"
-
-# Wrap PS1 with 133;A at the start and 133;B at the end. For multi-line
-# prompts we ALSO inject 133;A after every line break in PS1: bash 5.x
-# readline redraws only the last visual line of the prompt (CR + reprint,
-# no preceding 133;A). Without a 133;A on every line, the redrawn cells
-# fall outside the PROMPT scope and become INPUT-tagged.
-# We inject after both literal newlines and the bash `\n' PS1 escape
-# (which expands to a newline at prompt-render time).
-# \[ \] mark the OSC sequence as zero-width for readline's line-wrap math;
-# \a is BEL — a valid OSC terminator. We use BEL rather than ST (ESC \)
-# because `${var//pat/repl}' eats backslashes in the replacement, which
-# would break a multi-line ST-terminated marker.
-__ghostel_ps1_a='\[\e]133;A\a\]'
-__ghostel_ps1_b='\[\e]133;B\a\]'
-PS1="${PS1//$'\n'/$'\n'${__ghostel_ps1_a}}"
-PS1="${PS1//\\n/\\n${__ghostel_ps1_a}}"
-PS1="${__ghostel_ps1_a}${PS1}${__ghostel_ps1_b}"
-unset __ghostel_ps1_a __ghostel_ps1_b
 
 trap '__ghostel_preexec' DEBUG
 

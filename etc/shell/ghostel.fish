@@ -27,16 +27,17 @@ function __ghostel_postexec --on-event fish_postexec
     set -g __ghostel_last_status $status
 end
 
-# Emit "command finished" (D) for the previous command.
-# 133;A and 133;B are emitted by wrapping fish_prompt below so they fire
-# in lockstep with prompt rendering, including any redraws — emitting from
-# `--on-event fish_prompt` handlers (which fire only once per prompt cycle
-# and only before fish_prompt) would leave redraws outside the PROMPT scope.
+# Emit "command finished" (D) for the previous command, then "prompt
+# start" (A) for the new prompt.  Both fire from a fish_prompt event
+# handler so they're independent of the fish_prompt function body —
+# survives mid-session `function fish_prompt' redefinitions that would
+# otherwise drop our wrap.
 function __ghostel_prompt_start --on-event fish_prompt
     if test "$__ghostel_prompt_shown" = 1
         printf '\e]133;D;%s\e\\' "$__ghostel_last_status"
     end
     set -g __ghostel_prompt_shown 1
+    printf '\e]133;A\e\\'
 end
 
 # Emit "command output start" (C) before command runs.
@@ -44,13 +45,29 @@ function __ghostel_preexec --on-event fish_preexec
     printf '\e]133;C\e\\'
 end
 
-# Wrap fish_prompt with 133;A at the start and 133;B at the end so they
-# fire in lockstep with prompt rendering. If the user redefines fish_prompt
-# later, they're responsible for re-sourcing this file.
-if functions -q fish_prompt; and not functions -q __ghostel_orig_fish_prompt
+# Wrap fish_prompt to emit 133;B (input boundary) at the end of every
+# prompt render.  Fish has no "after fish_prompt" event, so we wrap the
+# function itself.
+#
+# Deferred to fire-time via `--on-event fish_prompt' so themes/plugins
+# loaded after ghostel.fish (later in config.fish or in conf.d/) have
+# already defined fish_prompt before we wrap it.  Re-checks each fire
+# and re-wraps if our wrap was removed (e.g. user redefined fish_prompt
+# mid-session).  One-prompt warmup is the trade-off: if a theme's own
+# `--on-event fish_prompt' handler runs after ours and redefines
+# fish_prompt, this fire is unwrapped but the next is wrapped.
+function __ghostel_ensure_fish_prompt_wrap --on-event fish_prompt
+    functions -q fish_prompt; or return
+    # Skip if already wrapped — detect via a sentinel comment in the
+    # wrapped body.  Cheaper and more robust than comparing function
+    # bodies, since fish preserves comments in `functions <name>' output.
+    if functions fish_prompt | string match -q '*__ghostel_wrapped*'
+        return
+    end
+    functions -e __ghostel_orig_fish_prompt 2>/dev/null
     functions -c fish_prompt __ghostel_orig_fish_prompt
     function fish_prompt
-        printf '\e]133;A\e\\'
+        # __ghostel_wrapped — sentinel for the idempotency check above.
         __ghostel_orig_fish_prompt
         printf '\e]133;B\e\\'
     end
