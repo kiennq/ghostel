@@ -3,6 +3,7 @@
 /// Provides type-safe access to emacs_env functions, cached symbol
 /// interning, and helper methods for common operations.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const c = @cImport({
     // Ensure struct timespec is fully defined on Linux (glibc gates it
@@ -263,12 +264,61 @@ pub const Env = struct {
         return func(self.raw, str.ptr, @intCast(str.len));
     }
 
+    // --- Logging and debugging ---
+
     /// Signal an error with a message string.
     pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
             self.intern("error"),
             self.call1(self.intern("list"), self.makeString(msg)),
         );
+    }
+
+    /// Signal an error with a formatted message string.
+    pub fn signalErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        callFmt(self, Env.signalError, fmt, args);
+    }
+
+    pub fn message(self: Env, msg: []const u8) void {
+        _ = self.call1(sym.message, self.makeString(msg));
+    }
+
+    pub fn messagef(self: Env, comptime fmt: []const u8, args: anytype) void {
+        callFmt(self, Env.message, fmt, args);
+    }
+
+    pub fn logError(self: Env, msg: []const u8) void {
+        _ = self.call3(sym.@"display-warning", sym.ghostel, self.makeString(msg), sym.@":error");
+    }
+
+    pub fn logErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        callFmt(self, Env.logError, fmt, args);
+    }
+
+    /// Writes stack trace as Emacs messages if in debug mode
+    pub fn logStackTrace(self: Env, stack_trace: ?*std.builtin.StackTrace) void {
+        if (comptime builtin.mode == .Debug) {
+            if (stack_trace) |trace| {
+                var buffer: [4096]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&buffer);
+                const debug_info = std.debug.getSelfDebugInfo() catch |err| {
+                    self.logErrorf("Unable to get debug info: {s}", .{@errorName(err)});
+                    return;
+                };
+                std.debug.writeStackTrace(trace.*, &writer, debug_info, .no_color) catch |err| {
+                    self.logErrorf("Unable to print stack trace: {s}", .{@errorName(err)});
+                    return;
+                };
+                self.logError(buffer[0..writer.end]);
+            }
+        }
+    }
+
+    fn callFmt(self: Env, func: anytype, comptime fmt: []const u8, args: anytype) void {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.print(fmt, args) catch {};
+        @call(.auto, func, .{ self, buffer[0..writer.end] });
     }
 };
 
@@ -354,6 +404,12 @@ pub const Sym = struct {
     @"ghostel--kitty-display-image": Value,
     @"ghostel--kitty-display-virtual": Value,
     @"ghostel--kitty-clear": Value,
+
+    // Debugging and logging
+    message: Value,
+    @"display-warning": Value,
+    @":error": Value,
+    ghostel: Value,
 };
 
 pub var sym: Sym = undefined;

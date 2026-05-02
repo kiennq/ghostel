@@ -12,28 +12,19 @@ const ppm = @import("ppm.zig");
 /// Query all visible kitty graphics placements from libghostty and
 /// emit them to Elisp for display.  Called after render_state_update()
 /// during each redraw.
-pub fn emitPlacements(env: emacs.Env, term: *Terminal) void {
+pub fn emitPlacements(env: emacs.Env, term: *Terminal) !void {
     // Obtain the kitty graphics handle from the terminal.
-    var graphics: gt.KittyGraphics = undefined;
-    if (gt.c.ghostty_terminal_get(
-        term.terminal,
-        gt.DATA_KITTY_GRAPHICS,
-        @ptrCast(&graphics),
-    ) != gt.SUCCESS) return;
+    const graphics = try gt.terminal_data.get(gt.KittyGraphics, term.terminal, gt.DATA_KITTY_GRAPHICS);
 
     // Create a placement iterator.
     var iterator: gt.KittyGraphicsPlacementIterator = undefined;
-    if (gt.c.ghostty_kitty_graphics_placement_iterator_new(null, &iterator) != gt.SUCCESS) return;
+    try gt.toError(gt.c.ghostty_kitty_graphics_placement_iterator_new(null, &iterator));
     defer gt.c.ghostty_kitty_graphics_placement_iterator_free(iterator);
 
     // Populate it from the storage.
-    if (gt.c.ghostty_kitty_graphics_get(
-        graphics,
-        gt.c.GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR,
-        @ptrCast(&iterator),
-    ) != gt.SUCCESS) return;
+    try gt.kitty_graphics_data.read(graphics, gt.c.GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR, &iterator);
 
-    // Iterate over all placements.
+    // Iterate over all placements. Per-placement errors skip that placement only.
     while (gt.c.ghostty_kitty_graphics_placement_next(iterator)) {
         emitOnePlacement(env, term, graphics, iterator) catch continue;
     }
@@ -46,21 +37,11 @@ fn emitOnePlacement(
     iterator: gt.KittyGraphicsPlacementIterator,
 ) !void {
     // Get image ID and check if virtual.
-    var image_id: u32 = 0;
-    var is_virtual: bool = false;
-    if (gt.c.ghostty_kitty_graphics_placement_get(
-        iterator,
-        gt.c.GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID,
-        @ptrCast(&image_id),
-    ) != gt.SUCCESS) return error.PlacementQuery;
+    const image_id = try gt.kitty_placement_data.get(u32, iterator, gt.c.GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID);
     // Failure to query is_virtual would silently misclassify the
     // placement as non-virtual; for virtuals, render_info reports
     // viewport_visible=false and we'd silently drop the image.
-    if (gt.c.ghostty_kitty_graphics_placement_get(
-        iterator,
-        gt.c.GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL,
-        @ptrCast(&is_virtual),
-    ) != gt.SUCCESS) return error.PlacementQuery;
+    const is_virtual = try gt.kitty_placement_data.get(bool, iterator, gt.c.GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL);
 
     // Look up the image.
     const image = gt.c.ghostty_kitty_graphics_image(graphics, image_id) orelse return error.ImageNotFound;
