@@ -969,6 +969,33 @@ the buffer-local override installed by `ghostel-mode', strips every
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: set-buffer-face only called with ghostel-default colors
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-set-buffer-face-uses-default-face-colors ()
+  "Regression: New terminal colors should not flicker.
+ghostel--set-buffer-face must only ever receive ghostel-default face colors in
+new terminal. Regression guard against color flickering."
+  (let ((buf (generate-new-buffer " *ghostel-test-face-colors*"))
+        (calls nil))
+    (unwind-protect
+        (let ((expected-fg (ghostel--face-hex-color 'ghostel-default :foreground))
+              (expected-bg (ghostel--face-hex-color 'ghostel-default :background)))
+          (cl-letf (((symbol-function 'ghostel--start-process) (lambda () nil))
+                    ((symbol-function 'ghostel--set-buffer-face)
+                     (lambda (fg bg) (push (list fg bg) calls))))
+            (ghostel--init-buffer buf)
+            (with-current-buffer buf
+              (let ((inhibit-read-only t))
+                (ghostel--write-input ghostel--term "hello")
+                (ghostel--redraw ghostel--term t))))
+          (should calls)
+          (dolist (call calls)
+            (should (equal expected-fg (car call)))
+            (should (equal expected-bg (cadr call)))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: multi-byte character rendering (box drawing, Unicode)
 ;; -----------------------------------------------------------------------
 
