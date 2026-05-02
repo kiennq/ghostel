@@ -564,8 +564,8 @@ fn getDefaultColors(term: *Terminal) !BgFg {
 }
 
 pub fn render(env: emacs.Env, term: *Terminal, skip: usize, force_full: bool) !void {
-    const default_colors = try getDefaultColors(term);
     try gt.renderStateUpdate(term.render_state, term.terminal);
+    const default_colors = try getDefaultColors(term);
     var has_wide_chars: bool = false;
 
     // Check dirty state.
