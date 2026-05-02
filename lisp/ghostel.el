@@ -853,7 +853,8 @@ Leaving the prompt empty downloads the latest release."
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
     (if (ghostel--download-module dir version latest-release)
-        (progn
+        (if (featurep 'ghostel-module)
+            (message "ghostel: module downloaded.  Restart Emacs to load the new version")
           (module-load mod)
           (message "ghostel: module loaded successfully"))
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
