@@ -378,6 +378,18 @@ Errors in hook functions are demoted to messages via
 non-nil so the debugger can fire)."
   :type 'hook)
 
+(defcustom ghostel-pre-spawn-hook nil
+  "Hook run inside `ghostel--spawn-pty' just before `make-process'.
+Each function is called with no arguments in the buffer that will
+host the new process.  `process-environment' is dynamically bound
+to the env that will be passed to the child, so hook functions can
+inject or override entries with `setenv' and the spawned process
+inherits them.
+
+Use this hook for one-time pre-spawn setup; see `ghostel-environment'
+for static env entries that don't depend on runtime state."
+  :type 'hook)
+
 (defcustom ghostel-eval-cmds '(("find-file" find-file)
                                ("find-file-other-window" find-file-other-window)
                                ("dired" dired)
@@ -3534,25 +3546,30 @@ matches the PTY window size, and stores the process in
          (tramp-terminal-type (if remote-p
                                   (ghostel--remote-tramp-terminal-type
                                    extra-env)
-                                tramp-terminal-type))
-         (proc (make-process
-                :name "ghostel"
-                :buffer (current-buffer)
-                :command shell-command
-                :connection-type 'pty
-                :file-handler remote-p
-                :filter #'ghostel--filter
-                :sentinel #'ghostel--sentinel)))
-    (setq ghostel--process proc)
-    ;; Raw binary I/O — no encoding/decoding by Emacs
-    (set-process-coding-system proc 'binary 'binary)
-    ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
-    ;; the program's line editor (readline/ZLE) can render properly.
-    (set-process-window-size proc height width)
-    (set-process-query-on-exit-flag proc nil)
-    (process-put proc 'adjust-window-size-function
-                 #'ghostel--window-adjust-process-window-size)
-    proc))
+                                tramp-terminal-type)))
+    ;; Pre-spawn hook: runs while `process-environment' is dynamically
+    ;; bound to the about-to-be-spawned env, so hook functions can
+    ;; `setenv' to inject/override entries that the child inherits.
+    ;; See `ghostel-pre-spawn-hook'.
+    (run-hooks 'ghostel-pre-spawn-hook)
+    (let ((proc (make-process
+                 :name "ghostel"
+                 :buffer (current-buffer)
+                 :command shell-command
+                 :connection-type 'pty
+                 :file-handler remote-p
+                 :filter #'ghostel--filter
+                 :sentinel #'ghostel--sentinel)))
+      (setq ghostel--process proc)
+      ;; Raw binary I/O — no encoding/decoding by Emacs
+      (set-process-coding-system proc 'binary 'binary)
+      ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
+      ;; the program's line editor (readline/ZLE) can render properly.
+      (set-process-window-size proc height width)
+      (set-process-query-on-exit-flag proc nil)
+      (process-put proc 'adjust-window-size-function
+                   #'ghostel--window-adjust-process-window-size)
+      proc)))
 
 (defun ghostel--start-process ()
   "Start the shell process with a PTY.

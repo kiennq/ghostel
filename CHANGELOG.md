@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `ghostel-pre-spawn-hook`, run inside `ghostel--spawn-pty` just
+  before `make-process` with `process-environment` dynamically
+  bound to the about-to-be-spawned env.  Hook functions can
+  `setenv` to inject entries the child inherits.  Intended for
+  integrations like with-editor — with a `with-editor-setup-environment`
+  exposed upstream, users can wire Magit's `EDITOR` plumbing into
+  ghostel buffers via
+  `(add-hook 'ghostel-pre-spawn-hook
+            #'with-editor-setup-environment)`.  Fires for both
+  `ghostel`/`ghostel-project` and `ghostel-exec` spawns;
+  `ghostel-compile` has its own `make-process` and is not covered.
+
 ### Fixed
 - Launching `M-x ghostel` from a TRAMP `default-directory` (e.g.
   after `find-file /ssh:host:`) now produces a usable remote shell.

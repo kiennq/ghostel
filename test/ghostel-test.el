@@ -8315,6 +8315,47 @@ buffer eventually shows up."
             (should (equal (nth 1 captured) 80))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-pre-spawn-hook-injects-into-process-environment ()
+  "Hook `setenv' calls reach the spawned process via `process-environment'.
+`ghostel-pre-spawn-hook' fires with `process-environment' dynamically
+bound to the about-to-be-spawned env, so hook functions that call
+`setenv' inject entries the child process actually inherits.
+
+Contract relied on by integrations like with-editor: drive a real
+`/bin/sh' through `ghostel--start-process', have the hook `setenv' a
+sentinel value, and verify the value reached `make-process'.  Also
+verifies the hook fires in the spawning buffer with `default-directory'
+intact (with-editor's `with-editor--setup' reads `default-directory')."
+  (let ((captured-env nil)
+        captured-buffer
+        captured-default-directory
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (setq-local ghostel--term-rows 24
+                    ghostel--term-cols 80)
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/sh")
+               (ghostel-shell-integration nil)
+               (default-directory "/tmp/")
+               (test-buffer (current-buffer))
+               (ghostel-pre-spawn-hook
+                (list (lambda ()
+                        (setq captured-buffer (current-buffer))
+                        (setq captured-default-directory default-directory)
+                        (setenv "GHOSTEL_PRE_SPAWN_TEST" "ok"))))
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (progn
+                (should (eq captured-buffer test-buffer))
+                (should (equal captured-default-directory "/tmp/"))
+                (should (member "GHOSTEL_PRE_SPAWN_TEST=ok" captured-env)))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-eshell integration
 ;; -----------------------------------------------------------------------
