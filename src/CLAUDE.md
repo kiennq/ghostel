@@ -1,1 +1,74 @@
-AGENTS.md
+# ghostel/src — Zig coding principles
+
+## Error handling
+
+- **Errors are always errors.** Never swallow with bare `catch {}` or `catch continue` unless you can prove the specific error code means "no value" (see below). Log or propagate every real error.
+- **Know your error codes before mapping them.** `GHOSTTY_INVALID_VALUE` can mean either a programmer error (null handle, bad enum) or "no value configured" depending on which data key you query. Check the libghostty header comment for the specific data key before deciding.
+  - `GHOSTTY_NO_VALUE` → always means "optional absence" — map to `null` via `getOpt`.
+  - `GHOSTTY_INVALID_VALUE` → usually a programmer error, but some cell-level keys use it to mean "no per-cell value, use terminal default" — check the libghostty header comment for the specific key. When it means absence, use `catch |err| switch (err) { gt.Error.InvalidValue => null, else => return err }`.
+
+## C ABI boundary (module.zig callbacks)
+
+Functions with `callconv(.c)` cannot propagate Zig errors — handle them explicitly at the call site:
+
+```zig
+// For paths that can fail deep in the call stack (redraw, encode, emitPlacements):
+something.deepWork() catch |err| {
+    env.logStackTrace(@errorReturnTrace());
+    env.signalErrorf("ghostel: deepWork failed: {s}", .{@errorName(err)});
+    return env.nil();
+};
+
+// For simple one-call getters (getTitle, getScrollbar, getTotalRows, etc.):
+const val = term.getSomething() catch |err| {
+    env.signalErrorf("ghostel: getSomething failed: {s}", .{@errorName(err)});
+    return env.nil();
+};
+
+// For void C callbacks (callconv(.c) returning void), use logErrorf instead of signalErrorf:
+const val = term.getSomething() catch |err| {
+    env.logErrorf("ghostel: getSomething failed: {s}", .{@errorName(err)});
+    return;
+};
+
+// For per-item errors inside a loop where items are independent, log and continue:
+const val = term.getSomething() catch |err| {
+    env.logErrorf("ghostel: getSomething failed: {s}", .{@errorName(err)});
+    continue;
+};
+```
+
+## Accessor pattern (ghostty.zig)
+
+All libghostty `_get` functions that follow `(obj, key, *anyopaque) -> GhosttyResult` are wrapped by `Accessor()`:
+
+```zig
+// Returns !T — propagates all errors
+const val = try gt.terminal_data.get(T, obj, KEY_CONSTANT);
+
+// Returns !?T — maps NO_VALUE to null, propagates other errors
+const opt = try gt.terminal_data.getOpt(T, obj, KEY_CONSTANT);
+
+// Writes into an existing pointer (e.g. to repopulate an iterator in-place)
+try gt.kitty_graphics_data.read(obj, KEY_CONSTANT, &existing_ptr);
+```
+
+Available Accessors (see `ghostty.zig`): `terminal_data`, `row`, `cell`, `rs`, `rs_row`, `rs_row_cells`, `kitty_graphics_data`, `kitty_placement_data`.
+
+`ghostty_terminal_mode_get` has a different signature — use `gt.terminalModeGet(terminal, mode) !bool`.
+
+## Out-pointers
+
+Do not add new functions with out-pointer + bool/null return patterns. Always return `!T` or `!?T`:
+- Use the `Accessor` wrappers for C getter functions.
+- For `_new` constructor calls (opaque object creation), the out-pointer is inherent to the C ABI — use `try gt.toError(gt.c.ghostty_X_new(null, &handle))`.
+
+## C ABI callbacks — do not change calling convention
+
+Any function with `callconv(.c)` is part of a fixed ABI contract with libghostty or Emacs. Do not change its signature, calling convention, or return type without understanding the ABI contract on both sides.
+
+## Build and format workflow
+
+After editing any `.zig` file:
+1. `zig build` — must pass before moving on
+2. Format via Emacs: `(with-current-buffer (find-file-noselect "/path/to/file.zig") (indent-region (point-min) (point-max)) (save-buffer))`
