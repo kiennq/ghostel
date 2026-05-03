@@ -7670,6 +7670,89 @@ setting it to nil forces off."
                                         captured-env)))
                 (when (process-live-p proc) (delete-process proc))))))))))
 
+(ert-deftest ghostel-test-remote-tramp-terminal-type-helper ()
+  "`ghostel--remote-tramp-terminal-type' picks a TERM that restores echo.
+TRAMP's `make-process' handler resets TERM to `tramp-terminal-type'
+\(default \"dumb\"); leaving that unchanged disables readline/ZLE/fish
+line editing on the remote, which manifests as no visual feedback
+while typing (issue #224).  The helper must:
+- advertise `xterm-ghostty' only when bundled terminfo was pushed
+  to the remote via shell integration (TERMINFO=... in extra-env);
+- otherwise fall back to `xterm-256color' (universally available)
+  when the local TERM is `xterm-ghostty';
+- honor a user-customized non-default `ghostel-term' verbatim."
+  (let ((ghostel-term "xterm-ghostty"))
+    ;; No TERMINFO push → safe fallback.
+    (should (equal (ghostel--remote-tramp-terminal-type nil)
+                   "xterm-256color"))
+    (should (equal (ghostel--remote-tramp-terminal-type
+                    '("FOO=bar" "BAZ=qux"))
+                   "xterm-256color"))
+    ;; TERMINFO push → advertise xterm-ghostty.
+    (should (equal (ghostel--remote-tramp-terminal-type
+                    '("TERMINFO=/tmp/ghostel-XYZ"))
+                   "xterm-ghostty"))
+    (should (equal (ghostel--remote-tramp-terminal-type
+                    '("FOO=bar" "TERMINFO=/tmp/ghostel-XYZ"))
+                   "xterm-ghostty")))
+  ;; Non-default `ghostel-term' wins as-is — user opted into a
+  ;; specific TERM and we don't second-guess them.
+  (let ((ghostel-term "xterm-256color"))
+    (should (equal (ghostel--remote-tramp-terminal-type nil)
+                   "xterm-256color"))
+    (should (equal (ghostel--remote-tramp-terminal-type
+                    '("TERMINFO=/tmp/ghostel-XYZ"))
+                   "xterm-256color")))
+  (let ((ghostel-term "screen-256color"))
+    (should (equal (ghostel--remote-tramp-terminal-type nil)
+                   "screen-256color"))))
+
+(ert-deftest ghostel-test-spawn-pty-rebinds-tramp-terminal-type ()
+  "`ghostel--spawn-pty' must rebind `tramp-terminal-type' when REMOTE-P.
+TRAMP's `make-process' handler reads `tramp-terminal-type' inside
+the call and uses it as the remote TERM.  Without this rebinding,
+remote spawns get TERM=dumb and the user sees no echo (issue #224).
+
+Locally, `tramp-terminal-type' must be left alone — there's no
+TRAMP layer in the path."
+  (require 'tramp)
+  (let ((seen-tramp-terminal-type nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq seen-tramp-terminal-type tramp-terminal-type)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (setq-local ghostel--term-rows 25
+                    ghostel--term-cols 80)
+        (let ((tramp-terminal-type "dumb")
+              (ghostel-term "xterm-ghostty")
+              (ghostel-kill-buffer-on-exit nil))
+          ;; Remote spawn without pushed TERMINFO → xterm-256color.
+          (setq seen-tramp-terminal-type nil)
+          (let ((proc (ghostel--spawn-pty
+                       "/bin/sh" nil 25 80 "-ixon" nil t)))
+            (unwind-protect
+                (should (equal seen-tramp-terminal-type
+                               "xterm-256color"))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; Remote spawn with pushed TERMINFO → xterm-ghostty.
+          (setq seen-tramp-terminal-type nil)
+          (let ((proc (ghostel--spawn-pty
+                       "/bin/sh" nil 25 80 "-ixon"
+                       '("TERMINFO=/tmp/ghostel-XYZ") t)))
+            (unwind-protect
+                (should (equal seen-tramp-terminal-type
+                               "xterm-ghostty"))
+              (when (process-live-p proc) (delete-process proc))))
+          ;; Local spawn → leave the binding alone.
+          (setq seen-tramp-terminal-type nil)
+          (let ((proc (ghostel--spawn-pty
+                       "/bin/sh" nil 25 80 "-ixon" nil nil)))
+            (unwind-protect
+                (should (equal seen-tramp-terminal-type "dumb"))
+              (when (process-live-p proc) (delete-process proc)))))))))
+
 (ert-deftest ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix ()
   "TRAMP rewrites INSIDE_EMACS but must preserve the user-set prefix.
 The README's manual remote-integration gate
@@ -8907,6 +8990,8 @@ slip past the unit tests."
     ghostel-test-get-shell-local
     ghostel-test-fish-auto-inject-loads-integration
     ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix
+    ghostel-test-remote-tramp-terminal-type-helper
+    ghostel-test-spawn-pty-rebinds-tramp-terminal-type
     ghostel-test-resize-window-adjust
     ghostel-test-resize-nil-size
     ghostel-test-resize-noop-same-dims

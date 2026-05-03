@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Launching `M-x ghostel` from a TRAMP `default-directory` (e.g.
+  after `find-file /ssh:host:`) now produces a usable remote shell.
+  Previously TRAMP's `make-process' handler reset TERM to
+  `tramp-terminal-type' (default `"dumb"'), which caused
+  bash/readline, zsh/ZLE, and fish to disable interactive line
+  editing on the remote: typed characters didn't echo, although
+  Enter still submitted the line.  Ghostel now rebinds
+  `tramp-terminal-type' for its remote spawns to `xterm-256color'
+  (or `xterm-ghostty' when `ghostel-tramp-shell-integration' has
+  pushed the bundled terminfo), restoring echo and line editing
+  ([#224](https://github.com/dakra/ghostel/issues/224)).
+
 ## [0.21.0] — 2026-05-01
 
 ### Added

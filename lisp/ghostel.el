@@ -142,7 +142,11 @@ TRAMP caveats:
 - Entries with `=' are propagated to the remote shell.
 - TERM is always reset by TRAMP to `tramp-terminal-type' (see
   `tramp-handle-make-process'); overrides in `ghostel-environment'
-  do not win remotely.
+  do not win remotely.  Ghostel rebinds `tramp-terminal-type' for
+  its own remote spawns (to `xterm-256color', or `xterm-ghostty'
+  when the bundled terminfo is pushed via shell integration), so
+  remote shells get a real terminal type and readline/ZLE keep
+  echoing keystrokes.
 - INSIDE_EMACS is rewritten by TRAMP via `tramp-inside-emacs',
   which appends `,tramp:VER' to whatever value is in scope.  For
   ghostel that means the remote shell sees `ghostel,tramp:VER'
@@ -3446,6 +3450,28 @@ to restore the terminfo/ directory, or customize `ghostel-term' to silence."
         (append env (list "GHOSTEL_SSH_INSTALL_TERMINFO=1"))
       env)))
 
+(defun ghostel--remote-tramp-terminal-type (extra-env)
+  "Return TERM value to bind `tramp-terminal-type' to for a remote spawn.
+TRAMP's `make-process' handler resets TERM to `tramp-terminal-type'
+\(default \"dumb\") regardless of the caller's `process-environment'.
+
+When EXTRA-ENV contains a `TERMINFO=' entry - meaning
+`ghostel--setup-remote-integration' has pushed the bundled
+xterm-ghostty terminfo to the remote - advertise `xterm-ghostty'.
+Otherwise fall back to `xterm-256color' (a universally available
+terminfo entry) when `ghostel-term' is `xterm-ghostty', or honor a
+non-default `ghostel-term' verbatim."
+  (let ((terminfo-pushed
+         (seq-some (lambda (e)
+                     (and (stringp e) (string-prefix-p "TERMINFO=" e)))
+                   extra-env)))
+    (cond
+     ((and terminfo-pushed (equal ghostel-term "xterm-ghostty"))
+      "xterm-ghostty")
+     ((equal ghostel-term "xterm-ghostty")
+      "xterm-256color")
+     (t ghostel-term))))
+
 (defun ghostel--spawn-pty (program program-args height width stty-flags
                                    extra-env &optional remote-p)
   "Spawn PROGRAM with PROGRAM-ARGS as a PTY-backed process in the current buffer.
@@ -3502,6 +3528,13 @@ matches the PTY window size, and stores the process in
          ;; `make-process' time, so they must be let-bound here.
          (process-adaptive-read-buffering nil)
          (read-process-output-max (max read-process-output-max (* 1024 1024)))
+         ;; TRAMP's `make-process' handler resets TERM to
+         ;; `tramp-terminal-type' (defaults to "dumb") regardless of
+         ;; what we put in `process-environment'.
+         (tramp-terminal-type (if remote-p
+                                  (ghostel--remote-tramp-terminal-type
+                                   extra-env)
+                                tramp-terminal-type))
          (proc (make-process
                 :name "ghostel"
                 :buffer (current-buffer)
