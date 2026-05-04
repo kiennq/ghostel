@@ -15,7 +15,7 @@ const sys = @import("sys.zig");
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.22.0";
+const version = "0.22.1";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -370,11 +370,14 @@ fn dispatchPostWriteOscs(env: emacs.Env, term: *Terminal, data: []const u8) void
                     env.makeString(b64),
                 );
             },
-            // OSC 133: semantic prompt markers (A/B/C/D).
+            // OSC 133: semantic prompt markers (A/B/C/D/P).  P is
+            // "explicit prompt start" — same as A for navigation but
+            // without libghostty's fresh-line side effect, used by the
+            // zsh `zle-line-init' fallback when PROMPT-wrap was lost.
             133 => {
                 if (osc.payload.len == 0) continue;
                 const marker_type = osc.payload[0];
-                if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D') continue;
+                if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D' and marker_type != 'P') continue;
                 const has_param = osc.payload.len > 1 and osc.payload[1] == ';';
                 const param_data = if (has_param) osc.payload[2..] else &[_]u8{};
                 const type_str: [1]u8 = .{marker_type};

@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.22.0
+;; Version: 0.22.1
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -668,7 +668,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.22.0"
+(defconst ghostel--minimum-module-version "0.22.1"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -2608,14 +2608,16 @@ Two distinct artifacts both surface here:
 
 (defun ghostel--osc133-marker (type param)
   "Handle an OSC 133 semantic prompt marker from the Zig module.
-TYPE is a single character string: A, B, C, or D.
+TYPE is a single character string: A, B, C, D, or P.
 PARAM is the exit status string for type D, or nil.
 Note: the `ghostel-prompt' text property is applied by the native
 render loop (which queries libghostty's per-row semantic state),
 not here.  This handler only tracks prompt positions and exit status."
   (pcase type
-    ("A"
-     ;; Prompt start — record line number.
+    ((or "A" "P")
+     ;; Prompt start — record line number.  P is the explicit
+     ;; prompt-start marker (no fresh-line side effect); both mark
+     ;; a navigable prompt position.
      (push (cons (count-lines (point-min) (point-max)) nil)
            ghostel--prompt-positions))
     ("C"

@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.22.1] — 2026-05-04
+
 ### Fixed
 - Loading `ghostel.el` no longer prompts to download or compile the
   native module under any circumstances.  Previously `ghostel.el`
