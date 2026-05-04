@@ -8795,7 +8795,9 @@ send, and the coalesce-buffer state."
 (ert-deftest ghostel-test-debug-info-environment-section ()
   "`ghostel-debug-info' renders the Environment section.
 The section shows the spawn env ghostel hands the shell (TERM,
-COLORTERM, INSIDE_EMACS, …) plus pass-through LANG/LC_*."
+COLORTERM, INSIDE_EMACS, …) plus pass-through LANG/LC_*.  In a
+non-ghostel buffer (no `default-directory' override), the local-spawn
+branch fires and emits the full TERM/COLORTERM line set."
   (let ((display-buffer-overriding-action '(display-buffer-no-window))
         (inhibit-message t)
         (ghostel--terminfo-warned t))
@@ -8806,7 +8808,8 @@ COLORTERM, INSIDE_EMACS, …) plus pass-through LANG/LC_*."
             (with-current-buffer "*ghostel-debug*"
               (let ((content (buffer-string)))
                 (should (string-match-p "--- Environment ---" content))
-                (should (string-match-p "Spawn env" content))
+                (should (string-match-p "Spawn env (set by ghostel, local spawn)"
+                                        content))
                 (should (string-match-p "INSIDE_EMACS=ghostel" content))
                 (should (string-match-p "^  TERM=" content))
                 (should (string-match-p "COLORTERM=" content))
@@ -8814,6 +8817,257 @@ COLORTERM, INSIDE_EMACS, …) plus pass-through LANG/LC_*."
                 (should (string-match-p "LANG=" content))))))
       (when (get-buffer "*ghostel-debug*")
         (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-debug-info-environment-section-remote-labeling ()
+  "Remote ghostel buffer → Environment section hides local-spawn vars.
+For a remote ghostel buffer the on-remote `/bin/sh -c' preamble owns
+TERM/TERMINFO/TERM_PROGRAM/COLORTERM (issue #224 fix), so showing the
+local `(ghostel--terminal-env)' as if it were the spawn env is
+misleading.  Verify the new label fires and TERM/COLORTERM lines are
+suppressed; INSIDE_EMACS still shows because it's pushed regardless."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t))
+    (unwind-protect
+        (save-window-excursion
+          (ghostel-test--with-compile-buffer buf
+            (setq-local default-directory "/ssh:host.example.com:/tmp/")
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                (should (string-match-p
+                         "Spawn env (set by ghostel, remote spawn)"
+                         content))
+                (should (string-match-p "INSIDE_EMACS=ghostel" content))
+                ;; Local-only entries must not appear under "Spawn env".
+                ;; The Pass-through section still shows LANG.
+                (should-not (string-match-p "^  TERM=" content))
+                (should-not (string-match-p "^  TERMINFO=" content))
+                (should-not (string-match-p "^  COLORTERM=" content))
+                ;; The clarifying note pointing the user to the wrapper.
+                (should (string-match-p
+                         "set by the on-remote /bin/sh -c preamble"
+                         content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-debug-info-tramp-section-on-remote ()
+  "`ghostel-debug-info' adds a TRAMP section for remote ghostel buffers.
+TRAMP knobs that load-bear in `make-process' dispatch (and that
+silently misbehave for #224-class bugs) belong in the standard report."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t))
+    (unwind-protect
+        (save-window-excursion
+          (ghostel-test--with-compile-buffer buf
+            (setq-local default-directory "/ssh:host.example.com:/tmp/")
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                (should (string-match-p "^--- TRAMP ---" content))
+                (should (string-match-p "tramp-version:" content))
+                (should (string-match-p "tramp-terminal-type:" content))
+                (should (string-match-p "direct-async (global):" content))
+                (should (string-match-p "direct-async (effective):" content))
+                (should (string-match-p "Would dispatch direct-async:" content))
+                (should (string-match-p "Multi-hop length:" content))
+                (should (string-match-p "TERM (current):" content))
+                (should (string-match-p "TERM (toplevel):" content))
+                (should (string-match-p
+                         "TRAMP would strip pushed TERM:" content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-debug-info-tramp-section-absent-locally ()
+  "Local ghostel buffer → no TRAMP section.
+Avoids cluttering local-only reports with TRAMP irrelevancies."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t))
+    (unwind-protect
+        (save-window-excursion
+          (ghostel-test--with-compile-buffer buf
+            (setq-local default-directory "/tmp/")
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (should-not (string-match-p "^--- TRAMP ---"
+                                          (buffer-string))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-debug-info-spawn-capture-absent ()
+  "`ghostel-debug-info' notes the missing capture in plain ghostel buffers.
+The hint must point users to `ghostel-debug-ghostel' so they know how
+to capture spawn-time diagnostics on the next reproduction."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t))
+    (unwind-protect
+        (save-window-excursion
+          (ghostel-test--with-compile-buffer buf
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                (should (string-match-p "^--- Spawn capture ---" content))
+                (should (string-match-p "no capture" content))
+                (should (string-match-p "ghostel-debug-ghostel" content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-debug-info-spawn-capture-renders ()
+  "`ghostel-debug-info' renders the spawn capture when present.
+Drives the renderer with a synthesized capture plist that mimics what
+`ghostel-debug-ghostel' would have stashed for a remote spawn.  Asserts
+the wrapper script, geometry, env delta, and PTY-output / send-key
+sections all materialize."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t))
+    (unwind-protect
+        (save-window-excursion
+          (ghostel-test--with-compile-buffer buf
+            (setq-local ghostel-debug--spawn-capture
+                        (list :time (current-time)
+                              :default-directory "/ssh:host.example.com:/tmp/"
+                              :remote-p t
+                              :program "/bin/bash"
+                              :program-args nil
+                              :height 24 :width 80
+                              :stty-flags "erase '^?' iutf8 -ixon"
+                              :extra-env nil
+                              :process-environment
+                              '("INSIDE_EMACS=ghostel"
+                                "TERM=xterm-ghostty"
+                                "PATH=/usr/bin")
+                              :command
+                              '("/bin/sh" "-c"
+                                "TERM=xterm-256color; if infocmp xterm-ghostty >/dev/null 2>&1; then TERM=xterm-ghostty; fi; export TERM; exec /bin/bash")
+                              :filter-bytes "\e]0;hostname\007$ "
+                              :filter-cap 4096
+                              :filter-truncated nil
+                              :send-keys
+                              (list (cons (current-time) "l")
+                                    (cons (current-time) "s"))
+                              :send-cap 64
+                              :send-truncated nil))
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                (should (string-match-p "^--- Spawn capture ---" content))
+                (should (string-match-p "Captured at:" content))
+                (should (string-match-p "Remote-p:            yes" content))
+                (should (string-match-p "Program:             /bin/bash"
+                                        content))
+                (should (string-match-p "Geometry:            80x24" content))
+                ;; The wrapper script — load-bearing for #224.
+                (should (string-match-p "Wrapper command sent" content))
+                (should (string-match-p "infocmp xterm-ghostty" content))
+                ;; Env delta header.
+                (should (string-match-p "process-environment at spawn"
+                                        content))
+                ;; First PTY output preview.
+                (should (string-match-p "First PTY output" content))
+                ;; First sends preview.
+                (should (string-match-p "First sends" content))
+                (should (string-match-p "\"l\"" content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-debug-capture-filter-bounded ()
+  "`ghostel-debug--capture-filter' caps :filter-bytes and flags truncation.
+Keeps the first :filter-cap bytes verbatim, sets :filter-truncated once
+overflow occurs, and stops growing afterwards (so steady-state shell
+output doesn't accumulate unboundedly)."
+  (ghostel-test--with-compile-buffer buf
+    (setq-local ghostel-debug--spawn-capture
+                (list :filter-bytes ""
+                      :filter-cap 16
+                      :filter-truncated nil))
+    (let ((proc (make-pipe-process :name "ghostel-test-capture"
+                                   :buffer buf :noquery t)))
+      (unwind-protect
+          (progn
+            (ghostel-debug--capture-filter proc "0123456789")
+            (should (equal (plist-get ghostel-debug--spawn-capture
+                                      :filter-bytes)
+                           "0123456789"))
+            (should-not (plist-get ghostel-debug--spawn-capture
+                                   :filter-truncated))
+            ;; This chunk overflows the 16-byte cap (10 + 10 = 20).
+            (ghostel-debug--capture-filter proc "ABCDEFGHIJ")
+            (should (equal (plist-get ghostel-debug--spawn-capture
+                                      :filter-bytes)
+                           "0123456789ABCDEF"))
+            (should (plist-get ghostel-debug--spawn-capture
+                               :filter-truncated))
+            ;; Further chunks no-op against the cap.
+            (ghostel-debug--capture-filter proc "more")
+            (should (equal (plist-get ghostel-debug--spawn-capture
+                                      :filter-bytes)
+                           "0123456789ABCDEF")))
+        (delete-process proc)))))
+
+(ert-deftest ghostel-test-debug-capture-send-bounded ()
+  "`ghostel-debug--capture-send-string' caps :send-keys and flags truncation."
+  (ghostel-test--with-compile-buffer buf
+    (setq-local ghostel-debug--spawn-capture
+                (list :send-keys nil
+                      :send-cap 2
+                      :send-truncated nil))
+    (ghostel-debug--capture-send-string "a")
+    (ghostel-debug--capture-send-string "b")
+    (should (= 2 (length (plist-get ghostel-debug--spawn-capture
+                                    :send-keys))))
+    (should-not (plist-get ghostel-debug--spawn-capture :send-truncated))
+    (ghostel-debug--capture-send-string "c")
+    (should (= 2 (length (plist-get ghostel-debug--spawn-capture
+                                    :send-keys))))
+    (should (plist-get ghostel-debug--spawn-capture :send-truncated))))
+
+(ert-deftest ghostel-test-debug-ghostel-installs-spawn-pty-advice ()
+  "`ghostel-debug-ghostel' wires up self-removing advice on `ghostel--spawn-pty'.
+Confirms the around-advice fires (capturing arguments into a buffer-
+local plist) and that it removes itself after the spawn so subsequent
+plain `ghostel' calls aren't instrumented.  Stubs out `make-process'
+so no actual shell is spawned."
+  (let ((native-comp-enable-subr-trampolines nil)
+        (display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 ;; Return a dummy process object so the advice still
+                 ;; records :command from (process-command proc).
+                 (apply orig-make-process
+                        (plist-put plist :command '("true"))))))
+      (let* ((buf (generate-new-buffer " *ghostel-test-debug-ghostel*"))
+             ;; Stub `ghostel' to call `ghostel--spawn-pty' synchronously
+             ;; in `buf' — mimics the path through `ghostel--start-process'
+             ;; without dragging in module load, buffer init, etc.
+             (calls 0))
+        (cl-letf (((symbol-function #'ghostel)
+                   (lambda (&rest _arg)
+                     (with-current-buffer buf
+                       (setq-local ghostel--term-rows 24)
+                       (setq-local ghostel--term-cols 80)
+                       (cl-incf calls)
+                       (ghostel--spawn-pty "/bin/sh" nil 24 80
+                                           "-ixon" nil nil)))))
+          (unwind-protect
+              (progn
+                (ghostel-debug-ghostel)
+                ;; Advice should have removed itself.
+                (should-not (advice-member-p
+                             #'ghostel-debug--capture-spawn-pty
+                             'ghostel--spawn-pty))
+                ;; And the buffer-local capture should be populated.
+                (let ((cap (buffer-local-value
+                            'ghostel-debug--spawn-capture buf)))
+                  (should cap)
+                  (should (eq 24 (plist-get cap :height)))
+                  (should (eq 80 (plist-get cap :width)))
+                  (should (equal "/bin/sh" (plist-get cap :program)))
+                  (should (consp (plist-get cap :command)))))
+            (when (buffer-live-p buf)
+              (let ((p (buffer-local-value 'ghostel--process buf)))
+                (when (processp p) (delete-process p)))
+              (kill-buffer buf))))))))
 
 
 ;;; Cell pixel scale (DPI heuristic + reported dimensions)
@@ -9480,6 +9734,14 @@ slip past the unit tests."
     ghostel-test-terminfo-directory-finds-bundled
     ghostel-test-debug-keypress-renders-capture
     ghostel-test-debug-info-environment-section
+    ghostel-test-debug-info-environment-section-remote-labeling
+    ghostel-test-debug-info-tramp-section-on-remote
+    ghostel-test-debug-info-tramp-section-absent-locally
+    ghostel-test-debug-info-spawn-capture-absent
+    ghostel-test-debug-info-spawn-capture-renders
+    ghostel-test-debug-capture-filter-bounded
+    ghostel-test-debug-capture-send-bounded
+    ghostel-test-debug-ghostel-installs-spawn-pty-advice
     ghostel-test-uri-at-pos-prefers-string-help-echo
     ghostel-test-uri-at-pos-calls-native-for-function-help-echo
     ghostel-test-native-link-help-echo-calls-uri-at-pos
