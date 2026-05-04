@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- No-echo on remote shells launched from a TRAMP `default-directory`
+  (`ghostel-tramp-shell-integration nil`).  The previous fix
+  rebound `tramp-terminal-type`, which only takes effect on the
+  generic `tramp-handle-make-process` path; the ssh-method path
+  (`tramp-sh-handle-make-process`) ignores it.  In addition, when
+  the local default-toplevel `process-environment` already has
+  `TERM=xterm-ghostty` (e.g. Emacs launched from ghostty),
+  `tramp-local-environment-variable-p` strips ghostel's pushed
+  TERM as "ambient", and the remote shell inherits TERM=dumb from
+  TRAMP's connection shell — disabling readline/ZLE/fish line
+  editing.
+
+  The per-spawn `/bin/sh -c` wrapper now sets TERM itself on the
+  remote, after probing for `xterm-ghostty` terminfo via
+  `infocmp`.  Single path covers auto-integration (TERMINFO
+  pushed), manual install (system or `~/.terminfo`), and the
+  bare case (fall back to `xterm-256color` so echo works).  The
+  bogus local TERMINFO path is no longer pushed to the remote.
+  Closes [#224](https://github.com/dakra/ghostel/issues/224)
+  again.
+
+### Added
+- Manual remote-integration setups can now drop the bundled
+  `xterm-ghostty` terminfo at `~/.local/share/ghostel/terminfo/`
+  alongside the shell scripts (`scp -r etc/terminfo/{x,78}` from
+  the local package).  TRAMP-spawned remote shells detect it and
+  prepend the directory to `TERMINFO_DIRS` automatically — no
+  `tic`, no touching `~/.terminfo`.  README "Option 2: Manual
+  setup" updated with the one-shot install recipe.
+
 ## [0.22.0] — 2026-05-04
 
 ### Added

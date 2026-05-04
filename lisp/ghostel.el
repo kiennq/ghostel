@@ -140,13 +140,19 @@ Also honored via `dir-locals.el' for per-project overrides.
 
 TRAMP caveats:
 - Entries with `=' are propagated to the remote shell.
-- TERM is always reset by TRAMP to `tramp-terminal-type' (see
-  `tramp-handle-make-process'); overrides in `ghostel-environment'
-  do not win remotely.  Ghostel rebinds `tramp-terminal-type' for
-  its own remote spawns (to `xterm-256color', or `xterm-ghostty'
-  when the bundled terminfo is pushed via shell integration), so
-  remote shells get a real terminal type and readline/ZLE keep
-  echoing keystrokes.
+- TERM/TERMINFO/TERM_PROGRAM/TERM_PROGRAM_VERSION/COLORTERM here
+  are ignored for remote spawns and overridden unconditionally by
+  the per-spawn `/bin/sh -c' wrapper after `infocmp'-probing the
+  remote for `xterm-ghostty' terminfo.  TRAMP's
+  `tramp-local-environment-variable-p' filter strips env entries
+  that match the local default top-level `process-environment',
+  so pushing TERM via env was unreliable; the wrapper exports
+  these from inside the remote shell instead, where the filter
+  doesn't reach.  Customize `ghostel-term' (locally, or per-host
+  via dir-locals or `connection-local-set-profile-variables') to
+  change what gets advertised; on a customized branch the wrapper
+  exports `TERM=$ghostel-term' only — no `TERM_PROGRAM*' ghostty
+  advertisement.  Every other entry in this list still propagates.
 - INSIDE_EMACS is rewritten by TRAMP via `tramp-inside-emacs',
   which appends `,tramp:VER' to whatever value is in scope.  For
   ghostel that means the remote shell sees `ghostel,tramp:VER'
@@ -3462,27 +3468,54 @@ to restore the terminfo/ directory, or customize `ghostel-term' to silence."
         (append env (list "GHOSTEL_SSH_INSTALL_TERMINFO=1"))
       env)))
 
-(defun ghostel--remote-tramp-terminal-type (extra-env)
-  "Return TERM value to bind `tramp-terminal-type' to for a remote spawn.
-TRAMP's `make-process' handler resets TERM to `tramp-terminal-type'
-\(default \"dumb\") regardless of the caller's `process-environment'.
+(defun ghostel--remote-term-preamble ()
+  "Return a `/bin/sh' snippet that sets TERM for a remote spawn wrapper.
+Designed to run *on the remote*, inside the per-spawn `/bin/sh -c'
+wrapper, so the choice happens after TRAMP env propagation.  This
+sidesteps `tramp-local-environment-variable-p', which strips
+`TERM=' entries that match the local default top-level
+`process-environment' — leaving the remote shell to inherit
+TERM=dumb from TRAMP's connection shell, and disabling
+readline/ZLE/fish line editing on the remote (issue #224).
 
-When EXTRA-ENV contains a `TERMINFO=' entry - meaning
-`ghostel--setup-remote-integration' has pushed the bundled
-xterm-ghostty terminfo to the remote - advertise `xterm-ghostty'.
-Otherwise fall back to `xterm-256color' (a universally available
-terminfo entry) when `ghostel-term' is `xterm-ghostty', or honor a
-non-default `ghostel-term' verbatim."
-  (let ((terminfo-pushed
-         (seq-some (lambda (e)
-                     (and (stringp e) (string-prefix-p "TERMINFO=" e)))
-                   extra-env)))
-    (cond
-     ((and terminfo-pushed (equal ghostel-term "xterm-ghostty"))
-      "xterm-ghostty")
-     ((equal ghostel-term "xterm-ghostty")
-      "xterm-256color")
-     (t ghostel-term))))
+When `ghostel-term' is the default \"xterm-ghostty\", the snippet:
+1. Prepends ~/.local/share/ghostel/terminfo to TERMINFO_DIRS when
+   that directory holds the bundled entry.  This lets manual
+   setups co-locate terminfo with the shell-integration scripts
+   (see README, \"Option 2: Manual setup\") in one place — no
+   `tic', no touching ~/.terminfo.
+2. Probes via `infocmp xterm-ghostty'.  The probe honors all of
+   ncurses' standard lookup paths (the prepended dir, $TERMINFO,
+   ~/.terminfo, $TERMINFO_DIRS, and the compiled defaults), so
+   it succeeds whenever the entry is reachable any way — bundled,
+   system-installed, or pushed via `ghostel-tramp-shell-integration'.
+   On success, advertise ghostty; on failure, fall back to
+   \"xterm-256color\" (universally available) so echo keeps working.
+
+When `ghostel-term' was customized to anything else, honor it
+verbatim.  `COLORTERM=truecolor' is exported unconditionally."
+  (cond
+   ((equal ghostel-term "xterm-ghostty")
+    (concat
+     ;; Pick up a co-located bundle if the user dropped one alongside
+     ;; the shell integration scripts.  Tilde expands in assignment
+     ;; context per POSIX; ${TERMINFO_DIRS:+:$TERMINFO_DIRS} preserves
+     ;; any prior search list.
+     "if [ -e ~/.local/share/ghostel/terminfo/x/xterm-ghostty ] "
+     "|| [ -e ~/.local/share/ghostel/terminfo/78/xterm-ghostty ]; "
+     "then export TERMINFO_DIRS=~/.local/share/ghostel/terminfo"
+     "${TERMINFO_DIRS:+:$TERMINFO_DIRS}; "
+     "fi; "
+     "TERM=xterm-256color; "
+     "if infocmp xterm-ghostty >/dev/null 2>&1; then "
+     "TERM=xterm-ghostty; "
+     "TERM_PROGRAM=ghostty; TERM_PROGRAM_VERSION=1.3.2; "
+     "export TERM_PROGRAM TERM_PROGRAM_VERSION; "
+     "fi; "
+     "COLORTERM=truecolor; export TERM COLORTERM; "))
+   (t
+    (concat "TERM=" (shell-quote-argument ghostel-term)
+            "; COLORTERM=truecolor; export TERM COLORTERM; "))))
 
 (defun ghostel--spawn-pty (program program-args height width stty-flags
                                    extra-env &optional remote-p)
@@ -3515,19 +3548,28 @@ matches the PTY window size, and stores the process in
   ;; the wrapper so only the target program remains.
   (let* ((shell-command
           (list "/bin/sh" "-c"
-                (concat "stty " stty-flags
-                        (format " rows %d columns %d" height width)
-                        " 2>/dev/null; "
-                        "printf '\\033[H\\033[2J'; exec "
-                        (shell-quote-argument program)
-                        (and program-args
-                             (concat " "
-                                     (mapconcat #'shell-quote-argument
-                                                program-args " "))))))
+                (concat
+                 ;; Remote spawns: pick TERM via an on-remote probe
+                 (and remote-p (ghostel--remote-term-preamble))
+                 "stty " stty-flags
+                 (format " rows %d columns %d" height width)
+                 " 2>/dev/null; "
+                 "printf '\\033[H\\033[2J'; exec "
+                 (shell-quote-argument program)
+                 (and program-args
+                      (concat " "
+                              (mapconcat #'shell-quote-argument
+                                         program-args " "))))))
          (process-environment
           (append
            ghostel-environment
-           (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
+           (cons "INSIDE_EMACS=ghostel"
+                 ;; The remote wrapper sets TERM/TERMINFO/COLORTERM/
+                 ;; TERM_PROGRAM* itself; keeping the local entries
+                 ;; here would also push the local TERMINFO path,
+                 ;; which is meaningless on the remote and (per
+                 ;; terminfo(5)) makes ncurses ignore system entries.
+                 (if remote-p '() (ghostel--terminal-env)))
            extra-env
            process-environment))
          ;; Large TUI redraws (Claude Code, pi on resize) can emit
@@ -3539,14 +3581,7 @@ matches the PTY window size, and stores the process in
          ;; consume a full redraw frame.  Both are captured at
          ;; `make-process' time, so they must be let-bound here.
          (process-adaptive-read-buffering nil)
-         (read-process-output-max (max read-process-output-max (* 1024 1024)))
-         ;; TRAMP's `make-process' handler resets TERM to
-         ;; `tramp-terminal-type' (defaults to "dumb") regardless of
-         ;; what we put in `process-environment'.
-         (tramp-terminal-type (if remote-p
-                                  (ghostel--remote-tramp-terminal-type
-                                   extra-env)
-                                tramp-terminal-type)))
+         (read-process-output-max (max read-process-output-max (* 1024 1024))))
     ;; Pre-spawn hook: runs while `process-environment' is dynamically
     ;; bound to the about-to-be-spawned env, so hook functions can
     ;; `setenv' to inject/override entries that the child inherits.

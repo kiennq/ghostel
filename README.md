@@ -305,15 +305,26 @@ the terminal exits).  You can also enable it for specific shells only:
 
 Copy the integration scripts from ghostel's `etc/shell/` directory to
 each remote host (e.g. `~/.local/share/ghostel/`) and source them from
-your shell configuration.  From a local shell:
+your shell configuration.  Optionally co-locate the bundled
+`xterm-ghostty` terminfo there too — the wrapper that launches a
+TRAMP-spawned remote shell prepends
+`~/.local/share/ghostel/terminfo` to the terminfo search path, so
+ghostty-aware apps (Claude Code, neovim, tmux, …) get their fast
+paths without needing `tic` or `~/.terminfo` (see "Manual install
+\(no auto-machinery)" below for that alternative).  From a local
+shell:
 
 ```bash
-ssh REMOTE 'mkdir -p ~/.local/share/ghostel'
+ssh REMOTE 'mkdir -p ~/.local/share/ghostel/terminfo'
 scp "$EMACS_GHOSTEL_PATH"/etc/shell/ghostel.{bash,zsh,fish} REMOTE:.local/share/ghostel/
+scp -r "$EMACS_GHOSTEL_PATH"/etc/terminfo/{x,78} REMOTE:.local/share/ghostel/terminfo/
 ```
 
 (`$EMACS_GHOSTEL_PATH` is set inside ghostel buffers; outside, substitute
-the install path of the ghostel package.)
+the install path of the ghostel package.  The terminfo `scp` is
+optional — without it, TRAMP-spawned remote shells fall back to
+`TERM=xterm-256color`, which still has working echo and basic
+colors but no ghostty-specific fast paths.)
 
 Then add the appropriate gate to the remote shell config:
 

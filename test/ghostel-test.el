@@ -7670,88 +7670,137 @@ setting it to nil forces off."
                                         captured-env)))
                 (when (process-live-p proc) (delete-process proc))))))))))
 
-(ert-deftest ghostel-test-remote-tramp-terminal-type-helper ()
-  "`ghostel--remote-tramp-terminal-type' picks a TERM that restores echo.
-TRAMP's `make-process' handler resets TERM to `tramp-terminal-type'
-\(default \"dumb\"); leaving that unchanged disables readline/ZLE/fish
-line editing on the remote, which manifests as no visual feedback
-while typing (issue #224).  The helper must:
-- advertise `xterm-ghostty' only when bundled terminfo was pushed
-  to the remote via shell integration (TERMINFO=... in extra-env);
-- otherwise fall back to `xterm-256color' (universally available)
-  when the local TERM is `xterm-ghostty';
-- honor a user-customized non-default `ghostel-term' verbatim."
-  (let ((ghostel-term "xterm-ghostty"))
-    ;; No TERMINFO push → safe fallback.
-    (should (equal (ghostel--remote-tramp-terminal-type nil)
-                   "xterm-256color"))
-    (should (equal (ghostel--remote-tramp-terminal-type
-                    '("FOO=bar" "BAZ=qux"))
-                   "xterm-256color"))
-    ;; TERMINFO push → advertise xterm-ghostty.
-    (should (equal (ghostel--remote-tramp-terminal-type
-                    '("TERMINFO=/tmp/ghostel-XYZ"))
-                   "xterm-ghostty"))
-    (should (equal (ghostel--remote-tramp-terminal-type
-                    '("FOO=bar" "TERMINFO=/tmp/ghostel-XYZ"))
-                   "xterm-ghostty")))
-  ;; Non-default `ghostel-term' wins as-is — user opted into a
-  ;; specific TERM and we don't second-guess them.
-  (let ((ghostel-term "xterm-256color"))
-    (should (equal (ghostel--remote-tramp-terminal-type nil)
-                   "xterm-256color"))
-    (should (equal (ghostel--remote-tramp-terminal-type
-                    '("TERMINFO=/tmp/ghostel-XYZ"))
-                   "xterm-256color")))
-  (let ((ghostel-term "screen-256color"))
-    (should (equal (ghostel--remote-tramp-terminal-type nil)
-                   "screen-256color"))))
+(ert-deftest ghostel-test-remote-term-preamble ()
+  "`ghostel--remote-term-preamble' embeds an `infocmp' probe.
+The probe runs *on the remote* (inside the per-spawn wrapper), so
+TERM is decided after env propagation — sidestepping
+`tramp-local-environment-variable-p', which would otherwise strip
+`TERM=' entries that match the local default top-level
+`process-environment' and leave the remote shell to inherit
+TERM=dumb (issue #224).
 
-(ert-deftest ghostel-test-spawn-pty-rebinds-tramp-terminal-type ()
-  "`ghostel--spawn-pty' must rebind `tramp-terminal-type' when REMOTE-P.
-TRAMP's `make-process' handler reads `tramp-terminal-type' inside
-the call and uses it as the remote TERM.  Without this rebinding,
-remote spawns get TERM=dumb and the user sees no echo (issue #224).
+A single probe path covers every case: auto-integration (TERMINFO=
+already in env, points at the pushed terminfo dir),
+manually-installed (system, `~/.terminfo', or co-located with the
+shell-integration scripts under `~/.local/share/ghostel/terminfo'),
+and absent (fall back to `xterm-256color' so echo works)."
+  (let* ((ghostel-term "xterm-ghostty")
+         (preamble (ghostel--remote-term-preamble)))
+    ;; Default value for the case infocmp fails.
+    (should (string-match-p "\\bTERM=xterm-256color;" preamble))
+    ;; Probe and conditional upgrade.
+    (should (string-match-p "infocmp xterm-ghostty" preamble))
+    (should (string-match-p "\\bTERM=xterm-ghostty;" preamble))
+    (should (string-match-p "TERM_PROGRAM=ghostty;" preamble))
+    (should (string-match-p "TERM_PROGRAM_VERSION=" preamble))
+    ;; Co-located bundle gets prepended to TERMINFO_DIRS — so a
+    ;; user can `scp` the terminfo dir alongside the shell
+    ;; scripts and the probe finds it without `tic` or
+    ;; ~/.terminfo gymnastics.
+    (should (string-match-p
+             "~/\\.local/share/ghostel/terminfo/x/xterm-ghostty"
+             preamble))
+    (should (string-match-p
+             "~/\\.local/share/ghostel/terminfo/78/xterm-ghostty"
+             preamble))
+    (should (string-match-p
+             (regexp-quote
+              "TERMINFO_DIRS=~/.local/share/ghostel/terminfo")
+             preamble))
+    ;; Existing TERMINFO_DIRS must be preserved (prepend, not
+    ;; replace) so a system-configured search list still works.
+    (should (string-match-p (regexp-quote "${TERMINFO_DIRS:+:$TERMINFO_DIRS}")
+                            preamble))
+    ;; Order is load-bearing: the TERMINFO_DIRS prepend must run
+    ;; BEFORE the `infocmp' probe, otherwise ncurses won't find the
+    ;; co-located bundle and the probe falls back to xterm-256color.
+    (should (< (string-match (regexp-quote
+                              "TERMINFO_DIRS=~/.local/share/ghostel/terminfo")
+                             preamble)
+               (string-match "infocmp xterm-ghostty" preamble)))
+    ;; Always exported.
+    (should (string-match-p "COLORTERM=truecolor" preamble))
+    (should (string-match-p "export TERM COLORTERM" preamble)))
+  ;; Customized `ghostel-term' is honored verbatim — no probe, no
+  ;; ghostty advertisement, no TERMINFO_DIRS munging.
+  (let* ((ghostel-term "xterm-256color")
+         (preamble (ghostel--remote-term-preamble)))
+    (should-not (string-match-p "infocmp" preamble))
+    (should-not (string-match-p "TERM_PROGRAM=ghostty" preamble))
+    (should-not (string-match-p "TERMINFO_DIRS" preamble))
+    (should (string-match-p "TERM=xterm-256color" preamble))
+    (should (string-match-p "COLORTERM=truecolor" preamble)))
+  (let* ((ghostel-term "screen-256color")
+         (preamble (ghostel--remote-term-preamble)))
+    (should-not (string-match-p "infocmp" preamble))
+    (should (string-match-p "TERM=screen-256color" preamble))))
 
-Locally, `tramp-terminal-type' must be left alone — there's no
-TRAMP layer in the path."
-  (require 'tramp)
-  (let ((seen-tramp-terminal-type nil)
-        (orig-make-process (symbol-function #'make-process)))
-    (cl-letf (((symbol-function #'make-process)
-               (lambda (&rest plist)
-                 (setq seen-tramp-terminal-type tramp-terminal-type)
-                 (apply orig-make-process plist))))
-      (with-temp-buffer
-        (setq-local ghostel--term-rows 25
-                    ghostel--term-cols 80)
-        (let ((tramp-terminal-type "dumb")
-              (ghostel-term "xterm-ghostty")
-              (ghostel-kill-buffer-on-exit nil))
-          ;; Remote spawn without pushed TERMINFO → xterm-256color.
-          (setq seen-tramp-terminal-type nil)
-          (let ((proc (ghostel--spawn-pty
-                       "/bin/sh" nil 25 80 "-ixon" nil t)))
-            (unwind-protect
-                (should (equal seen-tramp-terminal-type
-                               "xterm-256color"))
-              (when (process-live-p proc) (delete-process proc))))
-          ;; Remote spawn with pushed TERMINFO → xterm-ghostty.
-          (setq seen-tramp-terminal-type nil)
-          (let ((proc (ghostel--spawn-pty
-                       "/bin/sh" nil 25 80 "-ixon"
-                       '("TERMINFO=/tmp/ghostel-XYZ") t)))
-            (unwind-protect
-                (should (equal seen-tramp-terminal-type
-                               "xterm-ghostty"))
-              (when (process-live-p proc) (delete-process proc))))
-          ;; Local spawn → leave the binding alone.
-          (setq seen-tramp-terminal-type nil)
-          (let ((proc (ghostel--spawn-pty
-                       "/bin/sh" nil 25 80 "-ixon" nil nil)))
-            (unwind-protect
-                (should (equal seen-tramp-terminal-type "dumb"))
-              (when (process-live-p proc) (delete-process proc)))))))))
+(ert-deftest ghostel-test-spawn-pty-uses-remote-term-preamble ()
+  "`ghostel--spawn-pty' embeds the remote preamble in the wrapper script.
+The preamble runs on the remote, so TERM is set after TRAMP's
+env propagation — sidestepping `tramp-local-environment-variable-p'
+which would otherwise strip `TERM=' entries that match the local
+default toplevel and leave the remote shell with TERM=dumb (#224).
+
+Local spawns must not get the preamble; their TERM still rides in
+`process-environment' via `ghostel--terminal-env'."
+  ;; First cl-letf of `make-process' in a fresh Emacs would trigger
+  ;; native-comp of a subr trampoline; disable to keep the test
+  ;; portable across machines without a working gccjit toolchain.
+  (let ((native-comp-enable-subr-trampolines nil))
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 25 ghostel--term-cols 80
+                  ;; The wrapped `make-process' below still calls the
+                  ;; real one via apply; needs a directory it can chdir
+                  ;; into.  /tmp is the safe default already used by
+                  ;; sibling tests.
+                  default-directory "/tmp/")
+      (let ((ghostel-term "xterm-ghostty")
+            (ghostel-kill-buffer-on-exit nil)
+            (orig-make-process (symbol-function #'make-process)))
+        ;; Remote spawn → preamble in wrapper, TERM/TERMINFO not
+        ;; added by ghostel.  Use a clean `process-environment' so
+        ;; the assertion is about ghostel's contribution, not the
+        ;; test runner's ambient env.
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (captured-env nil)
+               (captured-cmd nil))
+          (cl-letf (((symbol-function #'make-process)
+                     (lambda (&rest plist)
+                       (setq captured-env process-environment)
+                       (setq captured-cmd (plist-get plist :command))
+                       (apply orig-make-process plist))))
+            (let ((proc (ghostel--spawn-pty
+                         "/bin/sh" nil 25 80 "-ixon" nil t)))
+              (unwind-protect
+                  (let ((script (nth 2 captured-cmd)))
+                    (should (string-match-p "infocmp xterm-ghostty" script))
+                    (should (string-match-p "export TERM COLORTERM" script))
+                    ;; Ghostel must not push the local TERMINFO path —
+                    ;; it points at a dir the remote can't read and
+                    ;; (per terminfo(5)) suppresses system lookups.
+                    (should-not (seq-some
+                                 (lambda (s) (string-prefix-p "TERMINFO=" s))
+                                 captured-env))
+                    ;; TERM also stays out of env — wrapper handles it.
+                    (should-not (member "TERM=xterm-ghostty" captured-env)))
+                (when (process-live-p proc) (delete-process proc))))))
+        ;; Local spawn → no preamble, env-driven TERM.
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (captured-env nil)
+               (captured-cmd nil))
+          (cl-letf (((symbol-function #'make-process)
+                     (lambda (&rest plist)
+                       (setq captured-env process-environment)
+                       (setq captured-cmd (plist-get plist :command))
+                       (apply orig-make-process plist))))
+            (let ((proc (ghostel--spawn-pty
+                         "/bin/sh" nil 25 80 "-ixon" nil nil)))
+              (unwind-protect
+                  (let ((script (nth 2 captured-cmd)))
+                    (should-not (string-match-p "infocmp" script))
+                    (should (member "TERM=xterm-ghostty" captured-env)))
+                (when (process-live-p proc) (delete-process proc))))))))))
 
 (ert-deftest ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix ()
   "TRAMP rewrites INSIDE_EMACS but must preserve the user-set prefix.
@@ -9031,8 +9080,8 @@ slip past the unit tests."
     ghostel-test-get-shell-local
     ghostel-test-fish-auto-inject-loads-integration
     ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix
-    ghostel-test-remote-tramp-terminal-type-helper
-    ghostel-test-spawn-pty-rebinds-tramp-terminal-type
+    ghostel-test-remote-term-preamble
+    ghostel-test-spawn-pty-uses-remote-term-preamble
     ghostel-test-resize-window-adjust
     ghostel-test-resize-nil-size
     ghostel-test-resize-noop-same-dims
