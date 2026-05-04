@@ -3273,30 +3273,33 @@ below it."
                       "precmd_functions=(${precmd_functions:#__ghostel_ensure_prompt_wrap})\n"
                       "PROMPT=$'top-line\\nfinal-> '\n"
                       "\n"))
-                    ;; Wait for "final-> " to appear at least twice in
-                    ;; pending output: once in the echoed PROMPT
-                    ;; assignment, then again when zsh actually renders
-                    ;; the new multi-line prompt.  Matching on a single
-                    ;; occurrence races on slow CI runners — the wait
-                    ;; fires on the echo before the render lands, so
-                    ;; libghostty paints a stale screen (#cursor-row =
-                    ;; the trailing chunk of the echo, observed on
-                    ;; macOS aarch64).
+                    ;; Poll the asserted state directly: flush +
+                    ;; redraw on each tick and stop once the cursor
+                    ;; row starts with "final-> ".  Earlier attempts
+                    ;; that waited on byte patterns in pending output
+                    ;; ("final-> " count, the OSC 133;P marker) raced
+                    ;; on slow CI: pending gets consumed by the
+                    ;; redraw timer before the predicate can read
+                    ;; it, and a "final-> " match can land on the
+                    ;; echoed PROMPT assignment instead of the
+                    ;; rendered prompt (macOS aarch64 #failure).
                     (ghostel-test--wait-for
                      proc
                      (lambda ()
-                       (let ((combined (apply #'concat
-                                              (reverse ghostel--pending-output)))
-                             (count 0)
-                             (start 0))
-                         (while (string-match "final-> " combined start)
-                           (setq count (1+ count)
-                                 start (match-end 0)))
-                         (>= count 2)))
+                       (ghostel--flush-pending-output)
+                       (let ((inhibit-read-only t))
+                         (ghostel--redraw ghostel--term t))
+                       (let ((pos (ghostel--cursor-position ghostel--term)))
+                         (and pos
+                              (save-excursion
+                                (goto-char (point-min))
+                                (forward-line (cdr pos))
+                                (string-prefix-p
+                                 "final-> "
+                                 (buffer-substring-no-properties
+                                  (line-beginning-position)
+                                  (line-end-position)))))))
                      15)
-                    (ghostel--flush-pending-output)
-                    (let ((inhibit-read-only t))
-                      (ghostel--redraw ghostel--term t))
                     (let* ((pos (ghostel--cursor-position ghostel--term))
                            (col (car pos))
                            (row (cdr pos)))
