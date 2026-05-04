@@ -3238,6 +3238,15 @@ below it."
           (with-current-buffer buf
             (ghostel-mode)
             (setq ghostel--term (ghostel--new 8 80 200))
+            ;; Mirror the dimensions into the buffer-local row/col so
+            ;; the viewport-start helpers below can map libghostty's
+            ;; viewport-row index onto a buffer position once content
+            ;; has scrolled into scrollback (real risk here: a
+            ;; multi-line PROMPT plus four typed commands fill more
+            ;; than 8 rows on slow CI, and `(point-min)' then no
+            ;; longer aligns with the viewport top).
+            (setq ghostel--term-rows 8)
+            (setq ghostel--term-cols 80)
             (let* ((process-environment
                     (append (list "TERM=xterm-ghostty"
                                   "INSIDE_EMACS=ghostel"
@@ -3276,23 +3285,24 @@ below it."
                     ;; Poll the asserted state directly: flush +
                     ;; redraw on each tick and stop once the cursor
                     ;; row starts with "final-> ".  Earlier attempts
-                    ;; that waited on byte patterns in pending output
-                    ;; ("final-> " count, the OSC 133;P marker) raced
-                    ;; on slow CI: pending gets consumed by the
-                    ;; redraw timer before the predicate can read
-                    ;; it, and a "final-> " match can land on the
-                    ;; echoed PROMPT assignment instead of the
-                    ;; rendered prompt (macOS aarch64 #failure).
+                    ;; raced on slow CI: byte-pattern waits matched
+                    ;; the echoed PROMPT assignment before zsh had
+                    ;; rendered the new prompt, and a `(point-min)'
+                    ;; anchor mapped the viewport-row index onto the
+                    ;; wrong buffer line once scrollback formed.
+                    ;; Anchor on `ghostel--viewport-start' so the row
+                    ;; mapping survives scrollback.
                     (ghostel-test--wait-for
                      proc
                      (lambda ()
                        (ghostel--flush-pending-output)
                        (let ((inhibit-read-only t))
                          (ghostel--redraw ghostel--term t))
-                       (let ((pos (ghostel--cursor-position ghostel--term)))
-                         (and pos
+                       (let ((pos (ghostel--cursor-position ghostel--term))
+                             (vp-start (ghostel--viewport-start)))
+                         (and pos vp-start
                               (save-excursion
-                                (goto-char (point-min))
+                                (goto-char vp-start)
                                 (forward-line (cdr pos))
                                 (string-prefix-p
                                  "final-> "
@@ -3302,12 +3312,13 @@ below it."
                      15)
                     (let* ((pos (ghostel--cursor-position ghostel--term))
                            (col (car pos))
-                           (row (cdr pos)))
+                           (row (cdr pos))
+                           (vp-start (ghostel--viewport-start)))
                       ;; Cursor sits right after `final-> ' (8 chars).
                       (should (= 8 col))
                       ;; ...and on the same row as `final-> ', not below it.
                       (save-excursion
-                        (goto-char (point-min))
+                        (goto-char vp-start)
                         (forward-line row)
                         (should
                          (string-prefix-p
