@@ -3273,15 +3273,27 @@ below it."
                       "precmd_functions=(${precmd_functions:#__ghostel_ensure_prompt_wrap})\n"
                       "PROMPT=$'top-line\\nfinal-> '\n"
                       "\n"))
-                    ;; Wait for the multi-line prompt to render.
+                    ;; Wait for "final-> " to appear at least twice in
+                    ;; pending output: once in the echoed PROMPT
+                    ;; assignment, then again when zsh actually renders
+                    ;; the new multi-line prompt.  Matching on a single
+                    ;; occurrence races on slow CI runners — the wait
+                    ;; fires on the echo before the render lands, so
+                    ;; libghostty paints a stale screen (#cursor-row =
+                    ;; the trailing chunk of the echo, observed on
+                    ;; macOS aarch64).
                     (ghostel-test--wait-for
                      proc
                      (lambda ()
-                       (cl-some (lambda (s) (string-match-p "final-> " s))
-                                ghostel--pending-output))
+                       (let ((combined (apply #'concat
+                                              (reverse ghostel--pending-output)))
+                             (count 0)
+                             (start 0))
+                         (while (string-match "final-> " combined start)
+                           (setq count (1+ count)
+                                 start (match-end 0)))
+                         (>= count 2)))
                      15)
-                    ;; Give zle a beat to enter line-init and emit the OSC.
-                    (sleep-for 0.2)
                     (ghostel--flush-pending-output)
                     (let ((inhibit-read-only t))
                       (ghostel--redraw ghostel--term t))
