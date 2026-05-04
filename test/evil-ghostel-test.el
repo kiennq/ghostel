@@ -214,6 +214,49 @@ advice must not restore point or visual markers there."
    ;; Advice bypassed → the mock's point placement (point-min) wins.
    (should (= (point-min) (point)))))
 
+(ert-deftest evil-ghostel-test-around-redraw-snaps-point-on-prompt-line ()
+  "Point follows the new cursor line in normal state when on the prompt.
+Output that grows scrollback must not strand point above the new
+prompt — the renderer's cursor placement should win."
+  (evil-ghostel-test--with-buffer 5 40 "$ "
+                                  (evil-normal-state)
+                                  ;; After the initial redraw, point sits on the cursor line.
+                                  (should (evil-ghostel--point-on-cursor-line-p))
+                                  ;; Stream output that overflows the 5-row viewport, growing
+                                  ;; scrollback.  Without the on-prompt-line heuristic the
+                                  ;; advice would restore the stale buffer position from before
+                                  ;; the scroll.
+                                  (ghostel--write-input term "\r\n")
+                                  (dotimes (i 8)
+                                    (ghostel--write-input term (format "out-%d\r\n" i)))
+                                  (ghostel--write-input term "$ ")
+                                  (let ((inhibit-read-only t))
+                                    (ghostel--redraw term nil))
+                                  ;; Point lands on the new cursor line, not above it.
+                                  (should (evil-ghostel--point-on-cursor-line-p))))
+
+(ert-deftest evil-ghostel-test-around-redraw-preserves-point-off-prompt ()
+  "Point is preserved in normal state when parked off the prompt line.
+Scrollback navigation must not be disturbed by output redraws."
+  (evil-ghostel-test--with-buffer 5 40 "alpha\r\nbeta\r\ngamma\r\n$ "
+                                  (evil-normal-state)
+                                  ;; Park point on a non-cursor line above the prompt.
+                                  (goto-char (point-min))
+                                  (search-forward "beta")
+                                  (beginning-of-line)
+                                  (should-not (evil-ghostel--point-on-cursor-line-p))
+                                  ;; Drive a redraw that doesn't grow scrollback (still fits).
+                                  (ghostel--write-input term "x")
+                                  (let ((inhibit-read-only t))
+                                    (ghostel--redraw term nil))
+                                  ;; Point still on the same content line, not snapped to cursor.
+                                  (should (string-match-p
+                                           "beta"
+                                           (buffer-substring-no-properties
+                                            (line-beginning-position)
+                                            (line-end-position))))
+                                  (should-not (evil-ghostel--point-on-cursor-line-p))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: reset-cursor-point
 ;; -----------------------------------------------------------------------
@@ -334,17 +377,22 @@ point in the scrollback region instead of the visible viewport."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest evil-ghostel-test-redraw-preserves-point-normal ()
-  "Test that redraws preserve point in evil normal state."
-  (evil-ghostel-test--with-buffer 5 40 "hello world"
+  "Test that redraws preserve point in evil normal state.
+Specifically when point is parked off the cursor's buffer line —
+on-cursor-line normal state intentionally follows the cursor across
+redraws so the prompt isn't left behind by output."
+  (evil-ghostel-test--with-buffer 5 40 "first\r\nsecond\r\nthird"
                                   (evil-normal-state)
-                                  ;; Move point to col 5 (between "hello" and "world")
+                                  ;; Park point on the first row, off the cursor line.
                                   (goto-char (point-min))
-                                  (move-to-column 5)
-                                  (should (= 5 (current-column)))
+                                  (move-to-column 3)
+                                  (should (= 3 (current-column)))
+                                  (should (= 1 (line-number-at-pos)))
                                   ;; Redraw — should NOT move point back to terminal cursor
                                   (let ((inhibit-read-only t))
                                     (ghostel--redraw term t))
-                                  (should (= 5 (current-column)))))
+                                  (should (= 3 (current-column)))
+                                  (should (= 1 (line-number-at-pos)))))
 
 (ert-deftest evil-ghostel-test-redraw-moves-point-insert ()
   "Test that redraws move point to terminal cursor in insert state."

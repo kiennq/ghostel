@@ -107,6 +107,36 @@ placement math the native module performs in `src/render.zig'."
           (forward-line (+ scrollback (cdr pos)))
           (move-to-column (car pos)))))))
 
+(defun evil-ghostel--cursor-buffer-line ()
+  "Return the 0-indexed buffer line of the terminal cursor, or nil.
+Translates `ghostel--cursor-position' (viewport-relative row) into a
+buffer line by adding the scrollback line count.  Mirrors the
+placement math the native module performs in `src/render.zig'."
+  (when (and ghostel--term ghostel--term-rows)
+    (let ((pos (ghostel--cursor-position ghostel--term)))
+      (when pos
+        (let ((scrollback (max 0 (- (count-lines (point-min) (point-max))
+                                    ghostel--term-rows))))
+          (+ scrollback (cdr pos)))))))
+
+(defun evil-ghostel--point-on-cursor-line-p ()
+  "Return non-nil when point is on the buffer line of the terminal cursor.
+Reflects current state (libghostty cursor + Emacs buffer); only
+meaningful after a redraw has synchronized the two.  Inside
+`evil-ghostel--around-redraw' the libghostty cursor has already
+advanced past output that the buffer hasn't rendered yet, so this
+helper is unsafe there — use `evil-ghostel--last-cursor-line' instead."
+  (let ((cursor-line (evil-ghostel--cursor-buffer-line)))
+    (when cursor-line
+      (= (- (line-number-at-pos (point) t) 1) cursor-line))))
+
+(defvar-local evil-ghostel--last-cursor-line nil
+  "Buffer line where the previous redraw placed the terminal cursor.
+Used by `evil-ghostel--around-redraw' to decide whether the user has
+navigated point since the last redraw.  When point is still on this
+line, the user is parked at the live prompt and the renderer's new
+cursor placement should win across the redraw.")
+
 (defun evil-ghostel--cursor-to-point ()
   "Move the terminal cursor to Emacs point by sending arrow keys."
   (when ghostel--term
@@ -135,7 +165,12 @@ states) and the evil-specific visual range markers are restored here;
 at this layer.
 
   - `point' in non-terminal states.  In `insert' and `emacs' point
-    intentionally follows the TUI cursor.
+    intentionally follows the TUI cursor.  In `normal' (and other
+    non-visual non-terminal states) point follows the cursor too when
+    the user was parked on the prompt line before the redraw - the
+    renderer leaves point at the new cursor and we keep it there.
+    Otherwise the saved buffer position is restored so scrollback
+    navigation is undisturbed.
   - `evil-visual-beginning' and `evil-visual-end' in `visual' state.
 
 ORIG-FN is the advised `ghostel--redraw' called with TERM and FULL.
@@ -146,19 +181,37 @@ own the screen and drive their own redraw cycle."
       (let* ((preserve-point (not (memq evil-state '(insert emacs))))
              (visual-p (eq evil-state 'visual))
              (saved-point (and preserve-point (point)))
+             ;; If point is still on the line where the previous redraw
+             ;; placed the terminal cursor, the user has not navigated
+             ;; since — they are parked on the live prompt and the new
+             ;; cursor placement should win.  We can't reuse
+             ;; `evil-ghostel--point-on-cursor-line-p' here because the
+             ;; libghostty cursor has already advanced past output that
+             ;; the buffer hasn't rendered yet; comparing against the
+             ;; recorded last-cursor-line avoids that skew.  Skipped in
+             ;; visual state to keep selection markers stable.
+             (on-prompt-line (and preserve-point
+                                  (not visual-p)
+                                  evil-ghostel--last-cursor-line
+                                  (= (- (line-number-at-pos (point) t) 1)
+                                     evil-ghostel--last-cursor-line)))
              (saved-vb (and visual-p (bound-and-true-p evil-visual-beginning)
                             (marker-position evil-visual-beginning)))
              (saved-ve (and visual-p (bound-and-true-p evil-visual-end)
                             (marker-position evil-visual-end))))
         (funcall orig-fn term full)
-        (when preserve-point
+        (when (and preserve-point (not on-prompt-line))
           (goto-char (min saved-point (point-max))))
         (when visual-p
           (let ((pmax (point-max)))
             (when saved-vb
               (set-marker evil-visual-beginning (min saved-vb pmax)))
             (when saved-ve
-              (set-marker evil-visual-end (min saved-ve pmax))))))
+              (set-marker evil-visual-end (min saved-ve pmax)))))
+        ;; Record where the renderer placed the cursor so the next
+        ;; redraw can detect whether the user has navigated away.
+        (setq evil-ghostel--last-cursor-line
+              (evil-ghostel--cursor-buffer-line)))
     (funcall orig-fn term full)))
 
 ;; ---------------------------------------------------------------------------
