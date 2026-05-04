@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.22.0] — 2026-05-04
 
 ### Added
 - `ghostel-pre-spawn-hook`, run inside `ghostel--spawn-pty` just
@@ -16,6 +16,42 @@ All notable changes to this project will be documented in this file.
             #'with-editor-setup-environment)`.  Fires for both
   `ghostel`/`ghostel-project` and `ghostel-exec` spawns;
   `ghostel-compile` has its own `make-process` and is not covered.
+- `evil-ghostel-escape` controls how ESC is routed in evil insert
+  state: `auto` (default) inspects DECSET 1049 to send ESC to the
+  terminal in alt-screen apps (vim, less, htop, …) and otherwise
+  fall back to `evil-normal-state`; explicit `terminal` and `evil`
+  values force one or the other.  A toggle command with numeric
+  prefix support is also bound.  The terminal-bound ESC snaps to
+  the live viewport like every other typed key; the evil-bound
+  fallback lands on `evil-force-normal-state` when the user's
+  `<escape>` binding is missing or a chord prefix
+  ([#215](https://github.com/dakra/ghostel/issues/215)).
+- `make bench-e2e` (and a `--e2e` flag on `run-bench.sh`) measures
+  whole-pipeline throughput by installing each backend's production
+  filter+sentinel on a `cat` subprocess and waiting for full
+  quiescence, so the wall clock reflects what users actually feel
+  (including ghostel's `delayed-redraw` link detection / anchoring,
+  vterm's regex split + decode loop, and eat's deferred queue).
+  Composes with `--quick`, `--size`, `--iterations`, and the
+  backend-skip flags.
+
+### Changed
+- The Zig native module has been broadly refactored ("Zigify
+  everything"): libghostty calls are wrapped to be return-value
+  oriented rather than out-pointer oriented, errors propagate via
+  Zig's `try`/`catch` and error unions instead of C error codes,
+  optional absence is distinguished from real errors, and
+  per-error logging/handling is consistent across the module
+  ([#217](https://github.com/dakra/ghostel/pull/217)).  This is
+  internal — no user-visible API changes — but bumps the minimum
+  required native module version, so update both ghostel.el and
+  the prebuilt `.so`/`.dylib` together.
+- Render code is reorganised around a single property-run
+  abstraction (prompt cells, input cells, and ordinary content all
+  flow through the same path), and uses a new internal
+  `FixedArrayList` to cut per-row allocation overhead.  Adds an
+  Emacs↔Zig logging/debugging layer used during the refactor and
+  available for future native-module work.
 
 ### Fixed
 - Launching `M-x ghostel` from a TRAMP `default-directory` (e.g.
@@ -29,6 +65,38 @@ All notable changes to this project will be documented in this file.
   (or `xterm-ghostty' when `ghostel-tramp-shell-integration' has
   pushed the bundled terminfo), restoring echo and line editing
   ([#224](https://github.com/dakra/ghostel/issues/224)).
+- Shell integration survives prompt themes and rcfile assignments
+  that overwrite `PROMPT`/`PS1`/`fish_prompt` after ghostel sourced
+  its bootstrap.  The OSC 133 A/B markers are now (re)installed
+  every prompt cycle — modeled on ghostty's own zsh/bash/fish
+  integrations — so powerlevel10k, agnoster, Pure, oh-my-zsh /
+  prezto add-zle-hook chains, bash `PROMPT_COMMAND` reassignments,
+  and fish themes loaded via `conf.d/` no longer strip the
+  prompt-range markers.  Without those markers, the file-path link
+  detector linkified user-typed cells and the link keymap's RET
+  binding shadowed the normal terminal RET in tty Emacs — pressing
+  RET on a typed `cd some/path` opened the link instead of
+  executing the command
+  ([#199](https://github.com/dakra/ghostel/issues/199)).
+- New terminals no longer briefly flash with libghostty's default
+  colors before ghostel applies the Emacs theme.  A regression
+  test guards against the flicker reappearing
+  ([#219](https://github.com/dakra/ghostel/pull/219)).
+- `ghostel-keymap-exceptions` now also excludes special keys
+  (`<return>`, `<tab>`, `<f1>`, …, including their `S-`/`C-`/`M-`/
+  `C-S-`/`M-S-`/`C-M-` variants).  The special-keys binding loop
+  in `ghostel-mode-map` was missing the exceptions check that the
+  `C-<letter>` and `M-<letter>` loops had, so users could not
+  exclude e.g. `C-<return>` or `C-M-<down>`
+  ([#210](https://github.com/dakra/ghostel/issues/210)).
+- `ghostel-download-module` no longer segfaults when the module
+  is already loaded.  Calling `module-load` on a path whose shared
+  library is mapped into the running Emacs makes dyld/ld.so return
+  the existing handle and resolve `emacs_module_init` via `dlsym`
+  on the stale image.  Ghostel now skips the second `module-load`
+  when the module is already `featurep`'d and tells the user to
+  restart Emacs to pick up the new version
+  ([#78](https://github.com/dakra/ghostel/issues/78)).
 
 ## [0.21.0] — 2026-05-01
 
