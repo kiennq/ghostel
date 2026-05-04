@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Loading `ghostel.el` no longer prompts to download or compile the
+  native module under any circumstances.  Previously `ghostel.el`
+  consulted `ghostel-module-auto-install` at load time and could open
+  an interactive `read-char-choice` prompt — this hung Emacs 31
+  `user-lisp/` auto-byte-compile and similar harnesses where a user
+  `(setq ghostel-module-auto-install nil)` had not yet been
+  evaluated.  Module installation now happens only on an explicit
+  user action: `M-x ghostel`, `M-x ghostel-download-module`, or
+  `M-x ghostel-module-compile`.  When the module is missing at load
+  time the package issues a `display-warning` instead.
+  Closes [#231](https://github.com/dakra/ghostel/issues/231).
 - No-echo on remote shells launched from a TRAMP `default-directory`
   (`ghostel-tramp-shell-integration nil`).  The previous fix
   rebound `tramp-terminal-type`, which only takes effect on the

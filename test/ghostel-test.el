@@ -6508,20 +6508,75 @@ hand nil to the native module."
       (should-not warned))))
 
 (ert-deftest ghostel-test-module-version-mismatch ()
-  "Test that version check warns when module is below minimum."
-  (let ((warned nil)
-        (ensure-called nil)
-        (noninteractive nil)
-        (ghostel--minimum-module-version "0.2.0"))
+  "Test that version check warns when module is below minimum.
+At load time (PROMPT-USER nil) the warning fires but `ghostel--ensure-module'
+must NOT be called — that path can prompt or download (issue #231).
+At an interactive entry point (PROMPT-USER t) it does run."
+  (let ((ghostel--minimum-module-version "0.2.0"))
     (cl-letf (((symbol-function 'ghostel--module-version)
-               (lambda () "0.1.0"))
-              ((symbol-function 'display-warning)
-               (lambda (&rest _) (setq warned t)))
-              ((symbol-function 'ghostel--ensure-module)
-               (lambda (dir) (setq ensure-called dir))))
-      (ghostel--check-module-version "/tmp")
-      (should warned)
-      (should (equal "/tmp" ensure-called)))))
+               (lambda () "0.1.0")))
+      (let ((warned nil)
+            (ensure-called nil))
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (&rest _) (setq warned t)))
+                  ((symbol-function 'ghostel--ensure-module)
+                   (lambda (dir) (setq ensure-called dir))))
+          (ghostel--check-module-version "/tmp")
+          (should warned)
+          (should-not ensure-called)))
+      (let ((warned nil)
+            (ensure-called nil))
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (&rest _) (setq warned t)))
+                  ((symbol-function 'ghostel--ensure-module)
+                   (lambda (dir) (setq ensure-called dir))))
+          (ghostel--check-module-version "/tmp" t)
+          (should warned)
+          (should (equal "/tmp" ensure-called)))))))
+
+(ert-deftest ghostel-test-load-module-no-prompt-at-load-time ()
+  "Loading ghostel must never trigger the auto-install path (issue #231).
+At load time `ghostel--load-module' must not invoke
+`ghostel--ensure-module' or any of its install paths.  Module
+installation only happens at interactive entry points
+\(`ghostel', `ghostel-download-module', `ghostel-module-compile').
+
+The early-out in `ghostel--load-module' bails when the module is
+already loaded, so this test temporarily hides
+`ghostel--new' and the `ghostel-module' feature flag to force the
+missing-file code path, then restores them."
+  (let* ((tmp (make-temp-file "ghostel-test-no-mod" t))
+         (ghostel-module-auto-install 'ask)
+         (calls '())
+         (had-feat (featurep 'ghostel-module))
+         (saved-new (and (fboundp 'ghostel--new)
+                         (symbol-function 'ghostel--new))))
+    (unwind-protect
+        (progn
+          (when had-feat
+            (setq features (delq 'ghostel-module features)))
+          (when saved-new
+            (fmakunbound 'ghostel--new))
+          (cl-letf (((symbol-function 'ghostel--resource-root)
+                     (lambda () tmp))
+                    ((symbol-function 'ghostel--ensure-module)
+                     (lambda (&rest _) (push 'ensure calls)))
+                    ((symbol-function 'read-char-choice)
+                     (lambda (&rest _) (push 'prompt calls) ?s))
+                    ((symbol-function 'ghostel--download-module)
+                     (lambda (&rest _) (push 'download calls) nil))
+                    ((symbol-function 'ghostel--compile-module)
+                     (lambda (&rest _) (push 'compile calls) nil))
+                    ((symbol-function 'display-warning)
+                     (lambda (&rest _) nil)))
+            (ghostel--load-module)
+            (ghostel--load-module nil)))
+      (delete-directory tmp t)
+      (when saved-new
+        (fset 'ghostel--new saved-new))
+      (when had-feat
+        (cl-pushnew 'ghostel-module features)))
+    (should (null calls))))
 
 (ert-deftest ghostel-test-module-version-newer-than-minimum ()
   "Test that version check does nothing when module exceeds minimum."
@@ -9023,6 +9078,7 @@ slip past the unit tests."
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
+    ghostel-test-load-module-no-prompt-at-load-time
     ghostel-test-platform-tag-normalizes-arch
     ghostel-test-title-does-not-overwrite-manual-rename
     ghostel-test-title-tracking-disabled

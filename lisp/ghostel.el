@@ -516,11 +516,14 @@ When absent, the match is linkified as a bare file/directory
 reference opened at its start.")
 
 (defcustom ghostel-module-auto-install 'ask
-  "What to do when the native module is missing at load time.
-\\=`ask'      — prompt with a choice to download, compile, or skip (default).
-\\=`download' — download a pre-built binary from GitHub releases.
-\\=`compile'  — build from source via `ghostel-module-compile'.
-nil         — do nothing; the user must install the module manually."
+  "What to do when the native module is missing at first interactive use.
+This setting is consulted only when the user invokes an interactive
+entry point such as `\\[ghostel]', not when `ghostel.el' is loaded
+or byte-compiled - loading the file never prompts or downloads.
+\\=`ask'      - prompt with a choice to download, compile, or skip (default).
+\\=`download' - download a pre-built binary from GitHub releases.
+\\=`compile'  - build from source via `ghostel-module-compile'.
+nil        - do nothing; the user must install the module manually."
   :type '(choice (const :tag "Ask interactively" ask)
                  (const :tag "Download pre-built binary" download)
                  (const :tag "Compile from source" compile)
@@ -889,11 +892,13 @@ The output is shown in a *ghostel-build* compilation buffer."
     (compile "zig build -Doptimize=ReleaseFast -Dcpu=baseline" t)))
 
 
-(defun ghostel--check-module-version (dir)
+(defun ghostel--check-module-version (dir &optional prompt-user)
   "Check if the loaded module is older than required.
 When the module version is below `ghostel--minimum-module-version',
-offer to update using `ghostel-module-auto-install'.
-DIR is the module directory."
+warn unconditionally and, when PROMPT-USER is non-nil, offer to
+update using `ghostel-module-auto-install'.  DIR is the module
+directory.  At load time PROMPT-USER is nil so a stale module never
+triggers an interactive prompt."
   (let ((mod-ver (and (fboundp 'ghostel--module-version)
                       (ghostel--module-version))))
     (when (or (null mod-ver)
@@ -902,16 +907,20 @@ DIR is the module directory."
                        (format "Module version %s is older than required %s"
                                (or mod-ver "unknown")
                                ghostel--minimum-module-version))
-      (unless noninteractive
+      (when prompt-user
         (ghostel--ensure-module dir)))))
 
 (defun ghostel--load-module (&optional prompt-user)
   "Ensure the ghostel native module is loaded.
-When the module file is missing, trigger `ghostel-module-auto-install'.
 When PROMPT-USER is non-nil (called from an interactive command like
-`ghostel'), failures signal `user-error' so the calling flow aborts.
-Otherwise (load time), failures `display-warning' instead so the user
-can still compile ghostel, read docs, and so on.
+`ghostel'), missing modules trigger `ghostel-module-auto-install' and
+load failures signal `user-error' so the calling flow aborts.
+Otherwise (load time, including byte-compilation and Emacs 31's
+`user-lisp/' auto-compile), this function never prompts, downloads,
+or compiles - it only loads an existing module file and warns if one
+is missing.  Module installation only happens on an explicit user
+action: `M-x ghostel', `M-x ghostel-download-module', or
+`M-x ghostel-module-compile'.
 
 The guard also honours `ghostel--new' being already `fboundp', which
 covers the pure-Elisp test path where `cl-letf' stubs the native
@@ -921,14 +930,14 @@ entry points so tests run without the module present."
     (let* ((dir (ghostel--resource-root))
            (mod (expand-file-name
                  (concat "ghostel-module" module-file-suffix) dir)))
-      (unless (or (file-exists-p mod) noninteractive)
+      (when (and prompt-user (not (file-exists-p mod)))
         (ghostel--ensure-module dir))
       (cond
        ((file-exists-p mod)
         (condition-case err
             (progn
               (module-load mod)
-              (ghostel--check-module-version dir))
+              (ghostel--check-module-version dir prompt-user))
           (error
            (if prompt-user
                (user-error "Failed to load ghostel native module: %s"
