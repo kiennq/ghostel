@@ -866,18 +866,39 @@ When VERSION is nil, use the latest release download URL."
   "Ask dyn-loader-module to reload MODULE-ID from its stored manifest."
   (dyn-loader-reload module-id))
 
-(defun ghostel-reload-module (&optional close-live)
-  "Reload the loader-managed Ghostel runtime bundle from disk.
+(defun ghostel--loader-loaded-modules ()
+  "Return module IDs currently registered with dyn-loader."
+  (and (boundp 'dyn-loader-loaded-modules)
+       (symbol-value 'dyn-loader-loaded-modules)))
 
-With prefix argument CLOSE-LIVE, terminate live Ghostel terminals first."
-  (interactive "P")
+(defun ghostel--native-runtime-reloadable-p ()
+  "Return non-nil when dyn-loader can reload every native runtime module."
+  (let ((loaded-modules (ghostel--loader-loaded-modules)))
+    (and (featurep 'dyn-loader-module)
+         (fboundp 'dyn-loader-reload)
+         (cl-every (lambda (spec)
+                     (member (plist-get spec :id) loaded-modules))
+                   (ghostel--native-runtime-specs)))))
+
+(defun ghostel--reload-native-runtime (&optional close-live)
+  "Reload every loader-managed native runtime module from disk.
+With CLOSE-LIVE, terminate live Ghostel terminals first."
+  (unless (ghostel--native-runtime-reloadable-p)
+    (user-error "Ghostel native runtime is loaded without dyn-loader; restart Emacs to load the downloaded version"))
   (let ((live-buffers (ghostel--live-buffers)))
     (when live-buffers
       (if close-live
           (ghostel--close-live-buffers live-buffers)
         (user-error "Ghostel terminals are still running; close them before reloading"))))
   (dolist (spec (ghostel--native-runtime-specs))
-    (ghostel--loader-reload (plist-get spec :id)))
+    (ghostel--loader-reload (plist-get spec :id))))
+
+(defun ghostel-reload-module (&optional close-live)
+  "Reload the loader-managed Ghostel runtime bundle from disk.
+
+With prefix argument CLOSE-LIVE, terminate live Ghostel terminals first."
+  (interactive "P")
+  (ghostel--reload-native-runtime close-live)
   (message "ghostel: native runtime reloaded successfully"))
 
 (defun ghostel--write-loader-metadata-atomically (manifest-file dir metadata)
@@ -1206,7 +1227,10 @@ Leaving the prompt empty downloads the latest release."
       (user-error "Cancelled"))
     (if (ghostel--download-module dir version latest-release)
         (if (ghostel--native-runtime-ready-p)
-            (message "ghostel: module downloaded.  Restart Emacs to load the new version")
+            (progn
+              (ghostel--reload-native-runtime)
+              (ghostel--check-module-version dir)
+              (message "ghostel: module loaded successfully"))
           (ghostel--ensure-loader-loaded mod)
           (ghostel--bootstrap-native-runtime dir)
           (ghostel--check-module-version dir)
