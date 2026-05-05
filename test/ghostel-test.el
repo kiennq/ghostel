@@ -8924,12 +8924,14 @@ sections all materialize."
     (unwind-protect
         (save-window-excursion
           (ghostel-test--with-compile-buffer buf
-            (let* ((t0 (current-time))
-                   (t1 (time-add t0 0.010))
+            (let* ((t-sp (current-time))
+                   (t0 (time-add t-sp 0.123))   ; +123ms elisp prep
+                   (t1 (time-add t0 0.010))     ; +10ms first PTY byte
                    (t2 (time-add t0 0.500))
                    (t3 (time-add t0 0.700)))
               (setq-local ghostel-debug--spawn-capture
                           (list :time t0
+                                :start-process-time t-sp
                                 :default-directory "/ssh:host.example.com:/tmp/"
                                 :remote-p t
                                 :program "/bin/bash"
@@ -8944,6 +8946,10 @@ sections all materialize."
                                 :command
                                 '("/bin/sh" "-c"
                                   "TERM=xterm-256color; if infocmp xterm-ghostty >/dev/null 2>&1; then TERM=xterm-ghostty; fi; export TERM; exec /bin/bash")
+                                ;; Mimic TRAMP's legacy-async dispatch:
+                                ;; the local bridge process differs from
+                                ;; the wrapper ghostel built.
+                                :executed-command '("/bin/sh" "-i")
                                 :filter-events
                                 (list (cons t1 "\e]0;hostname\007$ "))
                                 :filter-cap 16384
@@ -8966,9 +8972,27 @@ sections all materialize."
                 ;; The wrapper script — load-bearing for #224.
                 (should (string-match-p "Wrapper command sent" content))
                 (should (string-match-p "infocmp xterm-ghostty" content))
+                ;; The legacy-async divergence section — :executed-command
+                ;; differs from :command, so the renderer must surface it.
+                (should (string-match-p
+                         "Local process command (`process-command'):"
+                         content))
+                (should (string-match-p "    -i" content))
+                (should (string-match-p
+                         "TRAMP rewrote the command for legacy-async"
+                         content))
                 ;; Env delta header.
                 (should (string-match-p "process-environment at spawn"
                                         content))
+                ;; Phase timings: T0 baseline, +123ms spawn-pty entry,
+                ;; +133ms first PTY byte (123 + 10 from t-sp).
+                (should (string-match-p "^Phase timings:" content))
+                (should (string-match-p
+                         "T0 +ghostel--start-process entered" content))
+                (should (string-match-p
+                         "\\+123ms +ghostel--spawn-pty entered" content))
+                (should (string-match-p
+                         "\\+133ms +first PTY byte received" content))
                 ;; Unified RECV/SEND timeline.
                 (should (string-match-p "^Timeline (RECV cap=" content))
                 (should (string-match-p "RECV  \"" content))
@@ -9073,10 +9097,15 @@ so no actual shell is spawned."
           (unwind-protect
               (progn
                 (ghostel-debug-ghostel)
-                ;; Advice should have removed itself.
+                ;; Both advices should have removed themselves (or been
+                ;; stripped by the unwind-protect cleanup if they never
+                ;; fired — either way they must not linger).
                 (should-not (advice-member-p
                              #'ghostel-debug--capture-spawn-pty
                              'ghostel--spawn-pty))
+                (should-not (advice-member-p
+                             #'ghostel-debug--capture-start-process
+                             'ghostel--start-process))
                 ;; And the buffer-local capture should be populated.
                 (let ((cap (buffer-local-value
                             'ghostel-debug--spawn-capture buf)))
@@ -9084,11 +9113,109 @@ so no actual shell is spawned."
                   (should (eq 24 (plist-get cap :height)))
                   (should (eq 80 (plist-get cap :width)))
                   (should (equal "/bin/sh" (plist-get cap :program)))
-                  (should (consp (plist-get cap :command)))))
+                  ;; :command is the wrapper ghostel passed to make-process
+                  ;; — captured via cl-letf* on make-process *before* the
+                  ;; test stub substitutes :command.  So it must be the
+                  ;; ghostel wrapper (("/bin/sh" "-c" "<...>")), not the
+                  ;; substituted '("true").
+                  (let ((cmd (plist-get cap :command)))
+                    (should (consp cmd))
+                    (should (equal "/bin/sh" (car cmd)))
+                    (should (equal "-c" (cadr cmd))))
+                  ;; :executed-command is what process-command returns,
+                  ;; which is the test-substituted '("true").
+                  (should (equal '("true")
+                                 (plist-get cap :executed-command)))))
             (when (buffer-live-p buf)
               (let ((p (buffer-local-value 'ghostel--process buf)))
                 (when (processp p) (delete-process p)))
               (kill-buffer buf))))))))
+
+(ert-deftest ghostel-test-debug-capture-start-process-records-time ()
+  "`ghostel-debug--capture-start-process' stashes its entry time and self-removes.
+The stashed value is consumed by `ghostel-debug--capture-spawn-pty'
+and folded into the capture as `:start-process-time'.  Without that
+two-step, the spawn-capture would have no baseline for the elisp-prep
+delta in the phase timings section."
+  (let ((buf (generate-new-buffer " *ghostel-test-start-proc-cap*"))
+        (orig (lambda (&rest _) 'fake-result)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--start-process) orig))
+          (advice-add 'ghostel--start-process :around
+                      #'ghostel-debug--capture-start-process)
+          (with-current-buffer buf
+            (let ((t-before (current-time)))
+              (ghostel--start-process)
+              ;; Advice removed itself after one call.
+              (should-not
+               (advice-member-p
+                #'ghostel-debug--capture-start-process
+                'ghostel--start-process))
+              ;; Buffer-local stash holds a timestamp at or after t-before.
+              (let ((stashed ghostel-debug--pending-start-process-time))
+                (should stashed)
+                (should-not (time-less-p stashed t-before))))))
+      (advice-remove 'ghostel--start-process
+                     #'ghostel-debug--capture-start-process)
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-debug-info-phase-timings-without-start-time ()
+  "Phase timings still render when `:start-process-time' is absent.
+Spawn-captures created via direct `ghostel--spawn-pty' calls (not
+through `ghostel--start-process') have no elisp-prep baseline; the
+section must degrade gracefully and still report the spawn-pty/first-
+byte delta."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t))
+    (unwind-protect
+        (save-window-excursion
+          (ghostel-test--with-compile-buffer buf
+            (let* ((t0 (current-time))
+                   (t1 (time-add t0 0.042)))
+              (setq-local ghostel-debug--spawn-capture
+                          (list :time t0
+                                :start-process-time nil
+                                :default-directory "/tmp/"
+                                :remote-p nil
+                                :program "/bin/sh"
+                                :program-args nil
+                                :height 24 :width 80
+                                :stty-flags ghostel--default-stty
+                                :extra-env nil
+                                :process-environment process-environment
+                                :command '("/bin/sh" "-c" "exec /bin/sh")
+                                ;; Local spawn — no TRAMP rewriting,
+                                ;; so the executed cmd matches.
+                                :executed-command
+                                '("/bin/sh" "-c" "exec /bin/sh")
+                                :filter-events (list (cons t1 "$ "))
+                                :filter-cap 16384
+                                :filter-bytes 2
+                                :filter-truncated nil
+                                :send-keys nil
+                                :send-cap 64
+                                :send-truncated nil)))
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                (should (string-match-p "^Phase timings:" content))
+                ;; No T0 baseline line when start-process-time is nil.
+                (should-not (string-match-p
+                             "ghostel--start-process entered" content))
+                ;; spawn-pty is the baseline (T0); first byte is +42ms.
+                (should (string-match-p
+                         "T0 +ghostel--spawn-pty entered" content))
+                (should (string-match-p
+                         "\\+42ms +first PTY byte received" content))
+                ;; :command and :executed-command match (local spawn,
+                ;; no TRAMP rewriting), so the divergence section must
+                ;; be suppressed.
+                (should-not (string-match-p
+                             "Local process command" content))
+                (should-not (string-match-p
+                             "TRAMP rewrote" content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
 
 
 ;;; Cell pixel scale (DPI heuristic + reported dimensions)
@@ -9763,6 +9890,8 @@ slip past the unit tests."
     ghostel-test-debug-capture-filter-bounded
     ghostel-test-debug-capture-send-bounded
     ghostel-test-debug-ghostel-installs-spawn-pty-advice
+    ghostel-test-debug-capture-start-process-records-time
+    ghostel-test-debug-info-phase-timings-without-start-time
     ghostel-test-uri-at-pos-prefers-string-help-echo
     ghostel-test-uri-at-pos-calls-native-for-function-help-echo
     ghostel-test-native-link-help-echo-calls-uri-at-pos
