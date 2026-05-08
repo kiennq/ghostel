@@ -1437,14 +1437,14 @@ Input modes (`ghostel-semi-char-mode-map', `ghostel-char-mode-map',
   "C-c C-j"          #'ghostel-semi-char-mode
   "C-c M-d"          #'ghostel-char-mode
   "C-c C-l"          #'ghostel-line-mode
-  ;; Mouse click events (for terminal mouse tracking)
-  "<down-mouse-1>"   #'ghostel--mouse-press
-  "<mouse-1>"        #'ghostel--mouse-release
+  ;; Mouse click events
+  "<down-mouse-1>"   #'ghostel-mouse-press-or-copy-mode
+  "<mouse-1>"        #'ghostel-mouse-release-or-set-point
+  "<drag-mouse-1>"   #'ghostel-mouse-drag-or-set-region
   "<down-mouse-2>"   #'ghostel--mouse-press
   "<mouse-2>"        #'ghostel--mouse-release
   "<down-mouse-3>"   #'ghostel--mouse-press
   "<mouse-3>"        #'ghostel--mouse-release
-  "<drag-mouse-1>"   #'ghostel--mouse-drag
   "<drag-mouse-2>"   #'ghostel--mouse-drag
   "<drag-mouse-3>"   #'ghostel--mouse-drag
   ;; Drag and drop
@@ -2137,6 +2137,58 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             (ghostel--mouse-button-number event)
                             row col
                             (ghostel--mouse-mods event)))))
+
+(defun ghostel--mouse-tracking-active-p ()
+  "Non-nil if libghostty has any DEC mouse-tracking mode set.
+Checks modes 1000 (normal), 1002 (button-event), and 1003
+\(any-event) - the modes a running program enables when it wants
+to consume mouse input."
+  (and ghostel--term
+       (or (ghostel--mode-enabled ghostel--term 1000)
+           (ghostel--mode-enabled ghostel--term 1002)
+           (ghostel--mode-enabled ghostel--term 1003))))
+
+(defun ghostel-mouse-press-or-copy-mode (event)
+  "Forward EVENT to the terminal, or hand off to `mouse-drag-region'.
+When a DEC mouse-tracking mode (1000/1002/1003) is enabled, behaves
+like `ghostel--mouse-press' and forwards the press to the running
+program.  Otherwise hands EVENT off to `mouse-drag-region' so Emacs's
+standard click-to-set-point and drag-to-select work; if the buffer is
+in semi-char mode (where typing normally goes to the terminal) it
+also switches to `ghostel-copy-mode' first so the buffer is frozen
+and read-only for the duration of the selection."
+  (interactive "e")
+  (select-window (posn-window (event-start event)))
+  (cond
+   ((ghostel--mouse-tracking-active-p)
+    (ghostel--mouse-press event))
+   ((eq ghostel--input-mode 'semi-char)
+    (ghostel-copy-mode)
+    (mouse-drag-region event))
+   (t
+    (mouse-drag-region event))))
+
+(defun ghostel-mouse-release-or-set-point (event)
+  "Forward EVENT to the terminal, or hand off to `mouse-set-point'.
+Companion to `ghostel-mouse-press-or-copy-mode' for the left-button
+release event.  With tracking off, defers to Emacs's standard
+click handler so the release of a non-drag click sets point normally."
+  (interactive "e")
+  (if (ghostel--mouse-tracking-active-p)
+      (ghostel--mouse-release event)
+    (mouse-set-point event)))
+
+(defun ghostel-mouse-drag-or-set-region (event)
+  "Forward EVENT to the terminal, or hand off to `mouse-set-region'.
+Companion to `ghostel-mouse-press-or-copy-mode' for the left-button
+drag event.  With tracking off, defers to Emacs's standard drag
+handler so the selection survives release; without this,
+`mouse-drag-track's exit hook deactivates the mark and our
+intercept keeps `mouse-set-region' from re-establishing the region."
+  (interactive "e")
+  (if (ghostel--mouse-tracking-active-p)
+      (ghostel--mouse-drag event)
+    (mouse-set-region event)))
 
 
 ;;; Input modes — state helpers

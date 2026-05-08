@@ -8527,6 +8527,185 @@ redraw and produce visible flicker, so point is left alone."
         (kill-local-variable 'ghostel--scroll-intercept-active)
         (kill-local-variable 'pre-command-hook)))))
 
+(ert-deftest ghostel-test-mouse-1-press-no-tracking-semi-char ()
+  "Left-press in semi-char with no tracking enters copy mode and drags.
+Hands EVENT off to `mouse-drag-region' after switching to copy mode so
+Emacs's standard click-set-point and drag-to-select work, with the
+buffer frozen for selection."
+  (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (copy-mode-called nil)
+        (drag-region-arg nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'mouse-drag-region)
+                 (lambda (event) (setq drag-region-arg event)))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-press-or-copy-mode fake-event))
+      (should copy-mode-called)
+      (should (equal fake-event drag-region-arg)))))
+
+(ert-deftest ghostel-test-mouse-1-press-no-tracking-copy-mode ()
+  "Left-press in copy mode hands off without re-toggling copy mode.
+Calling `ghostel-copy-mode' while already in copy mode would exit it,
+so the function must skip the toggle and go straight to drag-region."
+  (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (copy-mode-called nil)
+        (drag-region-arg nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'copy)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'mouse-drag-region)
+                 (lambda (event) (setq drag-region-arg event)))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-press-or-copy-mode fake-event))
+      (should-not copy-mode-called)
+      (should (equal fake-event drag-region-arg)))))
+
+(ert-deftest ghostel-test-mouse-1-press-no-tracking-line-mode ()
+  "Left-press in line mode hands off to `mouse-drag-region' as-is.
+Line mode keeps its own buffer state; we should not switch to copy
+mode or otherwise interfere."
+  (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (copy-mode-called nil)
+        (drag-region-arg nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'line)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'mouse-drag-region)
+                 (lambda (event) (setq drag-region-arg event)))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-press-or-copy-mode fake-event))
+      (should-not copy-mode-called)
+      (should (equal fake-event drag-region-arg)))))
+
+(ert-deftest ghostel-test-mouse-1-release-no-tracking-sets-point ()
+  "Release with no tracking hands off to `mouse-set-point'."
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (set-point-arg nil)
+        (mouse-event-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (event) (setq set-point-arg event)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (&rest _) (setq mouse-event-called t) t)))
+        (ghostel-mouse-release-or-set-point fake-event))
+      (should (equal fake-event set-point-arg))
+      (should-not mouse-event-called))))
+
+(ert-deftest ghostel-test-mouse-1-release-tracking-forwards ()
+  "Release with active tracking forwards via `ghostel--mouse-release'."
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (set-point-called nil)
+        (mouse-event-args nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (eq mode 1000)))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (_e) (setq set-point-called t)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (_term action button row col mods)
+                   (setq mouse-event-args (list action button row col mods))
+                   t))
+                ((symbol-function 'process-live-p) (lambda (_p) t)))
+        (ghostel-mouse-release-or-set-point fake-event))
+      (should-not set-point-called)
+      (should (equal 1 (nth 0 mouse-event-args))))))   ; action = release
+
+(ert-deftest ghostel-test-mouse-1-drag-no-tracking-sets-region ()
+  "Drag-end with no tracking hands off to `mouse-set-region'.
+This is the bug guard: without it, `mouse-drag-track's exit hook
+deactivates the mark, our intercept blocks `mouse-set-region', and
+the user-visible region disappears on release."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (set-region-arg nil)
+        (mouse-event-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (event) (setq set-region-arg event)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (&rest _) (setq mouse-event-called t) t)))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should (equal fake-event set-region-arg))
+      (should-not mouse-event-called))))
+
+(ert-deftest ghostel-test-mouse-1-drag-tracking-forwards ()
+  "Drag-end with active tracking forwards via `ghostel--mouse-drag'."
+  (let ((fake-event `(drag-mouse-1
+                      (,(selected-window) 1 (5 . 2) 0)
+                      (,(selected-window) 7 (10 . 4) 0)))
+        (set-region-called nil)
+        (mouse-event-args nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (eq mode 1000)))
+                ((symbol-function 'mouse-set-region)
+                 (lambda (_e) (setq set-region-called t)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (_term action button row col mods)
+                   (setq mouse-event-args (list action button row col mods))
+                   t))
+                ((symbol-function 'process-live-p) (lambda (_p) t)))
+        (ghostel-mouse-drag-or-set-region fake-event))
+      (should-not set-region-called)
+      (should (equal 2 (nth 0 mouse-event-args))))))   ; action = motion
+
+(ert-deftest ghostel-test-mouse-1-press-tracking-forwards-to-terminal ()
+  "Left-press with active mouse-tracking forwards to libghostty.
+Never enters copy mode and never hands off to `mouse-drag-region'."
+  (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (copy-mode-called nil)
+        (drag-region-called nil)
+        (mouse-event-args nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--process 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 ;; Pretend DEC mode 1000 (normal mouse) is enabled.
+                 (lambda (_term mode) (eq mode 1000)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'mouse-drag-region)
+                 (lambda (_e) (setq drag-region-called t)))
+                ((symbol-function 'ghostel--mouse-event)
+                 (lambda (_term action button row col mods)
+                   (setq mouse-event-args (list action button row col mods))
+                   t))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'select-window) (lambda (_w) nil)))
+        (ghostel-mouse-press-or-copy-mode fake-event))
+      (should-not copy-mode-called)
+      (should-not drag-region-called)
+      (should (equal 0 (nth 0 mouse-event-args)))   ; action = press
+      (should (equal 1 (nth 1 mouse-event-args)))   ; button 1 = mouse-1
+      (should (equal 5 (nth 2 mouse-event-args)))   ; row
+      (should (equal 10 (nth 3 mouse-event-args)))))) ; col
+
 (ert-deftest ghostel-test-scroll-intercept-unselected-window ()
   "Wheel events on an unselected ghostel window must not loop.
 
