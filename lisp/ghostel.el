@@ -2393,6 +2393,7 @@ When `ghostel-readonly-fast-exit' is non-nil, also exits read-only mode."
     (let ((text (ghostel--clean-copy-text
                  (buffer-substring (region-beginning) (region-end)))))
       (kill-new text)
+      (setq deactivate-mark t)  ; matching `kill-ring-save'
       (message "Copied to kill ring")))
   (when ghostel-readonly-fast-exit
     (ghostel-readonly-exit)))

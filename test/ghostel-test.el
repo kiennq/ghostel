@@ -8437,6 +8437,26 @@ The selection still lands on the kill ring; only the auto-exit is suppressed."
       (should-not exit-called)
       (should (equal (car kill-ring) "hello world")))))
 
+(ert-deftest ghostel-test-readonly-copy-deactivates-mark ()
+  "`ghostel-readonly-copy' deactivates the mark like `kill-ring-save'.
+Sets the variable `deactivate-mark' so the region is cleared after
+the command, with point staying at the region end."
+  (let ((kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel-readonly-fast-exit nil))
+    (with-temp-buffer
+      (transient-mark-mode 1)
+      (insert "hello world")
+      (push-mark (point-min) t t)
+      (goto-char (point-max))
+      (let ((end (point))
+            (deactivate-mark nil))
+        (cl-letf (((symbol-function 'ghostel-readonly-exit)
+                   (lambda () (ignore))))
+          (ghostel-readonly-copy))
+        (should deactivate-mark)
+        (should (= (point) end))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-readonly-recenter
 ;; -----------------------------------------------------------------------
@@ -12404,6 +12424,7 @@ slip past the unit tests."
     ghostel-test-xterm-paste-no-exit-when-fast-exit-disabled
     ghostel-test-readonly-copy-exits-when-fast-exit-enabled
     ghostel-test-readonly-copy-no-exit-when-fast-exit-disabled
+    ghostel-test-readonly-copy-deactivates-mark
     ghostel-test-char-mode-key-bindings
     ghostel-test-copy-mode-recenter
     ghostel-test-input-mode-default-is-semi-char
