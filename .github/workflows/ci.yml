@@ -160,6 +160,10 @@ jobs:
             platform: x86_64-freebsd
             suffix: .so
             target: x86_64-freebsd
+          - os: windows-latest
+            platform: x86_64-windows
+            suffix: .dll
+            target: x86_64-windows-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -178,6 +182,7 @@ jobs:
           cache-key: ${{ matrix.platform }}-zig-0.15.2
 
       - name: Build native module
+        shell: bash
         run: |
           if [ -n "${{ matrix.target }}" ]; then
             zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=baseline
@@ -190,8 +195,9 @@ jobs:
         with:
           name: ghostel-module-${{ matrix.platform }}
           path: |
-            ghostel-module${{ matrix.suffix }}
-            ghostel-module.version
+            zig-out/bin/*${{ matrix.suffix }}
+            zig-out/bin/*.json
+            zig-out/bin/*.version
 
   test-native:
     needs: build-native
@@ -215,14 +221,24 @@ jobs:
             platform: aarch64-macos
             suffix: .dylib
             emacs_version: 'snapshot'
+          - os: windows-latest
+            platform: x86_64-windows
+            suffix: .dll
+            emacs_version: 'snapshot'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
+        if: runner.os != 'Windows'
         with:
           github_access_token: ${{ github.token }}
+      - uses: jcs090218/setup-emacs@master
+        if: runner.os == 'Windows'
+        with:
+          version: ${{ matrix.emacs_version }}
 
       - name: Install pinned Emacs
+        if: runner.os != 'Windows'
         env:
           EMACS_VERSION: ${{ matrix.emacs_version }}
         run: bash .github/scripts/install-emacs.sh
@@ -235,22 +251,24 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-
-      - name: Mark pre-built module as up-to-date
-        # The module was built in a prior job and its mtime predates the
-        # checkout, so make would consider it stale w.r.t. src/*.zig and
-        # try to re-invoke `zig build' (Zig isn't installed in this job).
-        # Touching the artifact pins the Make dependency.
-        run: touch ghostel-module${{ matrix.suffix }}
+          path: zig-out/bin
 
       - name: Install compat
-        run: git clone --depth 1 https://github.com/emacs-compat/compat.git /tmp/compat
+        shell: bash
+        run: git clone --depth 1 https://github.com/emacs-compat/compat.git "$RUNNER_TEMP/compat"
 
       - name: Run native module tests
+        shell: bash
         run: |
-          make -j$(getconf _NPROCESSORS_ONLN) \
-            EMACSFLAGS="-L /tmp/compat" \
-            test-native
+          find test -maxdepth 1 -name 'ghostel-*-test.el' -print | sort | while IFS= read -r file; do
+            printf '  NATIVE  %s\n' "${file##*/}"
+            emacs --batch -Q -L "$RUNNER_TEMP/compat" -L lisp -L test \
+              --eval '(setq ghostel-module-directory (expand-file-name "zig-out/bin" default-directory))' \
+              -l ert \
+              -l test/ghostel-test-helpers.el \
+              -l "$file" \
+              --eval "(ert-run-tests-batch-and-exit '(tag native))"
+          done
 
   test-hypothesis-cases:
     needs: build-native
