@@ -20,7 +20,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     // --- Symbol interning ---
@@ -33,6 +35,26 @@ pub const Env = struct {
 
     pub fn funcall(self: Env, func: Value, args: []const Value) Value {
         return self.raw.funcall.?(self.raw, func, @intCast(args.len), @constCast(args.ptr));
+    }
+
+    pub fn call0(self: Env, func: Value) Value {
+        return self.funcall(func, &.{});
+    }
+
+    pub fn call1(self: Env, func: Value, a0: Value) Value {
+        return self.funcall(func, &.{a0});
+    }
+
+    pub fn call2(self: Env, func: Value, a0: Value, a1: Value) Value {
+        return self.funcall(func, &.{ a0, a1 });
+    }
+
+    pub fn call3(self: Env, func: Value, a0: Value, a1: Value, a2: Value) Value {
+        return self.funcall(func, &.{ a0, a1, a2 });
+    }
+
+    pub fn call4(self: Env, func: Value, a0: Value, a1: Value, a2: Value, a3: Value) Value {
+        return self.funcall(func, &.{ a0, a1, a2, a3 });
     }
 
     pub fn f(self: Env, comptime func: []const u8, args: anytype) Value {
@@ -53,6 +75,10 @@ pub const Env = struct {
 
     pub fn list(self: Env, items: anytype) Value {
         return self.f("list", items);
+    }
+
+    pub fn makeList(self: Env, items: []const Value) Value {
+        return self.funcall(sym.list, items);
     }
 
     pub fn makeInteger(self: Env, n: i64) Value {
@@ -190,7 +216,7 @@ pub const Env = struct {
     }
 
     pub fn vecSize(self: Env, vec: Value) c_long {
-        return self.raw.vec_size.?(self.raw, vec);
+        return @intCast(self.raw.vec_size.?(self.raw, vec));
     }
 
     // --- Non-local exit handling ---
@@ -205,6 +231,10 @@ pub const Env = struct {
 
     pub fn nonLocalExitSignal(self: Env, symbol: Value, data: Value) void {
         self.raw.non_local_exit_signal.?(self.raw, symbol, data);
+    }
+
+    pub fn openChannel(self: Env, process: Value) i32 {
+        return self.raw.open_channel.?(self.raw, process);
     }
 
     // --- Function registration ---
@@ -308,6 +338,14 @@ pub const Env = struct {
         _ = self.f("put-text-property", .{ start, end, prop, value });
     }
 
+    pub fn bufferReadOnly(self: Env) bool {
+        return self.isNotNil(self.symbolValue("buffer-read-only"));
+    }
+
+    pub fn setBufferReadOnly(self: Env, read_only: bool) void {
+        self.set("buffer-read-only", read_only);
+    }
+
     /// Create a unibyte string (for binary data like PNG images).
     /// Returns null if the API is unavailable (Emacs < 28).
     pub fn makeUnibyteString(self: Env, str: []const u8) ?Value {
@@ -318,16 +356,23 @@ pub const Env = struct {
     // --- Logging and debugging ---
 
     /// Signal an error with a message string.
-    pub fn signalError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
             sym.@"error",
-            self.f("list", .{self.format("ghostel: " ++ msg, objects)}),
+            self.f("list", .{msg}),
         );
     }
 
-    pub fn message(self: Env, msg: []const u8, objects: anytype) void {
-        const all_args = [1]Value{self.makeString(msg)} ++ self.makeValues(objects);
-        _ = self.funcall(sym.message, &all_args);
+    pub fn signalErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        self.callFmt(Env.signalError, fmt, args);
+    }
+
+    pub fn message(self: Env, msg: []const u8) void {
+        _ = self.f("message", .{msg});
+    }
+
+    pub fn messagef(self: Env, comptime fmt: []const u8, args: anytype) void {
+        self.callFmt(Env.message, fmt, args);
     }
 
     pub fn format(self: Env, msg: []const u8, objects: anytype) Value {
@@ -335,12 +380,16 @@ pub const Env = struct {
         return self.funcall(sym.format, &all_args);
     }
 
-    pub fn logError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn logError(self: Env, msg: []const u8) void {
         _ = self.f("display-warning", .{
             sym.ghostel,
-            self.format("ghostel: " ++ msg, objects),
+            msg,
             sym.@":error",
         });
+    }
+
+    pub fn logErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        self.callFmt(Env.logError, fmt, args);
     }
 
     /// Writes stack trace as Emacs messages if in debug mode
@@ -350,16 +399,23 @@ pub const Env = struct {
                 var buffer: [4096]u8 = undefined;
                 var writer = std.Io.Writer.fixed(&buffer);
                 const debug_info = std.debug.getSelfDebugInfo() catch |err| {
-                    self.logError("Unable to get debug info: %s", .{@errorName(err)});
+                    self.logErrorf("Unable to get debug info: {s}", .{@errorName(err)});
                     return;
                 };
                 std.debug.writeStackTrace(trace.*, &writer, debug_info, .no_color) catch |err| {
-                    self.logError("Unable to print stack trace: %s", .{@errorName(err)});
+                    self.logErrorf("Unable to print stack trace: {s}", .{@errorName(err)});
                     return;
                 };
-                self.logError("%s", .{buffer[0..writer.end]});
+                self.logError(buffer[0..writer.end]);
             }
         }
+    }
+
+    fn callFmt(self: Env, func: anytype, comptime fmt: []const u8, args: anytype) void {
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.print(fmt, args) catch {};
+        @call(.auto, func, .{ self, buffer[0..writer.end] });
     }
 
     fn isStringLike(comptime ty: std.builtin.Type.Pointer) bool {
@@ -392,8 +448,13 @@ const interned_symbols = [_][:0]const u8{
     ":weight",
     "bold",
     "bright",
+    "buffer-read-only",
+    "add-hook",
+    "boundp",
+    "car",
     "char-before",
     "cons",
+    "cdr",
     "dash",
     "default",
     "delete-region",
@@ -463,6 +524,7 @@ const interned_symbols = [_][:0]const u8{
     "provide",
     "put-text-property",
     "query-font",
+    "remhash",
     "selected-window",
     "set",
     "set-marker",
@@ -491,11 +553,18 @@ fn SymbolCache(comptime symbols: []const [:0]const u8) type {
 }
 
 pub var sym: SymbolCache(&interned_symbols) = undefined;
+var sym_initialized = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
 pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
     inline for (std.meta.fields(@TypeOf(sym))) |field| {
         @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
     }
+    sym_initialized = true;
 }
