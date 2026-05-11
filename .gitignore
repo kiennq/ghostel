@@ -3,6 +3,8 @@ zig-out/
 zig-pkg/
 *.dylib
 *.so
+*.dll
+*.bak
 *.elc
 ghostel-autoloads.el
 ghostel-pkg.el
