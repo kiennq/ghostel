@@ -30,7 +30,7 @@ process, keymap, and buffer.
 ## Requirements
 
 - Emacs 28.1+ with dynamic module support
-- macOS, Linux or FreeBSD
+- macOS, Linux, FreeBSD, or Windows 10/11 with ConPTY support
 
 The native module is **automatically downloaded** on first use.  Pre-built
 binaries are available for:
@@ -40,6 +40,8 @@ binaries are available for:
 - `x86_64-linux`
 - `aarch64-linux`
 - `x86_64-freebsd`
+- `x86_64-windows`
+- `aarch64-windows`
 
 If you prefer to build from source or need a different platform, you'll also need
 [Zig](https://ziglang.org/) 0.15.2 (see [Building from source](#building-from-source)).
@@ -82,41 +84,53 @@ Then `M-x ghostel` to open a terminal.
 
 ### Native module
 
-When the native module is missing, Ghostel will offer to **download a
-pre-built binary** or **compile from source** (controlled by
+When the native module payload is missing, Ghostel will offer to **download a
+pre-built package** or **compile from source** (controlled by
 `ghostel-module-auto-install`, default `ask`).  You can also trigger these
 manually:
 
-- `M-x ghostel-download-module` — download the minimum supported pre-built binary
+- `M-x ghostel-download-module` — download and install a pre-built package from GitHub releases
 - `C-u M-x ghostel-download-module` — choose a specific release tag (leave blank for latest)
 - `M-x ghostel-module-compile` — build from source via `zig build`
+
+Set `ghostel-module-dir` to keep downloaded modules in a custom
+directory, similar to vterm's configurable module directory.  When this
+option is set, Ghostel loads and downloads `ghostel-module` there and
+does not fall back to the package directory; source builds still run in
+the package checkout and then copy the finished module into the custom
+directory.
 
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
+On Windows, run the build from Git Bash or another Bash-compatible shell.
+Windows builds target the GNU/UCRT runtime so the resulting module matches the
+runtime family used by Windows Emacs distributions such as emacs-libvterm's
+MinGW/UCRT builds.
 Ghostel vendors a generated `vendor/emacs-module.h`, so normal builds do not
-require local Emacs headers.  If you want to override the vendored header, set
-`EMACS_INCLUDE_DIR` to a directory containing `emacs-module.h`, or set
-`EMACS_BIN_DIR` to an Emacs `bin/` directory and Ghostel will look for
-`../include` and `../share/emacs/include`.
+require local Emacs headers or an Emacs source checkout.
+If you want to override the vendored header, set `EMACS_INCLUDE_DIR` to a
+directory containing `emacs-module.h`, set `EMACS_BIN_DIR` to an Emacs `bin/`
+directory (Ghostel will look for `../include` and `../share/emacs/include`),
+or set `EMACS_SOURCE_DIR` to an Emacs source checkout and Ghostel will generate
+the header from the upstream module fragments.
 
 ```sh
-git clone https://github.com/dakra/ghostel.git
+# Clone with submodules
+git clone --recurse-submodules https://github.com/dakra/ghostel.git
 cd ghostel
 
-# Build everything (fetches ghostty automatically via Zig package manager)
+# Optional: override the vendored header with an Emacs source checkout
+# export EMACS_SOURCE_DIR=/path/to/emacs
+
+# Build everything (libghostty-vt + ghostel-module)
 zig build -Doptimize=ReleaseFast
 ```
 
-To override the vendored Emacs header, set `EMACS_INCLUDE_DIR` to a
-directory containing `emacs-module.h`, or set `EMACS_BIN_DIR` to an
-Emacs `bin/` directory.
-
-To build against a local ghostty checkout, temporarily point the
-dependency at your local path:
+If you already have the repo, initialize the submodules and build:
 
 ```sh
-zig fetch --save=ghostty /path/to/ghostty
+git submodule update --init --recursive vendor/ghostty vendor/emacs-util-mods
 zig build -Doptimize=ReleaseFast
 ```
 
@@ -345,7 +359,7 @@ history in **any** mode that has a read-only buffer (Emacs or copy).
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
 - 256-color and RGB (24-bit true color) support
-- **`TERM=xterm-ghostty` with bundled terminfo** — apps that consult terminfo for capabilities (Claude Code, neovim, tmux, modern TUIs) discover synchronized output (DEC 2026), Kitty keyboard protocol, true color, colored underlines, focus reporting, etc., and use their fast paths.  Synchronized output in particular eliminates the choppy partial-redraw effect when Claude Code repaints over a large scrollback.  OSC 52 (clipboard) is supported but intentionally not advertised in the bundled terminfo — see Clipboard below.  Override via `ghostel-term`.
+- **`TERM=xterm-ghostty` with bundled terminfo** — apps that consult terminfo for capabilities (Claude Code, neovim, tmux, modern TUIs) discover synchronized output (DEC 2026), Kitty keyboard protocol, true color, colored underlines, focus reporting, etc., and use their fast paths.  Synchronized output in particular eliminates the choppy partial-redraw effect when Claude Code repaints over a large scrollback.  OSC 52 (clipboard) is supported but intentionally not advertised in the bundled terminfo — see Clipboard below.  Override via `ghostel-term`.  On Windows, Ghostel defaults `ghostel-term` to `xterm-256color` until the bundled terminfo is wired up safely for ConPTY shells.
 - **OSC 4 / 10 / 11 color queries** — TUI programs can query the current palette, foreground, and background colors, so tools like `duf`, `btop`, `delta`, and anything else using `termenv` auto-detect the right light/dark theme from the Emacs face colors
 - **OSC 9 / OSC 777** — desktop notifications and ConEmu progress reports (percentage shown in the mode line; see [Notifications and Progress](#notifications-and-progress))
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
@@ -514,8 +528,12 @@ navigation (OSC 133), and `ghostel_cmd` for calling Elisp from the shell.
 
 #### Remote `xterm-ghostty` terminfo
 
-Ghostel sets `TERM=xterm-ghostty` so apps inside the buffer get the
-full capability set (synchronized output, Kitty keyboard, etc.).
+On non-Windows platforms, Ghostel sets `TERM=xterm-ghostty` when it can
+also provide matching terminfo for the shell it is starting, so apps
+inside the buffer get the full capability set (synchronized output,
+Kitty keyboard, etc.).  For TRAMP-launched shells without prepared
+remote terminfo, Ghostel falls back to `xterm-256color` instead of
+claiming unsupported capabilities.
 That same `TERM` value gets inherited by anything spawned inside
 the buffer — including `ssh REMOTE` and `M-x ghostel` from a TRAMP
 `default-directory`.  Remote hosts without the `xterm-ghostty`
@@ -803,7 +821,7 @@ inside a light Emacs):
 |----------------------------------|----------------------|----------------------------------------------------------|
 | `ghostel-module-auto-install`    | `ask`                | What to do when native module is missing (`ask`, `download`, `compile`, `nil`) |
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
-| `ghostel-term`                   | `"xterm-ghostty"`    | Value of `TERM` for spawned processes.  Default uses the bundled terminfo so apps can detect ghostel's full capability set.  Set to `"xterm-256color"` to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
+| `ghostel-term`                   | `"xterm-ghostty"` on Unix, `"xterm-256color"` on Windows | Value of `TERM` for spawned processes.  Unix defaults use the bundled terminfo so apps can detect ghostel's full capability set.  Windows stays on `"xterm-256color"` until bundled terminfo is wired up safely for ConPTY shells.  Set to `"xterm-256color"` anywhere to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
 | `ghostel-environment`            | `nil`                | Extra env vars for spawned processes (list of `"KEY=VALUE"` strings). |
 | `ghostel-ssh-install-terminfo`   | `auto`               | Install `xterm-ghostty` terminfo on remote hosts as needed.  `auto` follows `ghostel-tramp-shell-integration`.  Affects both TRAMP-launched ghostel (push terminfo over the existing TRAMP connection) and outbound `ssh` from a local buffer (install via `tic` on first connection, cache in `~/.cache/ghostel/ssh-terminfo-cache`).  Per-call ssh override: `GHOSTEL_SSH_KEEP_TERM=1` |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
@@ -822,6 +840,7 @@ inside a light Emacs):
 | `ghostel-kitty-graphics-storage-limit` | `320 MiB`      | Per-terminal cap on kitty graphics image storage.  Set to 0 to disable kitty graphics entirely (image transmissions are ignored, no storage allocated) |
 | `ghostel-kitty-graphics-mediums` | `nil`                | Opt-in image-loading mediums beyond the always-enabled inline base64.  A subset of `(file temp-file shared-mem)`.  Default `nil` keeps SSH sessions safe — the non-direct mediums let a remote program instruct ghostel to read arbitrary local paths or shared memory |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
+| `ghostel-cursor-follow`          | `t`                  | Keep point following terminal cursor on redraw           |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
 | `ghostel-notification-function`  | `ghostel-default-notify` | Handler for OSC 9 / OSC 777 desktop notifications (nil disables) |
@@ -874,8 +893,8 @@ When `evil-ghostel-mode` is active:
 - **Undo** (`u`) sends readline undo (`Ctrl+_`)
 - Cursor shape follows evil state (block for normal, bar for insert)
 - Alt-screen programs (vim, less, htop) are unaffected
-
 ## Commands
+<!-- Some commands are missing from the previous commits -->
 
 | Command                        | Description                                  |
 |--------------------------------|----------------------------------------------|
@@ -900,8 +919,9 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
 | `M-x ghostel-ssh-clear-terminfo-cache` | Clear outbound-ssh terminfo install cache (force re-probe) |
-| `M-x ghostel-download-module`  | Download pre-built native module             |
-| `M-x ghostel-module-compile`   | Compile native module from source            |
+| `M-x ghostel-download-module`  | Download and publish the native loader package |
+| `M-x ghostel-module-compile`   | Compile and publish the native loader package  |
+| `M-x ghostel-reload-module`    | Manually reload the versioned real module      |
 
 ### Sending input from Lisp
 
@@ -945,10 +965,11 @@ user, so multi-line shell scripts are passed through verbatim and
 no shell-integration setup is required.  The process sentinel
 delivers the real exit status.
 
-`ghostel-compile` inherits the same `TERM=xterm-ghostty` and
-`TERMINFO=...` env as `M-x ghostel`, so build output gets
-synchronized output, true color, etc.  If a test runner or build
-tool gets confused by the unfamiliar `TERM`, set
+`ghostel-compile` inherits the same terminal env as `M-x ghostel`, so
+on Unix build output gets `TERM=xterm-ghostty` plus `TERMINFO=...`
+for synchronized output, true color, etc.  Windows keeps the safer
+`xterm-256color` default.  If a test runner or build tool gets
+confused by the unfamiliar `TERM`, set
 `(setq ghostel-term "xterm-256color")`.
 
 ```elisp
