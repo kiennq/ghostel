@@ -9914,25 +9914,36 @@ buffer happened to be current and paste into the wrong terminal."
       (should (eq target-window selected-arg)))))
 
 (ert-deftest ghostel-test-readonly-RET-on-link-opens-link ()
-  "RET on a hyperlink opens the link instead of exiting copy mode."
-  (let ((open-called nil)
+  "RET on a hyperlink with fast-exit opens the link and exits read-only mode.
+The exit must happen before the link is opened so a file:// or
+fileref: link that switches buffers does not leave the ghostel
+buffer stuck in copy mode."
+  (let ((open-url nil)
         (exit-called nil)
-        (send-called nil))
+        (send-called nil)
+        (call-order nil))
     (with-temp-buffer
       (setq-local ghostel--term 'fake)
       (setq-local ghostel--input-mode 'copy)
       (cl-letf (((symbol-function 'ghostel--uri-at-pos)
                  (lambda (_p) "https://example.com"))
-                ((symbol-function 'ghostel-open-link-at-point)
-                 (lambda () (setq open-called t)))
+                ((symbol-function 'ghostel--open-link)
+                 (lambda (url)
+                   (setq open-url url)
+                   (push 'open call-order)))
                 ((symbol-function 'ghostel-readonly-exit)
-                 (lambda () (setq exit-called t)))
+                 (lambda ()
+                   (setq exit-called t)
+                   (push 'exit call-order)))
                 ((symbol-function 'ghostel--send-encoded)
                  (lambda (&rest _) (setq send-called t))))
         (ghostel-readonly-RET-or-exit-and-send))
-      (should open-called)
-      (should-not exit-called)
-      (should-not send-called))))
+      (should (equal open-url "https://example.com"))
+      (should exit-called)
+      (should-not send-called)
+      ;; Exit before open so buffer-switching link openers
+      ;; (file://, fileref:) don't leave the ghostel buffer in copy mode.
+      (should (equal call-order '(open exit))))))
 
 (ert-deftest ghostel-test-readonly-RET-off-link-exits-and-sends ()
   "RET off a hyperlink exits read-only mode and sends a CR."

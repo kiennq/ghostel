@@ -2708,12 +2708,17 @@ accepts terminal input (semi-char or char)."
 (defun ghostel-readonly-RET-or-exit-and-send ()
   "Open the link at point, or exit read-only mode and send RET.
 Bound to RET / `<return>' in `ghostel-readonly-fast-exit-mode-map'
-so RET behaves like other input keys when fast exit is on: a
-press at a hyperlink still opens the link, while a press anywhere
-else exits the read-only mode and forwards a CR to the terminal."
+so RET behaves like other input keys when fast exit is on: a press
+at a hyperlink opens the link and exits read-only mode, while a
+press anywhere else exits and forwards a CR to the terminal."
   (interactive)
-  (if (ghostel--uri-at-pos (point))
-      (ghostel-open-link-at-point)
+  (if-let* ((url (ghostel--uri-at-pos (point))))
+      ;; Capture URL before exiting: `ghostel-readonly-exit' moves
+      ;; point to `point-max', and opening a file:// or fileref:
+      ;; link switches the current buffer.
+      (progn
+        (ghostel-readonly-exit)
+        (ghostel--open-link url))
     (let ((target (or ghostel--pre-readonly-mode 'semi-char)))
       (ghostel-readonly-exit)
       (when (and ghostel--term (memq target '(semi-char char)))
