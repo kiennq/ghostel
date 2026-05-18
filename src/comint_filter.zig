@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 
 const gt = @import("ghostty-vt");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const style_face = @import("style_face.zig");
 const parseHexColor = @import("utils.zig").parseHexColor;
 
@@ -407,8 +407,12 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
 
 var module_alloc: Allocator = undefined;
 
-pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+pub fn setModuleAllocator(allocator: Allocator) void {
     module_alloc = allocator;
+}
+
+pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+    setModuleAllocator(allocator);
     env.registerFunctions(&emacs_functions);
 }
 
@@ -461,11 +465,11 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
                 const filter = env.getUserPtr(Self, args[0]) orelse return error.InvalidComintFilter;
                 const data = env.extractStringAlloc(module_alloc, args[1], &filter.buffer) catch |err| {
-                    env.signalError("Failed to extract string: %s", .{@errorName(err)});
+                    env.signalErrorf("failed to extract string: %s", .{@errorName(err)});
                     return env.nil();
                 };
                 return filter.feed(env, data) catch |err| {
-                    env.signalError("comint filter failed: %s", .{@errorName(err)});
+                    env.signalErrorf("comint filter failed: %s", .{@errorName(err)});
                     return env.nil();
                 };
             }
@@ -488,7 +492,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const filter = env.getUserPtr(Self, args[0]) orelse return error.InvalidComintFilter;
                 var str_buf: [2048]u8 = undefined;
                 const colors_str = env.extractString(args[1], &str_buf) catch |err| {
-                    env.signalError("invalid palette string: %s", .{@errorName(err)});
+                    env.signalErrorf("invalid palette string: %s", .{@errorName(err)});
                     return env.nil();
                 };
                 var palette16: [16]gt.color.RGB = @splat(.{});
