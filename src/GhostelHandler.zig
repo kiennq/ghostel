@@ -4,7 +4,7 @@
 
 const std = @import("std");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const GhostelTerm = @import("GhostelTerm.zig");
 
@@ -112,7 +112,7 @@ fn handleReportPwd(self: *Self, v: gt.StreamAction.ReportPwd) void {
     if (v.url.len == 0) return;
     self.inner.terminal.setPwd(v.url) catch |err| {
         if (emacs.current_env) |e|
-            e.logError("setPwd failed: %s", .{@errorName(err)});
+            e.logErrorf("setPwd failed: %s", .{@errorName(err)});
     };
 
     const env = emacs.current_env orelse return;

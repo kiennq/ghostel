@@ -10,17 +10,37 @@
 
 (require 'ghostel-test-helpers)
 
+(defun ghostel-test--posix-sh-p ()
+  "Return non-nil when `/bin/sh' is a native POSIX shell."
+  (and (not (eq system-type 'windows-nt))
+       (file-executable-p "/bin/sh")))
+
+(defun ghostel-test--bash-source-path (path)
+  "Return PATH in a form readable by `bash', or nil when unavailable."
+  (let* ((quoted (ghostel--posix-shell-quote-argument path))
+         (script
+          (format
+           (concat "if [ -r %s ]; then printf '%%s' %s; "
+                   "elif command -v wslpath >/dev/null 2>&1; then "
+                   "p=$(wslpath -a %s 2>/dev/null) && "
+                   "[ -r \"$p\" ] && printf '%%s' \"$p\"; fi")
+           quoted quoted quoted)))
+    (with-temp-buffer
+      (when (and (zerop (call-process "bash" nil t nil "-lc" script))
+                 (> (buffer-size) 0))
+        (buffer-string)))))
+
 (defmacro ghostel-test--with-cat-process (var &rest body)
-  "Spawn a long-lived `cat' process bound to VAR, run BODY, then clean up.
+  "Create a long-lived pipe process bound to VAR, run BODY, then clean up.
 The process is killed and the temp buffer destroyed on exit so the
 flag-flip tests don't leak processes between runs."
   (declare (indent 1))
   `(let* ((buf (generate-new-buffer " *ghostel-test-query-cat*"))
-          (,var (make-process :name "ghostel-test-cat"
-                              :buffer buf
-                              :command '("cat")
-                              :connection-type 'pipe
-                              :noquery nil)))
+          (,var (make-pipe-process :name "ghostel-test-query-process"
+                                   :buffer buf
+                                   :noquery nil
+                                   :filter #'ignore
+                                   :sentinel #'ignore)))
      (unwind-protect (progn ,@body)
        (when (process-live-p ,var)
          (delete-process ,var))
@@ -48,9 +68,27 @@ newest-first list aligns with the buffer-order regions."
       (ghostel-test--insert-prompt prefix input)
       (push cwd ghostel--imenu-cwds))))
 
+(ert-deftest ghostel-test-kill-buffer-cleans-windows-conpty ()
+  "Killing a Ghostel buffer should tear down the Windows ConPTY backend."
+  (let ((buf (generate-new-buffer " *ghostel-test-conpty-kill-buffer*"))
+        (killed-term nil))
+    (cl-letf (((symbol-function 'conpty--kill)
+               (lambda (term)
+                 (setq killed-term term)
+                 t))
+              ((symbol-function 'conpty--write) #'ignore)
+              ((symbol-function 'conpty--read-pending) #'ignore))
+      (with-current-buffer buf
+        (ghostel-mode)
+        (setq-local ghostel--term 'fake-term
+                    ghostel--conpty-notify-pipe 'fake-process))
+      (kill-buffer buf)
+      (should (eq killed-term 'fake-term)))))
+
 (ert-deftest ghostel-test-shell-integration ()
   "Test shell process command output and PTY echo."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((buf (generate-new-buffer " *ghostel-test-shell*")))
     (unwind-protect
         (with-current-buffer buf
@@ -134,6 +172,7 @@ newest-first list aligns with the buffer-order regions."
 (ert-deftest ghostel-test-fish-backspace ()
   "Test backspace works with fish shell."
   :tags '(:fish native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (skip-unless (executable-find "fish"))
   (let ((buf (generate-new-buffer " *ghostel-test-fish*")))
     (unwind-protect
@@ -307,15 +346,18 @@ the buffer is misclassified as remote, switching on TRAMP."
             (or (> major 4) (and (= major 4) (>= minor 4)))))))
   (let* ((root (or (ghostel--resource-root)
                    (file-name-directory (locate-library "ghostel"))))
-         (shell-bash (expand-file-name "etc/shell/ghostel.bash" root)))
+         (shell-bash (expand-file-name "etc/shell/ghostel.bash" root))
+         (bash-shell-bash (ghostel-test--bash-source-path shell-bash)))
     (skip-unless (file-exists-p shell-bash))
+    (skip-unless bash-shell-bash)
     (let* ((fake "ghostel-test-fake-host-zzz")
            (process-environment
             (append (list (format "HOSTNAME=%s" fake)
                           "INSIDE_EMACS=ghostel")
                     process-environment))
            (probe (format "cd /; source %s; __ghostel_osc7"
-                          shell-bash))
+                          (ghostel--posix-shell-quote-argument
+                           bash-shell-bash)))
            (output (with-temp-buffer
                      (call-process "bash" nil (current-buffer) nil
                                    "--noprofile" "--norc" "-c" probe)
@@ -353,12 +395,15 @@ output must be ours, not the competing one."
   (skip-unless (executable-find "bash"))
   (let* ((root (or (ghostel--resource-root)
                    (file-name-directory (locate-library "ghostel"))))
-         (shell-bash (expand-file-name "etc/shell/ghostel.bash" root)))
+         (shell-bash (expand-file-name "etc/shell/ghostel.bash" root))
+         (bash-shell-bash (ghostel-test--bash-source-path shell-bash)))
     (skip-unless (file-exists-p shell-bash))
+    (skip-unless bash-shell-bash)
     (let* ((probe
             (concat
              "PROMPT_COMMAND='printf \"\\e]7;file://competing-host/path\\a\"';"
-             (format " source %s;" shell-bash)
+             (format " source %s;"
+                     (ghostel--posix-shell-quote-argument bash-shell-bash))
              " __ghostel_wrapped_prompt_command"))
            (process-environment
             (append '("INSIDE_EMACS=ghostel") process-environment))
@@ -870,10 +915,10 @@ narrow input after the wide char keeps growing the region."
 (ert-deftest ghostel-test-pty-password-input-p-detects-stty-no-echo ()
   "Report t when a child's tty has ECHO off and ICANON on.
 This is the libghostty heuristic (canonical && !echo) replicated in
-the Zig binding.  Spawn a shell that does `stty -echo' and poll
-until the change takes effect."
+  the Zig binding.  Spawn a shell that does `stty -echo' and poll
+  until the change takes effect."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-test--posix-sh-p))
   (let* ((buf (generate-new-buffer " *ghostel-test-pwd-stty*"))
          (proc (start-process "ghostel-test-pwd-stty" buf
                               "/bin/sh" "-c" "stty -echo; sleep 30")))
@@ -893,7 +938,7 @@ Emacs's default pty starts with echo OFF (Emacs handles echo itself),
 so `stty sane' is required to mimic a normal shell prompt — which is
 exactly what `ghostel--spawn-pty' does at startup."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-test--posix-sh-p))
   (let* ((buf (generate-new-buffer " *ghostel-test-pwd-cooked*"))
          (proc (start-process "ghostel-test-pwd-cooked" buf
                               "/bin/sh" "-c" "stty sane; sleep 30")))
@@ -1253,7 +1298,11 @@ is re-confirmed (mirrors ghostty's ~200 ms termios polling cadence)."
               (should ghostel--password-mode-p)
               (should ghostel--password-confirm-timer)
               (should (= 0 calls))
-              (sleep-for 0.25)
+              (let ((deadline (+ (float-time) 2.0)))
+                (while (and (< (float-time) deadline)
+                            (or ghostel--password-confirm-timer
+                                (= 0 calls)))
+                  (accept-process-output nil 0.05)))
               (should (= 1 calls))
               (should-not ghostel--password-confirm-timer))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
@@ -1874,7 +1923,8 @@ but the cursor is at the end of the REPL's prompt."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert ">>> \n")
+          (let ((inhibit-read-only t))
+            (insert ">>> \n"))
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
           (setq ghostel--process 'fake-proc)
@@ -1924,6 +1974,79 @@ but the cursor is at the end of the REPL's prompt."
         (default-directory "/ssh:dan@myhost:/tmp/"))
     (ghostel--update-directory "file://myhost/home/dan")
     (should (equal "/ssh:dan@myhost:/home/dan/" default-directory))))
+
+
+
+(ert-deftest ghostel-test-ghostel-reuses-default-buffer ()
+  "Calling `ghostel' without a prefix reuses the default terminal buffer."
+  (let ((ghostel-buffer-name "*ghostel*")
+        (displayed nil)
+        (started 0)
+        (buf (generate-new-buffer "*ghostel*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq-local ghostel--term 'term-1))
+          (cl-letf (((symbol-function 'ghostel--native-runtime-ready-p)
+                     (lambda () t))
+                    ((symbol-function 'ghostel--new)
+                     (lambda (&rest _) 'unused))
+                    ((symbol-function 'ghostel--apply-palette)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (buffer-or-name &rest _)
+                        (setq displayed (get-buffer buffer-or-name))
+                        (set-buffer displayed)
+                        displayed))
+                    ((symbol-function 'ghostel--start-process)
+                     (lambda ()
+                       (setq started (1+ started)))))
+            (ghostel)
+            (should (eq buf displayed))
+            (should (equal 0 started))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-ghostel-clamps-initial-terminal-size-to-window-max-chars ()
+  "Initial terminal creation should use `window-max-chars-per-line'."
+  (let ((ghostel-buffer-name "*ghostel-size*")
+        (created-size nil)
+        (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'window-body-height)
+                   (lambda (&optional _) 22))
+                   ((symbol-function 'window-body-width)
+                    (lambda (&optional _window _pixelwise) 80))
+                  ;; Regression guard for #192: initial terminal sizing must use
+                  ;; `window-screen-lines', not `window-body-height'.
+                  ((symbol-function 'window-screen-lines)
+                   (lambda () 33.0))
+                  ((symbol-function 'window-max-chars-per-line)
+                   (lambda (&optional _) 120))
+                  ((symbol-function 'ghostel--initialize-native-modules)
+                   (lambda () nil))
+                  ((symbol-function 'ghostel--native-runtime-ready-p)
+                   (lambda () t))
+                  ((symbol-function 'ghostel--new)
+                   (lambda (height width _scrollback &rest _)
+                     (setq created-size (list height width))
+                     'fake-term))
+                  ((symbol-function 'ghostel--set-size)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--apply-palette)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--start-process)
+                   (lambda () 'fake-proc))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (buffer-or-name &rest _)
+                      (setq buf (get-buffer buffer-or-name))
+                      (set-buffer buf)
+                      buf)))
+          (ghostel)
+          (should (equal '(33 120) created-size)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 (provide 'ghostel-shell-test)
 ;;; ghostel-shell-test.el ends here
