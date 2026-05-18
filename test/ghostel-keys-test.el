@@ -418,7 +418,8 @@ side effects have to happen explicitly inside the command."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "hello world")
+          (let ((inhibit-read-only t))
+            (insert "hello world"))
           (goto-char (point-min))
           (set-mark (point))
           (goto-char (point-max))
@@ -763,6 +764,95 @@ External packages may still call the old internal name."
   "`ghostel-paste-string' signals `user-error' when not in a ghostel buffer."
   (with-temp-buffer
     (should-error (ghostel-paste-string "x") :type 'user-error)))
+
+
+
+(ert-deftest ghostel-test-send-key-dispatches-through-process-transport ()
+  "Immediate key sends should dispatch through the process transport helper."
+  (with-temp-buffer
+    (let* ((ghostel--process 'fake-process)
+           (ghostel--input-buffer nil)
+           (ghostel--input-timer nil)
+           (ghostel--last-send-time nil)
+           (ghostel-input-coalesce-delay 0)
+           (transport-send nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--process-send)
+                   (lambda (proc str)
+                     (setq transport-send (cons proc str))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct process-send-string: %S"
+                              args)))))
+           (ghostel--send-key "a")
+           (should (equal '(fake-process . "a") transport-send)))))))
+
+(ert-deftest ghostel-test-control-key-bindings-cover-upstream-range ()
+  "Ghostel binds the upstream control-key range plus C-@ passthrough."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'ghostel--send-string)
+               (lambda (key)
+                 (setq sent key))))
+      (dolist (entry '(("C-t" . "\x14")
+                       ("C-v" . "\x16")
+                       ("C-@" . "\x00")))
+        (setq sent nil)
+         (let ((binding (lookup-key ghostel-semi-char-mode-map (kbd (car entry)))))
+           (should binding)
+           (funcall binding)
+           (should (equal (cdr entry) sent)))))))
+
+(ert-deftest ghostel-test-meta-key-bindings-reach-terminal ()
+  "Meta-letter bindings stay routed to the terminal."
+  (dolist (key '("M-a" "M-z"))
+    (should (eq #'ghostel--send-event
+                (lookup-key ghostel-semi-char-mode-map (kbd key))))))
+
+(ert-deftest ghostel-test-window-resize-dispatches-through-process-transport ()
+  "Resize should use a transport helper instead of the PTY primitive directly."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--resize-timer nil)
+          (ghostel--force-next-redraw nil)
+          (resize-call nil)
+          (redraw-called nil)
+          (window 'fake-window)
+          (cur-buf (current-buffer)))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(80 . 25)))
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'selected-window) (lambda () window))
+                  ((symbol-function 'window-buffer)
+                   (lambda (win)
+                     (when (eq win window)
+                       cur-buf)))
+                  ((symbol-function 'process-buffer) (lambda (_) cur-buf))
+                  ((symbol-function 'buffer-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--conpty-active-p) (lambda () t))
+                  ((symbol-function 'ghostel--set-size) #'ignore)
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (buf)
+                     (setq redraw-called buf)))
+                  ((symbol-function 'ghostel--process-set-window-size)
+                   (lambda (proc height width)
+                     (setq resize-call (list proc height width))))
+                  ((symbol-function 'set-process-window-size)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct set-process-window-size: %S"
+                              args)))))
+          (should (equal '(80 . 25)
+                         (ghostel--window-adjust-process-window-size
+                          'fake-process (list window))))
+          (should (equal '(fake-process 25 80) resize-call))
+          (should (eq cur-buf redraw-called)))))))
 
 (provide 'ghostel-keys-test)
 ;;; ghostel-keys-test.el ends here

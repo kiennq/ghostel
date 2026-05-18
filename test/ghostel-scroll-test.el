@@ -492,6 +492,7 @@ rows in the viewport — with or without the trailing newline."
   "Yanking in Emacs mode scrolls the window to the live cursor."
   (let ((kill-ring '("hello"))
         (kill-ring-yank-pointer nil)
+        (interprogram-paste-function nil)
         sent-text)
     (ghostel-test--with-scroll-on-input-window t
 	    (setq ghostel--input-mode 'emacs)

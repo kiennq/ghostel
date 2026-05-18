@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 
 const gt = @import("ghostty-vt");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const utils = @import("utils.zig");
 
 pub const SavedMarker = struct {
