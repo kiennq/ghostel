@@ -227,9 +227,12 @@ jobs:
       - name: Run native module tests
         shell: bash
         run: |
-          emacs --batch -Q -L "$RUNNER_TEMP/compat" -L lisp -L test \
-            --eval '(setq ghostel-module-directory (expand-file-name "zig-out/bin" default-directory))' \
-            -l ert \
-            -l test/ghostel-test-helpers.el \
-            --eval '(dolist (file (directory-files "test" t "^ghostel-.*-test\\.el$")) (load file nil t))' \
-            --eval "(ert-run-tests-batch-and-exit '(tag native))"
+          find test -maxdepth 1 -name 'ghostel-*-test.el' -print | sort | while IFS= read -r file; do
+            printf '  NATIVE  %s\n' "${file##*/}"
+            emacs --batch -Q -L "$RUNNER_TEMP/compat" -L lisp -L test \
+              --eval '(setq ghostel-module-directory (expand-file-name "zig-out/bin" default-directory))' \
+              -l ert \
+              -l test/ghostel-test-helpers.el \
+              -l "$file" \
+              --eval "(ert-run-tests-batch-and-exit '(tag native))"
+          done

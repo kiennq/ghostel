@@ -5,7 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const GhostelHandler = @import("GhostelHandler.zig");
 const Renderer = @import("Renderer.zig");
@@ -149,8 +149,12 @@ pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void 
 
 var module_alloc: Allocator = undefined;
 
-pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+pub fn setModuleAllocator(allocator: Allocator) void {
     module_alloc = allocator;
+}
+
+pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+    setModuleAllocator(allocator);
     env.registerFunctions(&emacs_functions);
 }
 
@@ -309,16 +313,16 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
             pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) emacs.Value {
                 // Reject out-of-range row/col counts rather than wrapping/panicking.
                 const rows = std.math.cast(u16, env.extractInteger(args[0])) orelse {
-                    env.signalError("rows out of range", .{});
+                    env.signalError("rows out of range");
                     return env.nil();
                 };
                 const cols = std.math.cast(u16, env.extractInteger(args[1])) orelse {
-                    env.signalError("cols out of range", .{});
+                    env.signalError("cols out of range");
                     return env.nil();
                 };
                 const max_scrollback: usize = if (nargs > 2 and env.isNotNil(args[2]))
                     (std.math.cast(usize, env.extractInteger(args[2])) orelse {
-                        env.signalError("max-scrollback out of range", .{});
+                        env.signalError("max-scrollback out of range");
                         return env.nil();
                     })
                 else
@@ -327,7 +331,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 // (skips the storage allocation in libghostty's screen state).
                 const kitty_storage_limit: usize = if (nargs > 3 and env.isNotNil(args[3]))
                     (std.math.cast(usize, env.extractInteger(args[3])) orelse {
-                        env.signalError("kitty-storage-limit out of range", .{});
+                        env.signalError("kitty-storage-limit out of range");
                         return env.nil();
                     })
                 else
@@ -347,7 +351,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 effects.title_changed = &titleChangedCallback;
                 effects.size = &sizeCallback;
                 const term = init(module_alloc, cols, rows, max_scrollback, effects) catch {
-                    env.signalError("failed to create terminal", .{});
+                    env.signalError("failed to create terminal");
                     return env.nil();
                 };
                 // Set default colors (light gray on black)
@@ -361,7 +365,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                         (kitty_mediums & 0x2) != 0,
                         (kitty_mediums & 0x4) != 0,
                     ) catch |err|
-                        env.logError("enableKittyGraphics failed: %s", .{@errorName(err)});
+                        env.logErrorf("enableKittyGraphics failed: %s", .{@errorName(err)});
                 }
                 return env.makeUserPtr(terminalFinalize, term);
             }
@@ -378,16 +382,16 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
                 const term = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid terminal handle", .{});
+                    env.signalError("invalid terminal handle");
                     return env.nil();
                 };
-                // Extract string data — try stack buffer first, fall back to alloc
+                var arena = std.heap.ArenaAllocator.init(module_alloc);
+                defer arena.deinit();
+                const allocator = arena.allocator();
+                // Extract string data — try stack buffer first, fall back to arena
                 var stack_buf: [65536]u8 = undefined;
-                var heap_buf: ?[]const u8 = null;
-                defer if (heap_buf) |hb| module_alloc.free(hb);
                 const data = env.extractString(args[1], &stack_buf) orelse blk: {
-                    heap_buf = env.extractStringAlloc(args[1], module_alloc);
-                    break :blk heap_buf;
+                    break :blk env.extractStringAlloc(args[1], allocator);
                 };
                 if (data == null) {
                     return env.nil();
@@ -430,15 +434,15 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) emacs.Value {
                 const term = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid terminal handle", .{});
+                    env.signalError("invalid terminal handle");
                     return env.nil();
                 };
                 const rows = std.math.cast(u16, env.extractInteger(args[1])) orelse {
-                    env.signalError("rows out of range", .{});
+                    env.signalError("rows out of range");
                     return env.nil();
                 };
                 const cols = std.math.cast(u16, env.extractInteger(args[2])) orelse {
-                    env.signalError("cols out of range", .{});
+                    env.signalError("cols out of range");
                     return env.nil();
                 };
                 // Clamp cell dimensions to at least 1.  A zero (or negative,
@@ -506,7 +510,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const force_full = nargs > 1 and env.isNotNil(args[1]);
                 term.renderer.redraw(term.alloc, env, force_full) catch |err| {
                     env.logStackTrace(@errorReturnTrace());
-                    env.signalError("Redraw failed: %s", .{@errorName(err)});
+                    env.signalErrorf("Redraw failed: %s", .{@errorName(err)});
                     return env.nil();
                 };
                 // Kitty placement queries report `viewport_row' relative to the current
@@ -522,7 +526,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 _ = env.f("ghostel--kitty-clear", .{});
                 kitty_graphics.emitPlacements(env, term) catch |err| {
                     env.logStackTrace(@errorReturnTrace());
-                    env.logError("emitPlacements failed: %s", .{@errorName(err)});
+                    env.logErrorf("emitPlacements failed: %s", .{@errorName(err)});
                 };
                 return env.nil();
             }
@@ -552,7 +556,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const mods = input.parseMods(mod_str);
                 const sent = input.encodeAndSend(env, term, key, mods, utf8) catch |err| {
                     env.logStackTrace(@errorReturnTrace());
-                    env.signalError("encodeAndSend failed: %s", .{@errorName(err)});
+                    env.signalErrorf("encodeAndSend failed: %s", .{@errorName(err)});
                     return env.nil();
                 };
                 return if (sent) env.t() else env.nil();
@@ -577,7 +581,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const mods = env.extractInteger(args[5]);
                 const sent = input.encodeAndSendMouse(env, term, action, button, row, col, mods) catch |err| {
                     env.logStackTrace(@errorReturnTrace());
-                    env.signalError("encodeAndSendMouse failed: %s", .{@errorName(err)});
+                    env.signalErrorf("encodeAndSendMouse failed: %s", .{@errorName(err)});
                     return env.nil();
                 };
                 return if (sent) env.t() else env.nil();
@@ -623,12 +627,12 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
                 const term = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid terminal handle", .{});
+                    env.signalError("invalid terminal handle");
                     return env.nil();
                 };
                 var str_buf: [2048]u8 = undefined;
                 const colors_str = env.extractString(args[1], &str_buf) orelse {
-                    env.signalError("invalid palette string", .{});
+                    env.signalError("invalid palette string");
                     return env.nil();
                 };
                 var palette = term.terminal.colors.palette.current;
@@ -674,25 +678,25 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
                 const term = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid terminal handle", .{});
+                    env.signalError("invalid terminal handle");
                     return env.nil();
                 };
                 var fg_buf: [16]u8 = undefined;
                 var bg_buf: [16]u8 = undefined;
                 const fg_str = env.extractString(args[1], &fg_buf) orelse {
-                    env.signalError("invalid foreground color", .{});
+                    env.signalError("invalid foreground color");
                     return env.nil();
                 };
                 const bg_str = env.extractString(args[2], &bg_buf) orelse {
-                    env.signalError("invalid background color", .{});
+                    env.signalError("invalid background color");
                     return env.nil();
                 };
                 const fg = parseHexColor(fg_str) orelse {
-                    env.signalError("cannot parse foreground color", .{});
+                    env.signalError("cannot parse foreground color");
                     return env.nil();
                 };
                 const bg = parseHexColor(bg_str) orelse {
-                    env.signalError("cannot parse background color", .{});
+                    env.signalError("cannot parse background color");
                     return env.nil();
                 };
                 term.setColorForeground(fg);
@@ -722,13 +726,13 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 } else {
                     var hex_buf: [16]u8 = undefined;
                     const hex = env.extractString(val, &hex_buf) orelse {
-                        env.signalError("invalid bold config value", .{});
+                        env.signalError("invalid bold config value");
                         return env.nil();
                     };
                     if (parseHexColor(hex)) |color| {
                         term.renderer.bold_config = .{ .color = color };
                     } else {
-                        env.signalError("invalid bold color: %s", .{hex});
+                        env.signalErrorf("invalid bold color: %s", .{hex});
                         return env.nil();
                     }
                 }
@@ -749,11 +753,11 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
                 const raw_int = env.extractInteger(args[1]);
                 const mode_int = std.math.cast(u16, raw_int) orelse {
-                    env.signalError("invalid mode value: %d", .{raw_int});
+                    env.signalErrorf("invalid mode value: %d", .{raw_int});
                     return env.nil();
                 };
                 const mode = std.meta.intToEnum(gt.modes.Mode, mode_int) catch {
-                    env.signalError("invalid mode value: %d", .{raw_int});
+                    env.signalErrorf("invalid mode value: %d", .{raw_int});
                     return env.nil();
                 };
                 return if (term.terminal.modes.get(mode)) env.t() else env.nil();
@@ -795,7 +799,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 var writer = std.io.Writer.Allocating.init(module_alloc);
                 defer writer.deinit();
                 formatter.format(&writer.writer) catch {
-                    env.signalError("formatter failed", .{});
+                    env.signalError("formatter failed");
                     return env.nil();
                 };
                 const written = writer.written();
@@ -836,6 +840,181 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const entry = pin.node.data.hyperlink_set.get(pin.node.data.memory, link_id);
                 const uri = entry.uri.slice(pin.node.data.memory);
                 return env.makeString(uri);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Scroll the terminal viewport by DELTA lines.
+        \\
+        \\(ghostel--scroll TERM DELTA)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const delta = env.extractInteger(args[1]);
+                term.terminal.scrollViewport(.{ .delta = @intCast(delta) });
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-top",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the top of scrollback.
+        \\
+        \\(ghostel--scroll-top TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                term.terminal.scrollViewport(.top);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-bottom",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the bottom.
+        \\
+        \\(ghostel--scroll-bottom TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                term.terminal.scrollViewport(.bottom);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--debug-state",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return debug info about terminal/render state.
+        \\
+        \\(ghostel--debug-state TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                var buf: [4096]u8 = undefined;
+                return env.makeString(term.renderer.debugState(term.alloc, &buf));
+            }
+        },
+    },
+    .{
+        .name = "ghostel--debug-feed",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Feed STR to terminal and return first row + cursor.
+        \\
+        \\(ghostel--debug-feed TERM STR)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                var stack_buf: [4096]u8 = undefined;
+                const data = env.extractString(args[1], &stack_buf) orelse return env.nil();
+                var buf: [2048]u8 = undefined;
+                return env.makeString(term.renderer.debugFeed(term, data, &buf));
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-position",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return terminal cursor position as (COL . ROW), 0-indexed.
+        \\
+        \\(ghostel--cursor-position TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const pos = term.renderer.cursorPosition(term.alloc) catch |err| {
+                    env.signalErrorf("cursor position failed: %s", .{@errorName(err)});
+                    return env.nil();
+                } orelse return env.nil();
+                return env.cons(@as(i64, @intCast(pos.x)), @as(i64, @intCast(pos.y)));
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-row-char-offset",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return cursor Emacs char offset from its row start.
+        \\
+        \\(ghostel--cursor-row-char-offset TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const offset = term.renderer.cursorRowCharOffset(term.alloc) catch |err| {
+                    env.signalErrorf("cursor row char offset failed: %s", .{@errorName(err)});
+                    return env.nil();
+                } orelse return env.nil();
+                return env.makeInteger(offset);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-pending-wrap-p",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return t if the cursor is in pending-wrap state.
+        \\
+        \\(ghostel--cursor-pending-wrap-p TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                return if (term.terminal.screens.active.cursor.pending_wrap) env.t() else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-on-empty-row-p",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return t if the cursor row has no written cells or styled cells.
+        \\
+        \\(ghostel--cursor-on-empty-row-p TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const empty = term.renderer.cursorOnEmptyRow(term.alloc) catch |err| {
+                    env.signalErrorf("row emptiness check failed: %s", .{@errorName(err)});
+                    return env.nil();
+                } orelse return env.nil();
+                return if (empty) env.t() else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--redraw-full-scrollback",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Render entire scrollback into buffer, return original viewport line.
+        \\
+        \\(ghostel--redraw-full-scrollback TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const line = term.renderer.redrawFullScrollback(term.alloc, env) catch |err| {
+                    env.logStackTrace(@errorReturnTrace());
+                    env.signalErrorf("redrawFullScrollback failed: %s", .{@errorName(err)});
+                    return env.nil();
+                };
+                return env.makeInteger(line);
             }
         },
     },

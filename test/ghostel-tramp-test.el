@@ -29,6 +29,7 @@ behavior for an idle shell reading stdin differs across implementations
 
 ;;; Rendering / resize pipeline tests moved to `ghostel-render-test.el`.
 
+
 (ert-deftest ghostel-test-local-host-p ()
   "Test local hostname detection."
   (should (ghostel--local-host-p nil))
@@ -220,6 +221,7 @@ behavior for an idle shell reading stdin differs across implementations
 Setting `LINES'/`COLUMNS' env vars freezes ncurses apps like htop at
 start-up size and breaks live resize."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-env nil)
         (orig-make-process (symbol-function #'make-process)))
     (cl-letf (((symbol-function #'make-process)
@@ -268,6 +270,7 @@ TERMINFO and TERM_PROGRAM must not leak through when the user opts
 out — otherwise outbound `ssh' (or any consumer of those vars) would
 falsely conclude that ghostty is the controlling terminal."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-env nil)
         (orig-make-process (symbol-function #'make-process)))
     (cl-letf (((symbol-function #'make-process)
@@ -306,6 +309,7 @@ The `auto' default follows `ghostel-tramp-shell-integration': enabled
 when that's non-nil, off otherwise.  Setting it to t forces on,
 setting it to nil forces off."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-env nil)
         (orig-make-process (symbol-function #'make-process)))
     (cl-letf (((symbol-function #'make-process)
@@ -411,10 +415,10 @@ and absent (fall back to `xterm-256color' so echo works)."
   (let* ((ghostel-term "xterm-ghostty")
          (preamble (ghostel--remote-term-preamble)))
     ;; Default value for the case infocmp fails.
-    (should (string-match-p "\\bTERM=xterm-256color;" preamble))
+    (should (string-match-p "\\bTERM=\"?xterm-256color\"?;" preamble))
     ;; Probe and conditional upgrade.
     (should (string-match-p "infocmp xterm-ghostty" preamble))
-    (should (string-match-p "\\bTERM=xterm-ghostty;" preamble))
+    (should (string-match-p "\\bTERM=\"?xterm-ghostty\"?;" preamble))
     (should (string-match-p "TERM_PROGRAM=ghostty;" preamble))
     (should (string-match-p "TERM_PROGRAM_VERSION=" preamble))
     ;; Co-located bundle gets prepended to TERMINFO_DIRS — so a
@@ -452,12 +456,12 @@ and absent (fall back to `xterm-256color' so echo works)."
     (should-not (string-match-p "infocmp" preamble))
     (should-not (string-match-p "TERM_PROGRAM=ghostty" preamble))
     (should-not (string-match-p "TERMINFO_DIRS" preamble))
-    (should (string-match-p "TERM=xterm-256color" preamble))
+    (should (string-match-p "TERM=\"?xterm-256color\"?" preamble))
     (should (string-match-p "COLORTERM=truecolor" preamble)))
   (let* ((ghostel-term "screen-256color")
          (preamble (ghostel--remote-term-preamble)))
     (should-not (string-match-p "infocmp" preamble))
-    (should (string-match-p "TERM=screen-256color" preamble))))
+    (should (string-match-p "TERM=\"?screen-256color\"?" preamble))))
 
 (ert-deftest ghostel-test-spawn-pty-uses-remote-term-preamble ()
   "`ghostel--spawn-pty' embeds the remote preamble in the wrapper script.
@@ -547,11 +551,33 @@ When a user sets TERM via `ghostel-environment', it must win over the
 internal `TERM=xterm-ghostty' so a `process-environment' lookup (which
 returns the first match) resolves to the user's value."
   (let ((captured-env nil)
-        (orig-make-process (symbol-function #'make-process)))
-    (cl-letf (((symbol-function #'make-process)
+        (orig-make-pipe-process (symbol-function #'make-pipe-process))
+        (default-dir (file-name-as-directory temporary-file-directory)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
                (lambda (&rest plist)
                  (setq captured-env process-environment)
-                 (apply orig-make-process plist))))
+                 (ignore plist)
+                 (make-pipe-process :name "ghostel-test-fake"
+                                    :buffer (current-buffer)
+                                    :noquery t
+                                    :filter #'ignore
+                                    :sentinel #'ignore)))
+              ((symbol-function #'make-pipe-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-pipe-process plist)))
+              ((symbol-function #'set-process-window-size) #'ignore)
+              ((symbol-function #'set-process-coding-system) #'ignore)
+              ((symbol-function #'set-process-query-on-exit-flag) #'ignore)
+              ((symbol-function #'process-put) (lambda (&rest _) nil))
+              ((symbol-function #'conpty--init)
+               (lambda (&rest _)
+                 (setq captured-env process-environment)
+                 t)))
       (with-temp-buffer
         ;; `ghostel--start-process' reads dims from these buffer-locals
         ;; (set by `ghostel--init-buffer' in the real flow).
@@ -561,12 +587,18 @@ returns the first match) resolves to the user's value."
                (ghostel-shell "/bin/sh")
                (ghostel-shell-integration nil)
                (ghostel-environment '("TERM=dumb" "MY_VAR=42"))
-               (default-directory "/tmp/")
+               (default-directory default-dir)
                (proc (ghostel--start-process)))
           (unwind-protect
-              (let ((term-idx (seq-position captured-env "TERM=dumb"))
-                    (default-term-idx
-                     (seq-position captured-env "TERM=xterm-ghostty")))
+              (let* ((term-idx (seq-position captured-env "TERM=dumb"))
+                     (default-term-idx
+                      (and term-idx
+                           (cl-position-if
+                            (lambda (entry)
+                              (and (string-prefix-p "TERM=" entry)
+                                   (not (equal entry "TERM=dumb"))))
+                            captured-env
+                            :start (1+ term-idx)))))
                 (should (member "MY_VAR=42" captured-env))
                 (should term-idx)
                 (should default-term-idx)
@@ -661,6 +693,7 @@ Old bash versions can initialize readline before the ENV-injected
 integration script runs, so input echo must be enabled before exec.
 `sane' in `ghostel--default-stty' is what guarantees echo here."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-env nil)
         (orig-make-process (symbol-function #'make-process)))
     (cl-letf (((symbol-function #'make-process)
@@ -698,6 +731,7 @@ integration script runs, so input echo must be enabled before exec.
 It must also raise `read-process-output-max'.  Before Emacs 31 the
 former defaulted to t and throttled bursty TUI redraws."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-adaptive 'unset)
         (captured-max nil)
         (orig-make-process (symbol-function #'make-process)))
@@ -936,6 +970,7 @@ sentinel value, and verify the value reached `make-process'.  Also
 verifies the hook fires in the spawning buffer with `default-directory'
 intact (with-editor's `with-editor--setup' reads `default-directory')."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-env nil)
         captured-buffer
         captured-default-directory
@@ -971,17 +1006,22 @@ intact (with-editor's `with-editor--setup' reads `default-directory')."
 Confirms the around-advice fires (capturing arguments into a buffer-
 local plist) and that it removes itself after the spawn so subsequent
 plain `ghostel' calls aren't instrumented.  Stubs out `make-process'
-so no actual shell is spawned."
+  so no actual shell is spawned."
   (let ((native-comp-enable-subr-trampolines nil)
         (display-buffer-overriding-action '(display-buffer-no-window))
         (inhibit-message t)
-        (orig-make-process (symbol-function #'make-process)))
+        (executed-command '("ghostel-test-process")))
     (cl-letf (((symbol-function #'make-process)
                (lambda (&rest plist)
                  ;; Return a dummy process object so the advice still
-                 ;; records :command from (process-command proc).
-                 (apply orig-make-process
-                        (plist-put plist :command '("true"))))))
+                 ;; records :executed-command from (process-command proc).
+                 (make-pipe-process :name (plist-get plist :name)
+                                    :buffer (plist-get plist :buffer)
+                                    :noquery t
+                                    :filter #'ignore
+                                    :sentinel #'ignore)))
+              ((symbol-function #'process-command)
+               (lambda (_proc) executed-command)))
       (let* ((buf (generate-new-buffer " *ghostel-test-debug-ghostel*"))
              ;; Stub `ghostel' to call `ghostel--spawn-pty' synchronously
              ;; in `buf' — mimics the path through `ghostel--start-process'
@@ -1014,18 +1054,14 @@ so no actual shell is spawned."
                   (should (eq 24 (plist-get cap :height)))
                   (should (eq 80 (plist-get cap :width)))
                   (should (equal "/bin/sh" (plist-get cap :program)))
-                  ;; :command is the wrapper ghostel passed to make-process
-                  ;; — captured via cl-letf* on make-process *before* the
-                  ;; test stub substitutes :command.  So it must be the
-                  ;; ghostel wrapper (("/bin/sh" "-c" "<...>")), not the
-                  ;; substituted '("true").
+                  ;; :command is the wrapper ghostel passed to make-process,
+                  ;; captured before any process-command view of the result.
                   (let ((cmd (plist-get cap :command)))
                     (should (consp cmd))
                     (should (equal "/bin/sh" (car cmd)))
                     (should (equal "-c" (cadr cmd))))
-                  ;; :executed-command is what process-command returns,
-                  ;; which is the test-substituted '("true").
-                  (should (equal '("true")
+                  ;; :executed-command is what process-command returns.
+                  (should (equal executed-command
                                  (plist-get cap :executed-command)))))
             (when (buffer-live-p buf)
               (let ((p (buffer-local-value 'ghostel--process buf)))
@@ -1059,6 +1095,284 @@ delta in the phase timings section."
       (advice-remove 'ghostel--start-process
                      #'ghostel-debug--capture-start-process)
       (kill-buffer buf))))
+
+
+
+(ert-deftest ghostel-test-start-process-state-remote-uses-remote-terminfo ()
+  "Remote startup state must not leak the local bundled terminfo path."
+  (let ((default-directory "/ssh:test@host:/tmp/")
+        (ghostel-shell-integration t)
+        (ghostel-tramp-shell-integration t)
+        (ghostel-term "xterm-ghostty"))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'ghostel--get-shell)
+               (lambda () "/bin/bash"))
+              ((symbol-function #'ghostel--detect-shell)
+               (lambda (_shell) 'bash))
+              ((symbol-function #'ghostel--setup-remote-integration)
+               (lambda (_shell-type)
+                 '(:env ("TERMINFO=/remote/tinfo")
+                   :args nil
+                   :stty "erase '^?' iutf8 -ixon"
+                   :temp-files nil
+                   :temp-dirs nil)))
+              ((symbol-function #'ghostel--terminal-env)
+               (lambda ()
+                 '("TERM=xterm-ghostty"
+                   "TERMINFO=/local/tinfo"
+                   "TERM_PROGRAM=ghostty"
+                   "COLORTERM=truecolor"
+                   "GHOSTEL_SSH_INSTALL_TERMINFO=1"))))
+      (let* ((state (ghostel--start-process-state))
+             (env (plist-get state :env-overrides)))
+        (should (member "TERM=xterm-ghostty" env))
+        (should (member "TERMINFO=/remote/tinfo" env))
+        (should-not (member "TERMINFO=/local/tinfo" env))
+        (should (member "TERM_PROGRAM=ghostty" env))
+        (should (member "GHOSTEL_SSH_INSTALL_TERMINFO=1" env))))))
+
+(ert-deftest ghostel-test-start-process-state-remote-without-terminfo-falls-back-to-xterm-256color ()
+  "Remote startup without prepared terminfo must keep a generic TERM."
+  (let ((default-directory "/ssh:test@host:/tmp/")
+        (ghostel-shell-integration t)
+        (ghostel-tramp-shell-integration nil)
+        (ghostel-term "xterm-ghostty"))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'ghostel--get-shell)
+               (lambda () "/bin/bash"))
+              ((symbol-function #'ghostel--detect-shell)
+               (lambda (_shell) 'bash)))
+      (let ((env (plist-get (ghostel--start-process-state) :env-overrides)))
+        (should (member "TERM=xterm-256color" env))
+        (should-not (member "TERM=xterm-ghostty" env))
+        (should-not (member "TERM_PROGRAM=ghostty" env))
+        (should-not (seq-some (lambda (entry)
+                                (string-prefix-p "TERMINFO=" entry))
+                              env))))))
+
+(ert-deftest ghostel-test-resize-window-adjust-filters-to-selected-window ()
+  "Window adjust computes size from only the selected Ghostel window when enabled."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel-resize-only-when-selected-window t)
+          (set-size-args nil)
+          (selected-window 'selected-window)
+          (other-window 'other-window)
+          (adjust-windows nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (&rest _args)))
+                  ((symbol-function 'selected-window)
+                   (lambda () selected-window))
+                  ((symbol-function 'window-buffer)
+                   (lambda (win)
+                     (when (memq win (list selected-window other-window))
+                       cur-buf)))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc wins)
+                     (setq adjust-windows wins)
+                     (if (equal wins (list selected-window))
+                         '(80 . 24)
+                       '(120 . 40)))))
+           (let ((result (ghostel--window-adjust-process-window-size
+                          'fake-proc (list selected-window other-window))))
+             (should (equal (list selected-window) adjust-windows))
+             (should (equal '(80 . 24) result))
+             (should (equal '(24 80) set-size-args))))))))
+
+(ert-deftest ghostel-test-resize-window-adjust-keeps-legacy-window-set-by-default ()
+  "Window adjust forwards incoming windows by default."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (set-size-args nil)
+          (selected-window 'selected-window)
+          (other-window 'other-window)
+          (incoming-windows nil)
+          (redraw-called nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (&rest _args) (setq redraw-called t)))
+                  ((symbol-function 'selected-window)
+                   (lambda () selected-window))
+                  ((symbol-function 'window-buffer)
+                   (lambda (win)
+                     (when (memq win (list selected-window other-window))
+                       cur-buf)))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc wins)
+                     (setq incoming-windows wins)
+                     '(120 . 40))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc (list other-window))))
+            (should (equal (list other-window) incoming-windows))
+            (should (equal '(120 . 40) result))
+            (should (equal '(40 120) set-size-args))
+            (should redraw-called)))))))
+
+(ert-deftest ghostel-test-resize-window-adjust-ignores-unselected-window ()
+  "Window adjust ignores unselected Ghostel windows when enabled."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel-resize-only-when-selected-window t)
+          (set-size-called nil)
+          (redraw-called nil)
+          (selected-window 'selected-window)
+          (other-window 'other-window))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (&rest _args) (setq set-size-called t)))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (&rest _args) (setq redraw-called t)))
+                  ((symbol-function 'selected-window)
+                   (lambda () selected-window))
+                  ((symbol-function 'window-buffer)
+                   (lambda (win)
+                     (when (memq win (list selected-window other-window))
+                       cur-buf)))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 40))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc (list other-window))))
+            (should (null result))
+            (should-not set-size-called)
+            (should-not redraw-called)))))))
+
+(ert-deftest ghostel-test-resize-minibuffer-crop ()
+  "Minibuffer-induced height shrink on primary screen is cropped (nil)."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'ghostel--alt-screen-p) (lambda (_t) nil))
+                  ((symbol-function 'minibuffer-depth) (lambda () 1))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 25))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (null result))
+            (should-not set-size-called)))))))
+
+(ert-deftest ghostel-test-resize-minibuffer-alt-screen-commits ()
+  "Alt-screen apps (htop/vim) skip the crop path and resize normally."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-args nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'ghostel--alt-screen-p) (lambda (_t) t))
+                  ((symbol-function 'minibuffer-depth) (lambda () 1))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 25))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (equal '(120 . 25) result))
+            (should (equal '(25 120) set-size-args))
+            (should (eql ghostel--term-rows 25))))))))
+
+(ert-deftest ghostel-test-resize-minibuffer-width-only-shrink-commits ()
+  "Width-only shrink with minibuffer open skips the crop and resizes."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-args nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'ghostel--alt-screen-p) (lambda (_t) nil))
+                  ((symbol-function 'minibuffer-depth) (lambda () 1))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ;; width 100 < 120, height unchanged.
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(100 . 40))))
+           (let ((result (ghostel--window-adjust-process-window-size
+                          'fake-proc '(fake-win))))
+             (should (equal '(100 . 40) result))
+             (should (equal '(40 100) set-size-args))))))))
+
+(ert-deftest ghostel-test-selected-window-resize-catches-up-on-selection ()
+  "Selecting a Ghostel window commits a deferred selected-window-only resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel-resize-only-when-selected-window t)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (ghostel--force-next-redraw nil)
+          (set-size-args nil)
+          (swsize-args nil)
+          (redraw-called nil)
+          (ghostel-window (selected-window)))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'selected-window)
+                   (lambda () 'other-window))
+                  ((symbol-function 'window-buffer)
+                   (lambda (win)
+                     (when (eq win ghostel-window)
+                       cur-buf)))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((symbol-function 'minibuffer-depth) (lambda () 0)))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc (list ghostel-window))))
+            (should (null result))
+            (should (equal ghostel--term-rows 40))
+            (should (equal ghostel--term-cols 120))
+            (should-not set-size-args)
+            (should-not redraw-called))
+          (cl-letf (((symbol-function 'ghostel--set-size)
+                     (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                    ((symbol-function 'ghostel--delayed-redraw)
+                     (lambda (_buf) (setq redraw-called t)))
+                    ((symbol-function 'process-live-p) (lambda (_p) t))
+                    ((symbol-function 'ghostel--process-set-window-size)
+                     (lambda (_p h w) (setq swsize-args (list h w))))
+                    ;; Regression guard for #192: if the function ever
+                    ;; reverts to `window-body-height' instead of
+                    ;; `window-screen-lines', the assertions below fail
+                    ;; because 99 ≠ 25.
+                    ((symbol-function 'window-body-height) (lambda (&rest _) 99))
+                    ((symbol-function 'window-screen-lines) (lambda () 25.0))
+                    ((symbol-function 'window-max-chars-per-line)
+                     (lambda (&rest _) 100)))
+          (ghostel--commit-cropped-size ghostel-window)
+          (should (equal '(25 100) set-size-args))
+          (should (equal '(25 100) swsize-args))
+          (should (equal ghostel--term-rows 25))
+          (should (equal ghostel--term-cols 100))
+          (should ghostel--force-next-redraw)
+          (should redraw-called)))))))
 
 (provide 'ghostel-tramp-test)
 ;;; ghostel-tramp-test.el ends here
