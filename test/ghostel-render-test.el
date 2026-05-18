@@ -993,7 +993,7 @@ scrolling libghostty's viewport."
            (mapconcat (lambda (i) (format "clear-test-%d\r\n" i))
                       (number-sequence 0 14) ""))
           (ghostel-clear)
-          ;; Simulate what delayed-redraw does after `ghostel-clear' invalidates.
+          ;; Simulate what `ghostel--redraw-now' does after `ghostel-clear' invalidates.
           (let ((inhibit-read-only t))
             (ghostel--redraw ghostel--term t))
           ;; Scrollback rows live in the buffer above the cleared
@@ -1529,7 +1529,8 @@ app redraws all rows at new width via the filter pipeline."
           (set-window-buffer (selected-window) (current-buffer))
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 6 80 100))
-          (let* ((proc (start-process "ghostel-test-w" buf "sleep" "60"))
+          (let* ((proc (make-pipe-process :name "ghostel-test-w"
+                                          :buffer buf))
                  (ghostel--process proc)
                  (inhibit-read-only t))
             (set-process-coding-system proc 'binary 'binary)
@@ -1595,7 +1596,8 @@ rendered by `ghostel--redraw-now'.  This is the exact real-world path."
           (let* ((process-environment
                   (append (list "TERM=xterm-256color" "COLUMNS=40" "LINES=10")
                           process-environment))
-                 (proc (start-process "ghostel-test-pipe" buf "sleep" "60")))
+                 (proc (make-pipe-process :name "ghostel-test-pipe"
+                                          :buffer buf)))
             (setq ghostel--process proc)
             (set-process-coding-system proc 'binary 'binary)
             (set-process-window-size proc 10 40)
@@ -1618,7 +1620,7 @@ rendered by `ghostel--redraw-now'.  This is the exact real-world path."
                   (setq ghostel--force-next-redraw t)
 
                   ;; Simulate app's SIGWINCH response arriving through the filter.
-                  ;; This is the real pipeline: filter → terminal → delayed-redraw.
+                  ;; This is the real pipeline: filter -> terminal -> redraw-now.
                   ;; Use BSU/ESU like htop does.
                   (let ((response (concat
                                    "\e[?2026h"      ; BSU
@@ -1635,7 +1637,7 @@ rendered by `ghostel--redraw-now'.  This is the exact real-world path."
                     ;; Feed through the filter into the terminal.
                     (ghostel--filter proc response))
 
-                  ;; Now call delayed-redraw (as the timer would).
+                  ;; Now call redraw-now (as the timer would).
                   (ghostel--redraw-now buf)
 
                   (let ((content (buffer-substring-no-properties (point-min) (point-max))))
@@ -1918,6 +1920,178 @@ the bright variant just like in `bright' mode."
               (should (eq 'bold (plist-get face :weight))))))
       (kill-buffer buf))))
 
+
+(ert-deftest ghostel-test-hidden-buffer-snaps-on-reshow ()
+  "Buffer re-shown after output-while-hidden snaps to the viewport (issue #177).
+Dispatches through `window-buffer-change-functions' so the hook
+wiring -- not just `ghostel--window-buffer-change' in isolation -- is exercised."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-177-snap*"))
+        (other (get-buffer-create "*ghostel-test-177-other*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t)
+                 (win (selected-window)))
+            (dotimes (i 30)
+              (ghostel--write-input term (format "pre-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (set-window-buffer win buf)
+            (goto-char (point-max))
+            (set-window-point win (point-max))
+            (set-window-start win (ghostel--viewport-start) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--redraw-now buf)
+            (let ((pre-hide-ws (window-start win)))
+              (set-window-buffer win other)
+              (dotimes (i 30)
+                (ghostel--write-input term (format "hidden-%02d\r\n" i)))
+              (setq ghostel--force-next-redraw t)
+              (ghostel--redraw-now buf)
+              (set-window-buffer win buf)
+              (set-window-start win pre-hide-ws t)
+              (run-hook-with-args 'window-buffer-change-functions win)
+              (setq ghostel--force-next-redraw t)
+              (ghostel--redraw-now buf)
+              (should (ghostel--window-anchored-p win))
+              (should (/= pre-hide-ws (window-start win)))
+              (should-not ghostel--windows-needing-snap))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf)
+      (when (buffer-live-p other) (kill-buffer other)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-on-focus ()
+  "Focus return to a cropped ghostel window commits size and SIGWINCH."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (ghostel--force-next-redraw nil)
+          (set-size-args nil)
+          (swsize-args nil)
+          (redraw-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                ((symbol-function 'ghostel--redraw-now)
+                 (lambda (_buf) (setq redraw-called t)))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p h w) (setq swsize-args (list h w))))
+                ((symbol-function 'window-body-height) (lambda (&rest _) 99))
+                ((symbol-function 'window-screen-lines) (lambda () 25.0))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size (selected-window))
+        (should (equal '(25 120) set-size-args))
+        (should (equal '(25 120) swsize-args))
+        (should (eql ghostel--term-rows 25))
+        (should (eql ghostel--term-cols 120))
+        (should ghostel--force-next-redraw)
+        (should redraw-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-cancels-link-detection ()
+  "Resize-triggered redraw should cancel pending deferred link detection."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (ghostel--plain-link-detection-timer 'pending-link-timer)
+          (ghostel--plain-link-detection-begin 11)
+          (ghostel--plain-link-detection-end 22)
+          (cancelled nil)
+          (redraw-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'ghostel--redraw-now)
+                 (lambda (_buf) (setq redraw-called t)))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'window-body-height) (lambda (&rest _) 99))
+                ((symbol-function 'window-screen-lines) (lambda () 25.0))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1))
+                ((symbol-function 'cancel-timer)
+                 (lambda (timer) (push timer cancelled))))
+        (ghostel--commit-cropped-size (selected-window))
+        (should redraw-called)
+        (should (equal '(pending-link-timer) cancelled))
+        (should (null ghostel--plain-link-detection-timer))
+        (should (null ghostel--plain-link-detection-begin))
+        (should (null ghostel--plain-link-detection-end))))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-outside-minibuffer ()
+  "Focus change outside the minibuffer does not resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                ((symbol-function 'ghostel--redraw-now) #'ignore)
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'minibuffer-depth) (lambda () 0)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-on-deselect ()
+  "Hook firing on WINDOW deselection does not resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                ((symbol-function 'ghostel--redraw-now) #'ignore)
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-frame) (lambda (_w) 'test-frame))
+                ((symbol-function 'frame-selected-window)
+                 (lambda (_f) 'other-win))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-when-matched ()
+  "If the window already matches the committed size, do nothing."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                ((symbol-function 'ghostel--redraw-now) #'ignore)
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'window-screen-lines) (lambda () 40.0))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size (selected-window))
+        (should-not set-size-called)
+        (should-not swsize-called)))))
 
 (provide 'ghostel-render-test)
 ;;; ghostel-render-test.el ends here

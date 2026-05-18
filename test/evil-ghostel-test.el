@@ -53,6 +53,12 @@ Uses mocks for native functions."
      (evil-ghostel-mode 1)
      ,@body))
 
+(defun ghostel-evil-test--insert (&rest strings)
+  "Insert STRINGS while bypassing `buffer-read-only' during test setup."
+  (let ((inhibit-read-only t))
+    (dolist (string strings)
+      (insert string))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: mode activation
 ;; -----------------------------------------------------------------------
@@ -135,7 +141,8 @@ The mock erases and reinserts the same text so these tests exercise
 `evil-ghostel--around-redraw' independent of renderer marker handling."
   `(cl-letf (((symbol-function 'ghostel--redraw)
               (lambda (_term &optional _full)
-                (let ((text (buffer-string)))
+                (let ((text (buffer-string))
+                      (inhibit-read-only t))
                   (erase-buffer)
                   (insert text))))
              ((symbol-function 'ghostel--mode-enabled)
@@ -145,7 +152,7 @@ The mock erases and reinserts the same text so these tests exercise
 (ert-deftest evil-ghostel-test-around-redraw-does-not-restore-normal-point ()
   "Normal-state point is left where the renderer placed it."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (evil-normal-state)
    (goto-char (point-min))
    (search-forward "two")
@@ -163,10 +170,10 @@ The mock erases and reinserts the same text so these tests exercise
 (ert-deftest evil-ghostel-test-around-redraw-lets-point-follow-in-emacs ()
   "Point follows the TUI cursor in `emacs'/`insert' states."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (evil-emacs-state)
    (setq-local ghostel--term 'fake
-               ghostel--cursor-pos '(0 . 2))
+              ghostel--cursor-pos '(0 . 2))
    (goto-char (point-min))
    (search-forward "five")
    (cl-letf (((symbol-function 'ghostel--redraw) #'ignore)
@@ -179,7 +186,7 @@ The mock erases and reinserts the same text so these tests exercise
 (ert-deftest evil-ghostel-test-around-redraw-preserves-visual-markers ()
   "`evil-visual-beginning'/`evil-visual-end' are restored in visual state."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (goto-char (point-min))
    (search-forward "two")
    (let ((vb-target (point)))
@@ -199,13 +206,14 @@ The mock erases and reinserts the same text so these tests exercise
 Fullscreen TUIs own the screen and drive their own redraw cycle; the
 advice must not restore point or visual markers there."
   (evil-ghostel-test--with-evil-buffer
-   (insert "one\ntwo\nthree\nfour\nfive\n")
+   (ghostel-evil-test--insert "one\ntwo\nthree\nfour\nfive\n")
    (evil-normal-state)
    (goto-char (point-min))
    (search-forward "three")
    (cl-letf (((symbol-function 'ghostel--redraw)
               (lambda (_term &optional _full)
-                (let ((text (buffer-string)))
+                (let ((text (buffer-string))
+                      (inhibit-read-only t))
                   (erase-buffer)
                   (insert text)
                   (goto-char (point-min)))))
@@ -479,7 +487,7 @@ redrawing elsewhere."
   "Test that `evil-ghostel--before-append' fires on `evil-append'."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(5 . 0)))
      (evil-normal-state)
@@ -532,7 +540,7 @@ last input line (where the terminal cursor was parked), not on the
 line the user navigated to with `kk'."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "line one\nline two\nline three")
+   (ghostel-evil-test--insert "line one\nline two\nline three")
    ;; Terminal cursor at end of line three (row 2); point on row 0.
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(10 . 2)))
@@ -554,7 +562,7 @@ Symmetric to the `I' multi-row case — without the row sync the Ctrl-e
 goes to the end of the last input line."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "line one\nline two\nline three")
+   (ghostel-evil-test--insert "line one\nline two\nline three")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(10 . 2)))
      (evil-normal-state)
@@ -576,7 +584,7 @@ cursor from line three and the user's typed characters would land on
 the last input line — what was reported as `C deletes the last line'."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "line one\nline two\nline three")
+   (ghostel-evil-test--insert "line one\nline two\nline three")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(10 . 2)))
      (evil-normal-state)
@@ -670,7 +678,7 @@ padding that should be stripped per line."
   "Test that `evil-delete' advice sends backspace keys via PTY."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -693,7 +701,7 @@ and silently no-op.  Readline's Ctrl-u clears just the input area.
 See issue #218 for the multi-line counterpart."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "$ hello")
+   (ghostel-evil-test--insert "$ hello")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ;; Terminal cursor on the same row as point.
              (ghostel--cursor-pos '(7 . 0)))
@@ -717,7 +725,7 @@ Same single-line shell rationale as `dd' — see
 `evil-ghostel-test-delete-line-same-row-uses-ctrl-u'."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "$ hello")
+   (ghostel-evil-test--insert "$ hello")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(7 . 0)))
      (evil-normal-state)
@@ -740,7 +748,7 @@ line before deleting — otherwise Ctrl+U / shortcut-style deletion would
 target the line the cursor sat on (the last input line)."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "line one\nline two\nline three")
+   (ghostel-evil-test--insert "line one\nline two\nline three")
    ;; Terminal cursor reported at end of line three (col 10, row 2)
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(10 . 2)))
@@ -771,8 +779,9 @@ on a different row than point."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
    ;; "AAA" + 77 box-padding spaces + newline + "BBB" + 77 box-padding spaces.
-   (insert (concat "AAA" (make-string 77 ?\s) "\n"
-                   "BBB" (make-string 77 ?\s)))
+   (ghostel-evil-test--insert
+    (concat "AAA" (make-string 77 ?\s) "\n"
+            "BBB" (make-string 77 ?\s)))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ;; Terminal cursor on row 1 (BBB); point will be on row 0 (AAA).
              (ghostel--cursor-pos '(0 . 1))
@@ -796,7 +805,7 @@ so calls from `evil-delete-char' (which passes only 4 args to
 `evil-delete') raised `wrong-number-of-arguments'."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (let ((inhibit-read-only t)) (insert "hello"))
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -815,7 +824,7 @@ so calls from `evil-delete-char' (which passes only 4 args to
   "Test that `evil-change' advice deletes via PTY and enters insert state."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -835,7 +844,7 @@ so calls from `evil-delete-char' (which passes only 4 args to
 Regression: delete-func arg was not optional in advice signature."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -853,7 +862,7 @@ Regression: delete-func arg was not optional in advice signature."
   "Test that `evil-replace' deletes then inserts replacement text."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -882,7 +891,7 @@ ranges don't)."
    (setq-local ghostel--term t)
    ;; Multi-line range with TUI-style padding on the first row.
    ;; meaningful-length strips per-line padding → 4 chars: "AB\nC".
-   (insert "AB   \nC")
+   (ghostel-evil-test--insert "AB   \nC")
    (goto-char (point-min))
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -910,7 +919,7 @@ ranges don't)."
   "Test that `evil-paste-after' pastes via PTY."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (kill-new "world")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0))
@@ -931,7 +940,7 @@ ranges don't)."
   "Test that Ctrl keys in insert state are sent to the terminal."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(11 . 0)))
      (evil-insert-state)
@@ -952,7 +961,7 @@ mislead the next `cursor-to-point' into computing deltas from a
 position the cursor no longer holds."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello")
+   (ghostel-evil-test--insert "hello")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(5 . 0))
              ((symbol-function 'ghostel--send-encoded) #'ignore))
@@ -989,7 +998,7 @@ instead of invoking Evil's insert-state editing commands."
 Prevents up/down arrows being sent as history navigation."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "line one\nline two\nline three")
+   (ghostel-evil-test--insert "line one\nline two\nline three")
    ;; Terminal cursor on row 2 (last line), col 5
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(5 . 2)))
@@ -1015,7 +1024,7 @@ Prevents up/down arrows being sent as history navigation."
   "Test that entering insert on the same row syncs column position."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "hello world")
+   (ghostel-evil-test--insert "hello world")
    ;; Terminal cursor on row 0, col 0
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              (ghostel--cursor-pos '(0 . 0)))
@@ -1046,7 +1055,8 @@ become `ghostel--line-input-start' / `--line-input-end'."
   `(evil-ghostel-test--with-evil-buffer
     (setq-local ghostel--term t)
     (setq-local ghostel--input-mode 'line)
-    (insert ,input-text)
+    (setq buffer-read-only nil)
+    (ghostel-evil-test--insert ,input-text)
     (setq-local ghostel--line-input-start (copy-marker ,input-start nil))
     (setq-local ghostel--line-input-end (copy-marker ,input-end t))
     (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil)))
@@ -1180,7 +1190,7 @@ C-d (`ghostel-line-mode-delete-char-or-eof')."
   (with-temp-buffer
     (evil-local-mode 1)
     (evil-normal-state)
-    (insert "hello world")
+    (ghostel-evil-test--insert "hello world")
     (goto-char (point-min))
     ;; evil-delete should work normally (modify buffer)
     (evil-delete 1 6 'inclusive nil nil)
@@ -1335,10 +1345,9 @@ Without this, `0' lands point on top of the `$ ' prompt and `0i'
 inserts at the prompt position rather than at the input start."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "$ command")
-   ;; Mark the prompt prefix so ghostel-beginning-of-input-or-line
-   ;; treats it as a prompt row.
-   (put-text-property 1 3 'ghostel-prompt t)
+   (ghostel-evil-test--insert
+    (propertize "$ " 'ghostel-prompt t)
+    "command")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil)))
      (evil-normal-state)
      (goto-char (point-max))
@@ -1355,7 +1364,7 @@ column-0 / first-non-blank behaviour — scrollback navigation must
 not be hijacked."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "  output line")  ; no ghostel-prompt property anywhere
+   (ghostel-evil-test--insert "  output line")  ; no ghostel-prompt property anywhere
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil)))
      (evil-normal-state)
      (goto-char (point-max))
@@ -1375,7 +1384,7 @@ arrows.  Mocks the live cursor at (17 . 0) and verifies the second
 sync emits zero keys once point is at col 6."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "word1 word2 word3")
+   (ghostel-evil-test--insert "word1 word2 word3")
    (goto-char (point-min))
    (move-to-column 6)
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
@@ -1398,7 +1407,7 @@ sync emits zero keys once point is at col 6."
 A follow-up `cursor-to-point' from BEG should be a no-op."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "word1 word2 word3")
+   (ghostel-evil-test--insert "word1 word2 word3")
    (goto-char (point-min))
    (move-to-column 6)
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
@@ -1427,7 +1436,7 @@ backspaces — leaving a stray `w' behind (`word wword' instead of
 content."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "word word word")
+   (ghostel-evil-test--insert "word word word")
    (goto-char (point-min))
    (move-to-column 5)  ; start of word2
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
@@ -1448,7 +1457,7 @@ terminal cursor past the start of input — observed as `cw seems
 to move the point to the beginning of the line'."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
-   (insert "word1 word2 word3")
+   (ghostel-evil-test--insert "word1 word2 word3")
    (goto-char (point-min))
    (move-to-column 6)
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
@@ -1483,7 +1492,8 @@ and silently undoing the user's `^' / `$' / `0' navigation."
    (setq-local ghostel--term-rows 5)
    ;; Push 7 buffer lines so point's buffer line (line 7) is far from
    ;; the cursor's viewport row (0) when measured in raw line numbers.
-   (insert "scroll-0\nscroll-1\nscroll-2\nscroll-3\nscroll-4\nscroll-5\nscroll-6\n$ ")
+   (ghostel-evil-test--insert
+    "scroll-0\nscroll-1\nscroll-2\nscroll-3\nscroll-4\nscroll-5\nscroll-6\n$ ")
    (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil))
              ;; Cursor on the cursor's row at viewport row 4 (last).
              (ghostel--cursor-pos '(2 . 4)))
