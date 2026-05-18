@@ -379,10 +379,10 @@ unlike semi-char mode where it tracks the terminal cursor."
   (let ((buf (generate-new-buffer " *ghostel-test-copy-nav*")))
     (unwind-protect
         (with-current-buffer buf
-          (ghostel-mode)
-          (let ((ghostel--input-mode 'copy)
-                (ghostel--term 'fake-term)
-                (inhibit-read-only t))
+            (ghostel-mode)
+            (let ((ghostel--input-mode 'copy)
+                  (ghostel--term 'fake-term)
+                  (inhibit-read-only t))
             (insert (mapconcat #'number-to-string (number-sequence 1 20) "\n"))
             (insert "   \n\n")
             (goto-char (point-min))
@@ -467,7 +467,7 @@ unlike semi-char mode where it tracks the terminal cursor."
               (should buffer-read-only)
               (ghostel-semi-char-mode)
               (should (eq ghostel--input-mode 'semi-char))
-              (should-not buffer-read-only)
+              (should buffer-read-only)
               (should (null mode-line-process)))))
       (kill-buffer buf))))
 
@@ -604,7 +604,7 @@ Otherwise the window stays where the user navigated."
               (should (ghostel--terminal-live-p))     ; but now unfrozen
               (ghostel-semi-char-mode)
               (should (eq ghostel--input-mode 'semi-char))
-              (should-not buffer-read-only))))
+              (should buffer-read-only))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-emacs-to-copy-transition ()
@@ -683,9 +683,49 @@ Otherwise the window stays where the user navigated."
               (ghostel-char-mode)  (should (eq ghostel--input-mode 'char))
               (ghostel-semi-char-mode)
               (should (eq ghostel--input-mode 'semi-char))
-              ;; Read-only flag is consistently off after returning.
-              (should-not buffer-read-only))))
+              ;; Terminal input modes keep the renderer-owned buffer read-only.
+              (should buffer-read-only))))
       (kill-buffer buf))))
+
+
+
+(ert-deftest ghostel-test-copy-mode-uses-mode-line-process ()
+  "Copy mode uses `mode-line-process' instead of mutating `mode-name'."
+  (let ((buf (generate-new-buffer " *ghostel-test-mode-line*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--redraw-timer nil))
+            (ghostel-copy-mode)
+            (should (equal ":Copy" mode-line-process))
+            (should (equal "Ghostel" mode-name))
+            (ghostel-readonly-exit)
+            (should-not mode-line-process)
+            (should (equal "Ghostel" mode-name))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-suppress-interfering-modes-disables-pixel-scroll ()
+  "Ghostel disables pixel-scroll precision in terminal buffers."
+  (let ((buf (generate-new-buffer " *ghostel-test-pixel-scroll*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq-local pixel-scroll-precision-mode t)
+          (ghostel--suppress-interfering-modes)
+          (should-not pixel-scroll-precision-mode))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-ghostel-term-standard-value-respects-platform ()
+  "`ghostel-term' should default to a safe platform-specific TERM."
+  (let ((standard-value (car (get 'ghostel-term 'standard-value))))
+    (should (equal "xterm-ghostty"
+                   (let ((system-type 'gnu/linux))
+                     (eval standard-value))))
+    (should (equal "xterm-256color"
+                   (let ((system-type 'windows-nt))
+                     (eval standard-value))))))
 
 (provide 'ghostel-modes-test)
 ;;; ghostel-modes-test.el ends here

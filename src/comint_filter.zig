@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 
 const gt = @import("ghostty-vt");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const style_face = @import("style_face.zig");
 const parseHexColor = @import("utils.zig").parseHexColor;
 
@@ -400,8 +400,12 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
 
 var module_alloc: Allocator = undefined;
 
-pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+pub fn setModuleAllocator(allocator: Allocator) void {
     module_alloc = allocator;
+}
+
+pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+    setModuleAllocator(allocator);
     env.registerFunctions(&emacs_functions);
 }
 
@@ -432,7 +436,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, _: [*c]emacs.Value) emacs.Value {
                 const filter = Self.create(module_alloc) catch {
-                    env.signalError("failed to create comint filter state", .{});
+                    env.signalError("failed to create comint filter state");
                     return env.nil();
                 };
                 return env.makeUserPtr(comintFinalize, filter);
@@ -456,7 +460,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
                 const filter = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid comint filter state", .{});
+                    env.signalError("invalid comint filter state");
                     return env.nil();
                 };
                 var stack_buf: [65536]u8 = undefined;
@@ -468,7 +472,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 };
                 if (data == null) return env.nil();
                 return filter.feed(env, data.?) catch |err| {
-                    env.signalError("comint filter failed: %s", .{@errorName(err)});
+                    env.signalErrorf("comint filter failed: %s", .{@errorName(err)});
                     return env.nil();
                 };
             }
@@ -489,12 +493,12 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
                 const filter = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid comint filter state", .{});
+                    env.signalError("invalid comint filter state");
                     return env.nil();
                 };
                 var str_buf: [2048]u8 = undefined;
                 const colors_str = env.extractString(args[1], &str_buf) orelse {
-                    env.signalError("invalid palette string", .{});
+                    env.signalError("invalid palette string");
                     return env.nil();
                 };
                 var palette16: [16]gt.color.RGB = @splat(.{});
@@ -527,25 +531,25 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         .impl = struct {
             pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
                 const filter = env.getUserPtr(Self, args[0]) orelse {
-                    env.signalError("invalid comint filter state", .{});
+                    env.signalError("invalid comint filter state");
                     return env.nil();
                 };
                 var fg_buf: [16]u8 = undefined;
                 var bg_buf: [16]u8 = undefined;
                 const fg_str = env.extractString(args[1], &fg_buf) orelse {
-                    env.signalError("invalid foreground color", .{});
+                    env.signalError("invalid foreground color");
                     return env.nil();
                 };
                 const bg_str = env.extractString(args[2], &bg_buf) orelse {
-                    env.signalError("invalid background color", .{});
+                    env.signalError("invalid background color");
                     return env.nil();
                 };
                 const fg = parseHexColor(fg_str) orelse {
-                    env.signalError("cannot parse foreground color", .{});
+                    env.signalError("cannot parse foreground color");
                     return env.nil();
                 };
                 const bg = parseHexColor(bg_str) orelse {
-                    env.signalError("cannot parse background color", .{});
+                    env.signalError("cannot parse background color");
                     return env.nil();
                 };
                 filter.setDefaultColors(fg, bg);
