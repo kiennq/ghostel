@@ -5,7 +5,7 @@
 /// Emacs buffer.  See `redraw' below for the per-redraw algorithm
 /// (viewport parking, scrollback sync, dirty-row reuse).
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Terminal = @import("terminal.zig");
 
@@ -92,6 +92,12 @@ pub fn resize(self: *Self, cols: u16, rows: u16) void {
     self.pending_resize = .{ .cols = cols, .rows = rows };
 }
 
+fn temporarilyWritableBuffer(env: emacs.Env) bool {
+    const was_read_only = env.bufferReadOnly();
+    if (was_read_only) env.setBufferReadOnly(false);
+    return was_read_only;
+}
+
 /// Redraw the terminal into the current Emacs buffer.
 ///
 /// The Emacs buffer is a permanent record: all materialized scrollback sits
@@ -109,6 +115,9 @@ pub fn resize(self: *Self, cols: u16, rows: u16) void {
 /// When `force_full` is true, the viewport region is fully re-rendered
 /// instead of using the incremental dirty-row path.
 pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool) !void {
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
+
     // Snapshot the buffer's mark across the destructive ops below.  Both
     // paths — full (eraseBuffer / deleteRegion over the viewport) and
     // partial (per-row deleteRegion + insert) — move every marker in the
@@ -208,7 +217,7 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
 
     // Update working directory from OSC 7
     if (try term.getPwd()) |pwd| {
-        _ = env.f("ghostel--update-directory", .{pwd});
+        _ = env.call1(emacs.sym.@"ghostel--update-directory", env.makeString(pwd));
     }
 
     // Park the viewport one row above the bottom. On the next render, if
@@ -220,12 +229,20 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
     term.scrollViewport(gt.SCROLL_DELTA, -1);
 }
 
+pub fn redrawFullScrollback(self: *Self, env: emacs.Env, term: *Terminal) !i64 {
+    const scrollbar = try term.getScrollbar();
+    const viewport_line = scrollbar.offset + 1;
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    try self.redraw(env, term, true);
+    return @intCast(viewport_line);
+}
+
 fn updateFontInfo(self: *Self, env: emacs.Env) bool {
     const new_font = getDefaultFont(env);
-    const current_font = env.symbolValue("ghostel--rendered-font");
+    const current_font = env.call1(emacs.sym.@"symbol-value", emacs.sym.@"ghostel--rendered-font");
     if (env.eq(new_font, current_font)) return false;
 
-    _ = env.set("ghostel--rendered-font", new_font);
+    _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--rendered-font", new_font);
 
     if (env.isNil(new_font)) {
         self.font_info = null;
@@ -247,8 +264,8 @@ fn updateFontInfo(self: *Self, env: emacs.Env) bool {
 }
 
 fn getDefaultFont(env: emacs.Env) emacs.Value {
-    const font = env.f("face-attribute", .{ emacs.sym.default, emacs.sym.@":font" });
-    if (env.isNil(env.f("fontp", .{ font, emacs.sym.@"font-object" }))) return env.nil();
+    const font = env.call2(emacs.sym.@"face-attribute", emacs.sym.default, emacs.sym.@":font");
+    if (env.isNil(env.call2(emacs.sym.fontp, font, emacs.sym.@"font-object"))) return env.nil();
     return font;
 }
 
@@ -256,7 +273,12 @@ fn probeCoverage(env: emacs.Env, font: emacs.Value) u32 {
     const start_probe: u32 = 0xFF;
     const max_probe: u32 = 0x300;
     for (start_probe..max_probe) |x| {
-        const has_char = env.isNotNil(env.f("font-has-char-p", .{ font, x }));
+        const has_char = env.isNotNil(env.call2(
+            emacs.sym.@"font-has-char-p",
+            font,
+            env.makeInteger(@as(i64, @intCast(x))),
+        ));
+
         if (!has_char) return @intCast(x);
     }
 
@@ -449,6 +471,228 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps, default_co
 fn isRowWrapped(self: *Self) !bool {
     const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, self.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
     return try gt.row.get(bool, raw_row, gt.ROW_DATA_WRAP);
+}
+
+pub const CursorPosition = struct {
+    x: u16,
+    y: u16,
+};
+
+fn restoreViewport(term: *Terminal, offset: usize) void {
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    term.scrollViewport(gt.SCROLL_DELTA, @as(isize, @intCast(offset)));
+}
+
+fn currentCursorPosition(self: *Self) !?CursorPosition {
+    const has_value = try gt.rs.get(bool, self.render_state, gt.RS_DATA_CURSOR_VIEWPORT_HAS_VALUE);
+    if (!has_value) return null;
+
+    return .{
+        .x = try gt.rs.get(u16, self.render_state, gt.RS_DATA_CURSOR_VIEWPORT_X),
+        .y = try gt.rs.get(u16, self.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y),
+    };
+}
+
+fn refreshAtBottom(self: *Self, term: *Terminal) !?CursorPosition {
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+    try gt.renderStateUpdate(self.render_state, term.terminal);
+    return try self.currentCursorPosition();
+}
+
+pub fn cursorPosition(self: *Self, term: *Terminal) !?CursorPosition {
+    const saved_offset = (try term.getScrollbar()).offset;
+    defer restoreViewport(term, saved_offset);
+    return try self.refreshAtBottom(term);
+}
+
+fn rowCharOffset(self: *Self, cx: u16, cy: u16) !i64 {
+    if (cx == 0) return 0;
+
+    try gt.rs.read(self.render_state, gt.RS_DATA_ROW_ITERATOR, &self.row_iterator);
+
+    var ri: u16 = 0;
+    while (true) {
+        if (!gt.rs_row_next(self.row_iterator)) return 0;
+        if (ri == cy) break;
+        ri += 1;
+    }
+
+    try gt.rs_row.read(self.row_iterator, gt.RS_ROW_DATA_CELLS, &self.row_cells);
+
+    var col: u16 = 0;
+    var char_count: i64 = 0;
+    while (col < cx) : (col += 1) {
+        if (!gt.rs_row_cells_next(self.row_cells)) break;
+
+        const graphemes_len = try gt.rs_row_cells.get(u32, self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
+        if (graphemes_len == 0) {
+            const raw_cell = try gt.rs_row_cells.get(gt.c.GhosttyCell, self.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW);
+            const wide = try gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE);
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
+            char_count += 1;
+        } else {
+            char_count += @intCast(@min(graphemes_len, 16));
+        }
+    }
+
+    return char_count;
+}
+
+pub fn cursorRowCharOffset(self: *Self, term: *Terminal) !?i64 {
+    const saved_offset = (try term.getScrollbar()).offset;
+    defer restoreViewport(term, saved_offset);
+
+    const pos = try self.refreshAtBottom(term) orelse return null;
+    return try self.rowCharOffset(pos.x, pos.y);
+}
+
+pub fn isRowEmptyAt(self: *Self, term: *Terminal, cy: u16) !bool {
+    try gt.rs.read(self.render_state, gt.RS_DATA_ROW_ITERATOR, &self.row_iterator);
+
+    var ri: u16 = 0;
+    while (true) {
+        if (!gt.rs_row_next(self.row_iterator)) return false;
+        if (ri == cy) break;
+        ri += 1;
+    }
+
+    const raw_row = try gt.rs_row.get(gt.c.GhosttyRow, self.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW);
+    const row_hints = try readRowHints(raw_row);
+    try gt.rs_row.read(self.row_iterator, gt.RS_ROW_DATA_CELLS, &self.row_cells);
+
+    while (gt.rs_row_cells_next(self.row_cells)) {
+        const graphemes_len = try gt.rs_row_cells.get(u32, self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN);
+        if (graphemes_len > 0) return false;
+
+        const raw_cell = try gt.rs_row_cells.get(gt.c.GhosttyCell, self.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW);
+        const wide = try gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE);
+        if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
+
+        const prop_key = CellPropKey{
+            .style_id = if (row_hints.may_have_style)
+                try gt.cell.get(gt.c.GhosttyStyleId, raw_cell, gt.c.GHOSTTY_CELL_DATA_STYLE_ID)
+            else
+                null,
+            .hyperlink = if (row_hints.may_have_hyperlink)
+                try gt.cell.get(bool, raw_cell, gt.c.GHOSTTY_CELL_DATA_HAS_HYPERLINK)
+            else
+                false,
+            .prompt = false,
+            .input = false,
+        };
+        if (try self.readCellProps(term, self.row_cells, prop_key) != null) return false;
+    }
+
+    return true;
+}
+
+pub fn cursorOnEmptyRow(self: *Self, term: *Terminal) !?bool {
+    const saved_offset = (try term.getScrollbar()).offset;
+    defer restoreViewport(term, saved_offset);
+
+    const pos = try self.refreshAtBottom(term) orelse return null;
+    return try self.isRowEmptyAt(term, pos.y);
+}
+
+pub fn debugState(self: *Self, term: *Terminal, buf: []u8) []const u8 {
+    const saved_offset = (term.getScrollbar() catch return "");
+    defer restoreViewport(term, saved_offset.offset);
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+
+    var pos: usize = 0;
+    const update_result = gt.c.ghostty_render_state_update(self.render_state, term.terminal);
+    pos += (std.fmt.bufPrint(buf[pos..], "update={d}\n", .{update_result}) catch return buf[0..pos]).len;
+
+    if (gt.c.ghostty_render_state_get(self.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&self.row_iterator)) != gt.SUCCESS) {
+        pos += (std.fmt.bufPrint(buf[pos..], "iter=FAIL\n", .{}) catch return buf[0..pos]).len;
+        return buf[0..pos];
+    }
+
+    var row_idx: usize = 0;
+    while (gt.c.ghostty_render_state_row_iterator_next(self.row_iterator)) : (row_idx += 1) {
+        if (row_idx >= 10) break;
+
+        if (gt.c.ghostty_render_state_row_get(self.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&self.row_cells)) != gt.SUCCESS) {
+            pos += (std.fmt.bufPrint(buf[pos..], "row{d}=FAIL\n ", .{row_idx}) catch break).len;
+            continue;
+        }
+
+        pos += (std.fmt.bufPrint(buf[pos..], "row{d}=\"", .{row_idx}) catch break).len;
+        var col: usize = 0;
+        while (gt.c.ghostty_render_state_row_cells_next(self.row_cells)) : (col += 1) {
+            if (col >= 80) break;
+            var graphemes_len: u32 = 0;
+            if (gt.c.ghostty_render_state_row_cells_get(self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) != gt.SUCCESS) continue;
+
+            if (graphemes_len == 0) {
+                if (pos < buf.len) {
+                    buf[pos] = ' ';
+                    pos += 1;
+                }
+                continue;
+            }
+
+            var codepoints: [4]u32 = undefined;
+            if (gt.c.ghostty_render_state_row_cells_get(self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&codepoints)) != gt.SUCCESS) continue;
+            const cp: u21 = @intCast(codepoints[0]);
+            const remaining = buf[pos..];
+            if (remaining.len < 4) break;
+            const enc_len = std.unicode.utf8Encode(cp, remaining) catch continue;
+            pos += enc_len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "\"\n", .{}) catch break).len;
+    }
+
+    return buf[0..pos];
+}
+
+pub fn debugFeed(self: *Self, term: *Terminal, data: []const u8, buf: []u8) []const u8 {
+    const saved_offset = (term.getScrollbar() catch return "");
+    defer restoreViewport(term, saved_offset.offset);
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+
+    gt.c.ghostty_terminal_vt_write(term.terminal, data.ptr, data.len);
+    _ = gt.c.ghostty_render_state_update(self.render_state, term.terminal);
+
+    var cx: u16 = 0;
+    var cy: u16 = 0;
+    _ = gt.c.ghostty_terminal_get(term.terminal, gt.c.GHOSTTY_TERMINAL_DATA_CURSOR_X, @ptrCast(&cx));
+    _ = gt.c.ghostty_terminal_get(term.terminal, gt.c.GHOSTTY_TERMINAL_DATA_CURSOR_Y, @ptrCast(&cy));
+
+    if (gt.c.ghostty_render_state_get(self.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&self.row_iterator)) != gt.SUCCESS) {
+        return "iter-fail";
+    }
+
+    var pos: usize = 0;
+    pos += (std.fmt.bufPrint(buf[pos..], "cur=({d},{d})\n row0=\"", .{ cx, cy }) catch return "").len;
+
+    if (gt.c.ghostty_render_state_row_iterator_next(self.row_iterator)) {
+        if (gt.c.ghostty_render_state_row_get(self.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&self.row_cells)) == gt.SUCCESS) {
+            var col: usize = 0;
+            while (gt.c.ghostty_render_state_row_cells_next(self.row_cells)) : (col += 1) {
+                if (col >= 60) break;
+                var gl: u32 = 0;
+                if (gt.c.ghostty_render_state_row_cells_get(self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&gl)) != gt.SUCCESS) continue;
+                if (gl == 0) {
+                    if (pos < buf.len) {
+                        buf[pos] = ' ';
+                        pos += 1;
+                    }
+                    continue;
+                }
+                var cp: [4]u32 = undefined;
+                if (gt.c.ghostty_render_state_row_cells_get(self.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&cp)) != gt.SUCCESS) continue;
+                const c21: u21 = @intCast(cp[0]);
+                const rem = buf[pos..];
+                if (rem.len < 4) break;
+                const el = std.unicode.utf8Encode(c21, rem) catch continue;
+                pos += el;
+            }
+        }
+    }
+    pos += (std.fmt.bufPrint(buf[pos..], "\"", .{}) catch return buf[0..pos]).len;
+
+    return buf[0..pos];
 }
 
 /// Properties for a run of cells.
@@ -902,10 +1146,11 @@ pub fn render(self: *Self, env: emacs.Env, term: *Terminal, skip: usize, force_f
         // Set buffer default face
         var fg_hex: [7]u8 = undefined;
         var bg_hex: [7]u8 = undefined;
-        _ = env.f("ghostel--set-buffer-face", .{
-            formatColor(default_colors.fg, &fg_hex),
-            formatColor(default_colors.bg, &bg_hex),
-        });
+        _ = env.call2(
+            emacs.sym.@"ghostel--set-buffer-face",
+            env.makeString(formatColor(default_colors.fg, &fg_hex)),
+            env.makeString(formatColor(default_colors.bg, &bg_hex)),
+        );
 
         // Incremental redraw: only update dirty rows when possible.
         // force_full bypasses partial mode to avoid stale rows after scrolls.
@@ -917,7 +1162,7 @@ pub fn render(self: *Self, env: emacs.Env, term: *Terminal, skip: usize, force_f
             row_count += 1;
             // Clear per-row dirty flag
             gt.rs_row.set(self.row_iterator, gt.RS_ROW_OPT_DIRTY, false) catch |err| {
-                env.logError("rs_row.set(DIRTY, false) failed: %s", .{@errorName(err)});
+                env.logErrorf("ghostel: rs_row.set(DIRTY, false) failed: {s}", .{@errorName(err)});
             };
         }) {
             if (row_count < skip) continue;
@@ -965,17 +1210,22 @@ fn renderCursor(self: *Self, env: emacs.Env) !void {
             env.moveToColumn(@as(i64, cx));
         }
 
-        _ = env.set("ghostel--cursor-pos", env.cons(cx, cy));
-        _ = env.set("ghostel--cursor-char-pos", env.point());
+        _ = env.call2(
+            emacs.sym.set,
+            emacs.sym.@"ghostel--cursor-pos",
+            env.call2(emacs.sym.cons, env.makeInteger(cx), env.makeInteger(cy)),
+        );
+        _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--cursor-char-pos", env.point());
     } else {
-        _ = env.set("ghostel--cursor-pos", env.nil());
-        _ = env.set("ghostel--cursor-char-pos", env.nil());
+        _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--cursor-pos", env.nil());
+        _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--cursor-char-pos", env.nil());
     }
 
-    _ = env.f("ghostel--set-cursor-style", .{
-        cursor_style,
+    _ = env.call2(
+        emacs.sym.@"ghostel--set-cursor-style",
+        env.makeInteger(@as(i64, cursor_style)),
         if (cursor_visible) env.t() else env.nil(),
-    });
+    );
 }
 
 // Render content from the current viewport scroll position all the way to
