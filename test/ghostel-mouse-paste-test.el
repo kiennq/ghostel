@@ -19,9 +19,10 @@ Returns the buffer."
       (ghostel-mode)
       (setq ghostel--term (vector 'fake-term))
       (setq ghostel--process
-            (start-process (concat "ghostel-test-focus-" name)
-                           nil "cat"))
-      (set-process-query-on-exit-flag ghostel--process nil))
+            (make-pipe-process :name (concat "ghostel-test-focus-" name)
+                               :noquery t
+                               :filter #'ignore
+                               :sentinel #'ignore)))
     buf))
 
 (defun ghostel-test--cleanup-focus-buffer (buf)
@@ -1080,7 +1081,7 @@ Emacs's regular `yank' so paste lands in the input region."
          (kill-ring-yank-pointer kill-ring)
          (ghostel--yank-index 0)
          (last-command 'ghostel-yank)
-         (ghostel--process (start-process "true" nil "true")))
+         (ghostel--process 'ghostel-test-process))
     (cl-letf (((symbol-function 'ghostel--paste-text)
                (lambda (text) (push text pasted)))
               ((symbol-function 'process-live-p) (lambda (_) t))
@@ -1267,6 +1268,34 @@ the command, with point staying at the region end."
           (ghostel-readonly-copy))
         (should deactivate-mark)
         (should (= (point) end))))))
+
+
+
+(ert-deftest ghostel-test-scroll-fallback-no-mouse-tracking ()
+  "Scroll-up/down fall back to viewport scroll when mouse tracking is off."
+  (let ((ghostel--term 'fake)
+        (ghostel--process 'fake)
+        (ghostel--copy-mode-active nil)
+        (ghostel--copy-mode-full-buffer nil)
+        (ghostel--force-next-redraw nil)
+        (scroll-delta nil)
+        (fake-up-event `(wheel-up (,(selected-window) 1 (10 . 5) 0)))
+        (fake-down-event `(wheel-down (,(selected-window) 1 (10 . 5) 0))))
+    ;; Mouse tracking off: ghostel--mouse-event returns nil
+    (cl-letf (((symbol-function 'ghostel--mouse-event)
+               (lambda (_term _action _button _row _col _mods) nil))
+              ((symbol-function 'ghostel--scroll)
+               (lambda (_term delta) (setq scroll-delta delta)))
+              ((symbol-function 'ghostel--invalidate) #'ignore)
+              ((symbol-function 'process-live-p) (lambda (_p) t)))
+      (ghostel--scroll-up fake-up-event)
+      (should (equal -3 scroll-delta))
+      (should ghostel--force-next-redraw)
+      ;; Reset and test scroll-down fallback
+      (setq scroll-delta nil ghostel--force-next-redraw nil)
+      (ghostel--scroll-down fake-down-event)
+      (should (equal 3 scroll-delta))
+      (should ghostel--force-next-redraw))))
 
 (provide 'ghostel-mouse-paste-test)
 ;;; ghostel-mouse-paste-test.el ends here

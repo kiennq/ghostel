@@ -6,7 +6,7 @@
 /// (viewport parking, scrollback sync, dirty-row reuse).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const Terminal = @import("terminal.zig");
 
@@ -69,6 +69,12 @@ pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void 
     };
 }
 
+fn temporarilyWritableBuffer(env: emacs.Env) bool {
+    const was_read_only = env.bufferReadOnly();
+    if (was_read_only) env.setBufferReadOnly(false);
+    return was_read_only;
+}
+
 /// Redraw the terminal into the current Emacs buffer.
 ///
 /// The Emacs buffer is a permanent record: all materialized scrollback sits
@@ -86,6 +92,9 @@ pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void 
 /// When `force_full` is true, the viewport region is fully re-rendered
 /// instead of using the incremental dirty-row path.
 pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool) !void {
+    const was_read_only = temporarilyWritableBuffer(env);
+    defer if (was_read_only) env.setBufferReadOnly(true);
+
     // Snapshot the buffer's mark across the destructive ops below.  Both
     // paths — full (eraseBuffer / deleteRegion over the viewport) and
     // partial (per-row deleteRegion + insert) — move every marker in the
@@ -204,6 +213,14 @@ pub fn redraw(self: *Self, env: emacs.Env, term: *Terminal, force_full_arg: bool
 /// Read the default font and rendering parameters from Emacs, compare
 /// against the cached values, and signal whether a full invalidation is
 /// required.
+pub fn redrawFullScrollback(self: *Self, env: emacs.Env, term: *Terminal) !i64 {
+    const scrollbar = term.terminal.screens.active.pages.scrollbar();
+    const viewport_line = scrollbar.offset + 1;
+    term.terminal.scrollViewport(.top);
+    try self.redraw(env, term, true);
+    return @intCast(viewport_line);
+}
+
 fn updateFontInfo(self: *Self, env: emacs.Env) bool {
     const new_font = getDefaultFont(env);
     const current_font = env.symbolValue("ghostel--rendered-font");
@@ -222,7 +239,7 @@ fn updateFontInfo(self: *Self, env: emacs.Env) bool {
         }
     }
 
-    _ = env.set("ghostel--rendered-font", new_font);
+    _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--rendered-font", new_font);
 
     if (env.isNil(new_font)) {
         self.font_info = null;
@@ -245,8 +262,8 @@ fn updateFontInfo(self: *Self, env: emacs.Env) bool {
 }
 
 fn getDefaultFont(env: emacs.Env) emacs.Value {
-    const font = env.f("face-attribute", .{ emacs.sym.default, emacs.sym.@":font" });
-    if (env.isNil(env.f("fontp", .{ font, emacs.sym.@"font-object" }))) return env.nil();
+    const font = env.call2(emacs.sym.@"face-attribute", emacs.sym.default, emacs.sym.@":font");
+    if (env.isNil(env.call2(emacs.sym.fontp, font, emacs.sym.@"font-object"))) return env.nil();
     return font;
 }
 
@@ -254,7 +271,12 @@ fn probeCoverage(env: emacs.Env, font: emacs.Value) u32 {
     const start_probe: u32 = 0xFF;
     const max_probe: u32 = 0x300;
     for (start_probe..max_probe) |x| {
-        const has_char = env.isNotNil(env.f("font-has-char-p", .{ font, x }));
+        const has_char = env.isNotNil(env.call2(
+            emacs.sym.@"font-has-char-p",
+            font,
+            env.makeInteger(@as(i64, @intCast(x))),
+        ));
+
         if (!has_char) return @intCast(x);
     }
 
@@ -409,6 +431,137 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps) !void {
         .input => env.putTextProperty(start_val, end_val, "ghostel-input", env.t()),
         else => {},
     }
+}
+
+pub const CursorPosition = struct {
+    x: u16,
+    y: u16,
+};
+
+fn restoreViewport(term: *Terminal, offset: usize) void {
+    term.terminal.scrollViewport(.top);
+    term.terminal.scrollViewport(.{ .delta = @intCast(offset) });
+}
+
+fn refreshAtBottom(self: *Self, term: *Terminal) !?CursorPosition {
+    term.terminal.scrollViewport(.bottom);
+    try self.render_state.update(term.alloc, &term.terminal);
+    if (self.render_state.cursor.viewport) |vp| {
+        return .{ .x = vp.x, .y = vp.y };
+    }
+    return null;
+}
+
+pub fn cursorPosition(self: *Self, term: *Terminal) !?CursorPosition {
+    const saved_offset = term.terminal.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(term, saved_offset);
+    return try self.refreshAtBottom(term);
+}
+
+fn rowCharOffset(self: *Self, cx: u16, cy: u16) i64 {
+    if (cx == 0 or cy >= self.render_state.rows) return 0;
+
+    var col: u16 = 0;
+    var char_count: i64 = 0;
+    const cells = &self.render_state.row_data.items(.cells)[cy];
+    while (col < cx and col < cells.len) : (col += 1) {
+        const cell = cells.get(col);
+        if (cell.raw.wide == .spacer_head or cell.raw.wide == .spacer_tail) continue;
+        const graphemes_len = 1 + if (cell.raw.hasGrapheme()) cell.grapheme.len else 0;
+        char_count += @intCast(graphemes_len);
+    }
+    return char_count;
+}
+
+pub fn cursorRowCharOffset(self: *Self, term: *Terminal) !?i64 {
+    const saved_offset = term.terminal.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(term, saved_offset);
+
+    const pos = try self.refreshAtBottom(term) orelse return null;
+    return self.rowCharOffset(pos.x, pos.y);
+}
+
+pub fn isRowEmptyAt(self: *Self, cy: u16) !bool {
+    if (cy >= self.render_state.rows) return false;
+    const row = self.render_state.row_data.get(cy);
+
+    var col: usize = 0;
+    while (col < row.cells.len) : (col += 1) {
+        const cell = row.cells.get(col);
+        if (cell.raw.wide == .spacer_head or cell.raw.wide == .spacer_tail) continue;
+        if (cell.raw.hasText() or cell.raw.hasGrapheme()) return false;
+
+        if (self.readCellProps(&cell) != null) return false;
+    }
+
+    return true;
+}
+
+pub fn cursorOnEmptyRow(self: *Self, term: *Terminal) !?bool {
+    const saved_offset = term.terminal.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(term, saved_offset);
+
+    const pos = try self.refreshAtBottom(term) orelse return null;
+    return try self.isRowEmptyAt(pos.y);
+}
+
+pub fn debugState(self: *Self, term: *Terminal, buf: []u8) []const u8 {
+    const saved_offset = term.terminal.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(term, saved_offset);
+    term.terminal.scrollViewport(.bottom);
+    self.render_state.update(term.alloc, &term.terminal) catch return "";
+
+    var pos: usize = 0;
+    pos += (std.fmt.bufPrint(buf[pos..], "rows={d} dirty={any}\n", .{
+        self.render_state.rows,
+        self.render_state.dirty,
+    }) catch return buf[0..pos]).len;
+
+    var row_idx: usize = 0;
+    while (row_idx < @min(self.render_state.rows, 10)) : (row_idx += 1) {
+        const row = self.render_state.row_data.get(@intCast(row_idx));
+        pos += (std.fmt.bufPrint(buf[pos..], "row{d}=\"", .{row_idx}) catch break).len;
+        var col: usize = 0;
+        while (col < @min(row.cells.len, 80)) : (col += 1) {
+            const cell = row.cells.get(col);
+            const cp: u21 = if (cell.raw.hasText()) cell.raw.codepoint() else ' ';
+            const remaining = buf[pos..];
+            if (remaining.len < 4) break;
+            const enc_len = std.unicode.utf8Encode(cp, remaining) catch continue;
+            pos += enc_len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "\"\n", .{}) catch break).len;
+    }
+
+    return buf[0..pos];
+}
+
+pub fn debugFeed(self: *Self, term: *Terminal, data: []const u8, buf: []u8) []const u8 {
+    const saved_offset = term.terminal.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(term, saved_offset);
+    term.terminal.scrollViewport(.bottom);
+
+    term.vtWrite(data);
+    self.render_state.update(term.alloc, &term.terminal) catch return "";
+
+    var pos: usize = 0;
+    if (self.render_state.cursor.viewport) |vp| {
+        pos += (std.fmt.bufPrint(buf[pos..], "cur=({d},{d})\n", .{ vp.x, vp.y }) catch return "").len;
+    }
+    if (self.render_state.rows == 0) return buf[0..pos];
+    const row = self.render_state.row_data.get(0);
+    pos += (std.fmt.bufPrint(buf[pos..], "row0=\"", .{}) catch return buf[0..pos]).len;
+    var col: usize = 0;
+    while (col < @min(row.cells.len, 60)) : (col += 1) {
+        const cell = row.cells.get(col);
+        const cp: u21 = if (cell.raw.hasText()) cell.raw.codepoint() else ' ';
+        const rem = buf[pos..];
+        if (rem.len < 4) break;
+        const len = std.unicode.utf8Encode(cp, rem) catch continue;
+        pos += len;
+    }
+    pos += (std.fmt.bufPrint(buf[pos..], "\"", .{}) catch return buf[0..pos]).len;
+    return buf[0..pos];
 }
 
 /// Properties for a run of cells.
@@ -824,8 +977,8 @@ fn renderCursor(self: *Self, env: emacs.Env) !void {
         _ = env.set("ghostel--cursor-pos", env.cons(vp.x, vp.y));
         _ = env.set("ghostel--cursor-char-pos", env.point());
     } else {
-        _ = env.set("ghostel--cursor-pos", env.nil());
-        _ = env.set("ghostel--cursor-char-pos", env.nil());
+        _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--cursor-pos", env.nil());
+        _ = env.call2(emacs.sym.set, emacs.sym.@"ghostel--cursor-char-pos", env.nil());
     }
 
     _ = env.f("ghostel--set-cursor-style", .{
