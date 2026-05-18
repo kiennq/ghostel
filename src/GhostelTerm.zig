@@ -5,7 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const GhostelHandler = @import("GhostelHandler.zig");
 const Renderer = @import("Renderer.zig");
@@ -140,8 +140,12 @@ pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void 
 
 var module_alloc: Allocator = undefined;
 
-pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+pub fn setModuleAllocator(allocator: Allocator) void {
     module_alloc = allocator;
+}
+
+pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+    setModuleAllocator(allocator);
     env.registerFunctions(&emacs_functions);
 }
 
@@ -386,7 +390,10 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const force_full = nargs > 1 and env.isNotNil(args[1]);
                 try term.renderer.redraw(term.alloc, env, force_full);
                 _ = env.f("ghostel--kitty-clear", .{});
-                try kitty_graphics.emitPlacements(env, term);
+                kitty_graphics.emitPlacements(env, term) catch |err| {
+                    env.logStackTrace(@errorReturnTrace());
+                    env.logErrorf("emitPlacements failed: %s", .{@errorName(err)});
+                };
                 return env.nil();
             }
         },
@@ -598,6 +605,219 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const written = writer.written();
                 if (written.len == 0) return env.nil();
                 return env.makeString(written);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--native-uri-at",
+        .arity = .{ 3, 3 },
+        .doc =
+        \\Get URI at ROW-from-bottom and COL.
+        \\
+        \\(ghostel--native-uri-at TERM ROW COL)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const row_from_bottom = env.extractInteger(args[1]);
+                const col = env.extractInteger(args[2]);
+                const total_rows = term.terminal.screens.active.pages.total_rows;
+                if (col < 0 or col >= term.terminal.cols) return env.nil();
+                // The Emacs buffer always carries a trailing newline, so the line
+                // immediately after the last content row produces row_from_bottom == 0.
+                if (row_from_bottom <= 0 or row_from_bottom > total_rows) return env.nil();
+                const row = total_rows - @as(usize, @intCast(row_from_bottom));
+                const point = gt.Point{ .screen = .{
+                    .x = @intCast(col),
+                    .y = @intCast(row),
+                } };
+                const pin = term.terminal.screens.active.pages.pin(point) orelse return env.nil();
+                const cell = pin.rowAndCell().cell;
+                if (!cell.hyperlink) {
+                    return env.nil();
+                }
+                const link_id = pin.node.data.lookupHyperlink(cell) orelse return env.nil();
+                const entry = pin.node.data.hyperlink_set.get(pin.node.data.memory, link_id);
+                const uri = entry.uri.slice(pin.node.data.memory);
+                return env.makeString(uri);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Scroll the terminal viewport by DELTA lines.
+        \\
+        \\(ghostel--scroll TERM DELTA)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const delta = env.extractInteger(args[1]);
+                term.terminal.scrollViewport(.{ .delta = @intCast(delta) });
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-top",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the top of scrollback.
+        \\
+        \\(ghostel--scroll-top TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                term.terminal.scrollViewport(.top);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-bottom",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the bottom.
+        \\
+        \\(ghostel--scroll-bottom TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                term.terminal.scrollViewport(.bottom);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--debug-state",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return debug info about terminal/render state.
+        \\
+        \\(ghostel--debug-state TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                var buf: [4096]u8 = undefined;
+                return env.makeString(term.renderer.debugState(term.alloc, &buf));
+            }
+        },
+    },
+    .{
+        .name = "ghostel--debug-feed",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Feed STR to terminal and return first row + cursor.
+        \\
+        \\(ghostel--debug-feed TERM STR)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                var stack_buf: [4096]u8 = undefined;
+                const data = env.extractString(args[1], &stack_buf) catch |err| {
+                    env.signalErrorf("failed to extract debug feed string: %s", .{@errorName(err)});
+                    return env.nil();
+                };
+                var buf: [2048]u8 = undefined;
+                return env.makeString(term.renderer.debugFeed(term, data, &buf));
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-position",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return terminal cursor position as (COL . ROW), 0-indexed.
+        \\
+        \\(ghostel--cursor-position TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const pos = term.renderer.cursorPosition(term.alloc) catch |err| {
+                    env.signalErrorf("cursor position failed: %s", .{@errorName(err)});
+                    return env.nil();
+                } orelse return env.nil();
+                return env.cons(@as(i64, @intCast(pos.x)), @as(i64, @intCast(pos.y)));
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-row-char-offset",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return cursor Emacs char offset from its row start.
+        \\
+        \\(ghostel--cursor-row-char-offset TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const offset = term.renderer.cursorRowCharOffset(term.alloc) catch |err| {
+                    env.signalErrorf("cursor row char offset failed: %s", .{@errorName(err)});
+                    return env.nil();
+                } orelse return env.nil();
+                return env.makeInteger(offset);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-pending-wrap-p",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return t if the cursor is in pending-wrap state.
+        \\
+        \\(ghostel--cursor-pending-wrap-p TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                return if (term.terminal.screens.active.cursor.pending_wrap) env.t() else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-on-empty-row-p",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return t if the cursor row has no written cells or styled cells.
+        \\
+        \\(ghostel--cursor-on-empty-row-p TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const empty = term.renderer.cursorOnEmptyRow(term.alloc) catch |err| {
+                    env.signalErrorf("row emptiness check failed: %s", .{@errorName(err)});
+                    return env.nil();
+                } orelse return env.nil();
+                return if (empty) env.t() else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--redraw-full-scrollback",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Render entire scrollback into buffer, return original viewport line.
+        \\
+        \\(ghostel--redraw-full-scrollback TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                const line = term.renderer.redrawFullScrollback(term.alloc, env) catch |err| {
+                    env.logStackTrace(@errorReturnTrace());
+                    env.signalErrorf("redrawFullScrollback failed: %s", .{@errorName(err)});
+                    return env.nil();
+                };
+                return env.makeInteger(line);
             }
         },
     },

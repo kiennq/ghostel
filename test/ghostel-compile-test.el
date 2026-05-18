@@ -11,6 +11,19 @@
 
 (defvar-local ghostel-test-compile--finish-continuation nil)
 
+(defun ghostel-compile-test--fake-live-process (name buf)
+  "Return a live process-like object named NAME for tests in BUF."
+  (make-pipe-process :name name
+                     :buffer buf
+                     :noquery t
+                     :filter #'ignore
+                     :sentinel #'ignore))
+
+(defun ghostel-compile-test--posix-sh-p ()
+  "Return non-nil when `/bin/sh' is a native POSIX shell."
+  (and (not (eq system-type 'windows-nt))
+       (file-executable-p "/bin/sh")))
+
 (ert-deftest ghostel-test-compile-finalize-scans-errors ()
   "`ghostel-compile--finalize' parses errors in the scan region."
   (ghostel-test--with-compile-buffer buf
@@ -224,7 +237,7 @@ Previously, teardown called `delete-process' with the ghostel sentinel
 still attached; the sentinel would then invoke `kill-buffer' because
 `ghostel-kill-buffer-on-exit' defaults to t.  The visible symptom is a
 compile buffer that flashes open and disappears."
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf (generate-new-buffer " *ghostel-test-compile-live*"))
          (inhibit-message t)
          proc)
@@ -852,7 +865,7 @@ The buffer is in `ghostel-mode' (so the renderer keeps working) but
 `ghostel-compile-view-mode-map' — `g' reruns, `n'/`p' walk errors,
 attempts to mutate the buffer signal `buffer-read-only'."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf-name "*ghostel-test-readonly-compile*")
          (inhibit-message t)
          (save-some-buffers-default-predicate (lambda () nil))
@@ -967,6 +980,7 @@ slot so a revert routes through the global-mode advice and lands
 on the same variant.  The advice passes its own tuple verbatim, so
 custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   ;; Direct call without a tuple → synthesized default.
   (let ((buf-name "*ghostel-test-compargs-direct*")
         (inhibit-message t)
@@ -983,10 +997,8 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
                #'ignore)
               ((symbol-function 'ghostel-compile--spawn)
                (lambda (_cmd buf _h _w)
-                 (let ((p (start-process "ghostel-test-args" buf
-                                         "sleep" "100")))
-                   (set-process-sentinel p #'ignore)
-                   (set-process-query-on-exit-flag p nil)
+                 (let ((p (ghostel-compile-test--fake-live-process
+                           "ghostel-test-args" buf)))
                    (with-current-buffer buf (setq ghostel--process p))
                    p))))
       (unwind-protect
@@ -1018,10 +1030,8 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
                #'ignore)
               ((symbol-function 'ghostel-compile--spawn)
                (lambda (_cmd buf _h _w)
-                 (let ((p (start-process "ghostel-test-args2" buf
-                                         "sleep" "100")))
-                   (set-process-sentinel p #'ignore)
-                   (set-process-query-on-exit-flag p nil)
+                 (let ((p (ghostel-compile-test--fake-live-process
+                           "ghostel-test-args2" buf)))
                    (with-current-buffer buf (setq ghostel--process p))
                    p))))
       (unwind-protect
@@ -1099,7 +1109,7 @@ After `\\[ghostel-compile-switch-to-readonly]' the buffer must lock
 back, install `ghostel-compile-view-mode-map', and the mode-line
 must read `:run' again."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf-name "*ghostel-test-toggle-flip*")
          (inhibit-message t)
          (save-some-buffers-default-predicate (lambda () nil))
@@ -1154,7 +1164,7 @@ The minor-mode keymap takes precedence over the local map and the
 major-mode map, so `\\[ghostel-compile-switch-to-interactive]' /
 `\\[ghostel-compile-switch-to-readonly]' work in both run states."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf-name "*ghostel-test-toggle-mode-active*")
          (inhibit-message t)
          (save-some-buffers-default-predicate (lambda () nil))
@@ -1227,7 +1237,7 @@ a process to send keystrokes to.
 Run a small interactive echo loop, verify both conditions, then
 send bytes through the process to confirm they land in the buffer."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf-name "*ghostel-test-interactive-compile*")
          (script (concat "printf '%s\\n' ghostel-ready; "
                          "while IFS= read -r line; do "
@@ -1292,7 +1302,7 @@ parsed as a RET press, mangling multi-line scripts.  The new design
 spawns `sh -c COMMAND' directly, so the shell parses the paragraph
 normally."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf-name "*ghostel-test-multiline-compile*")
          (shell-file-name "/bin/sh")
          (script "for i in 1 2 3; do\n  echo line-$i\ndone\nexit 7")
@@ -1358,10 +1368,8 @@ the same dimensions so PTY and VT always agree."
                     (lambda (_cmd buf h w)
                       (push 'spawn call-order)
                       (push (list h w) spawn-calls)
-                      (let ((p (start-process "ghostel-test-size-fake"
-                                              buf "sleep" "100")))
-                        (set-process-sentinel p #'ignore)
-                        (set-process-query-on-exit-flag p nil)
+                      (let ((p (ghostel-compile-test--fake-live-process
+                                "ghostel-test-size-fake" buf)))
                         (with-current-buffer buf
                           (setq ghostel--process p))
                         p))))
@@ -1421,10 +1429,8 @@ dimensions when no output window exists."
                    (ghostel--cursor-pos (cons 0 0))
                    ((symbol-function 'ghostel-compile--spawn)
                     (lambda (_cmd buf _h _w)
-                      (let ((p (start-process "ghostel-test-nowin-fake"
-                                              buf "sleep" "100")))
-                        (set-process-sentinel p #'ignore)
-                        (set-process-query-on-exit-flag p nil)
+                      (let ((p (ghostel-compile-test--fake-live-process
+                                "ghostel-test-nowin-fake" buf)))
                         (with-current-buffer buf
                           (setq ghostel--process p))
                         p))))
@@ -1451,7 +1457,7 @@ calls `compilation-find-buffer' -> `compilation-buffer-internal-p',
 which is `(local-variable-p 'compilation-locs)'.  `prepare-buffer' must
 declare that variable buffer-locally so the live buffer qualifies."
   :tags '(native)
-  (skip-unless (file-executable-p "/bin/sh"))
+  (skip-unless (ghostel-compile-test--posix-sh-p))
   (let* ((buf-name "*ghostel-test-kill-compilation*")
          (command "printf '%s\\n' GHOSTEL_KILL_READY; exec sleep 30")
          (shell-file-name "/bin/sh")
@@ -1527,6 +1533,7 @@ drops the `permanent-local' property upstream this test catches it."
 It must also raise `read-process-output-max'.  Same reason as
 `ghostel--spawn-pty' (issue #85)."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-adaptive 'unset)
         (captured-max nil)
         (orig-make-process (symbol-function #'make-process)))

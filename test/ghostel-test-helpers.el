@@ -17,6 +17,38 @@
 
 (declare-function ghostel--cleanup-temp-paths "ghostel")
 
+(defmacro ghostel-test--without-subr-trampolines (&rest body)
+  "Run BODY with native trampolines disabled on supported Emacs versions."
+  `(let ((native-comp-enable-subr-trampolines nil)
+         (comp-enable-subr-trampolines nil))
+     ,@body))
+
+(defun ghostel-test--fixture-dir (name)
+  "Return a host-valid absolute test directory named NAME."
+  (file-name-as-directory
+   (expand-file-name name temporary-file-directory)))
+
+(defun ghostel-test--fixture-path (dir name)
+  "Return absolute path for NAME within DIR."
+  (expand-file-name name dir))
+
+(defun ghostel-test--ghostel-source-path ()
+  "Return the source path for `ghostel.el'."
+  (let ((path (locate-library "ghostel")))
+    (if (and path (string-suffix-p ".elc" path))
+        (substring path 0 -1)
+      path)))
+
+(defun ghostel-test--ghostel-source ()
+  "Return the contents of `ghostel.el' as a string."
+  (with-temp-buffer
+    (insert-file-contents (ghostel-test--ghostel-source-path))
+    (buffer-string)))
+
+(defun ghostel-test--source-pos (source marker)
+  "Return the position of MARKER within SOURCE."
+  (string-match-p (regexp-quote marker) source))
+
 (defmacro ghostel-test--with-compile-buffer (var &rest body)
   "Run BODY in a fresh ghostel-mode buffer bound to VAR."
   (declare (indent 1))
