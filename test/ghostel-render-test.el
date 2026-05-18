@@ -689,7 +689,8 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
     (should (equal "https://example.com/path"              ; url strips trailing dot
                    (get-text-property 5 'help-echo))))
   ;; File:line detection with absolute path
-  (let ((test-file (locate-library "ghostel")))
+  (unless (eq system-type 'windows-nt)
+    (let ((test-file (locate-library "ghostel")))
     (with-temp-buffer
       (insert (format "Error at %s:42 bad\n" test-file))
       (let ((ghostel-enable-url-detection t))
@@ -697,12 +698,15 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
       (let ((he (get-text-property 10 'help-echo)))
         (should (and he (string-prefix-p "fileref:" he)))  ; file:line help-echo set
         (should (and he (string-suffix-p ":42" he)))))     ; file:line contains line number
-    ;; File:line for non-existent file produces no link
+    ;; File detection is pattern-only; non-existent files still produce links.
     (with-temp-buffer
       (insert "Error at /no/such/file.el:10 bad\n")
       (let ((ghostel-enable-url-detection t))
         (ghostel--detect-urls))
-      (should (null (get-text-property 10 'help-echo))))   ; nonexistent file: no help-echo
+      (should (equal (concat "fileref:"
+                             (expand-file-name "/no/such/file.el")
+                             ":10")
+                     (get-text-property 10 'help-echo))))
     ;; File detection disabled
     (with-temp-buffer
       (insert (format "Error at %s:42 bad\n" test-file))
@@ -730,13 +734,17 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
       ;; Bare relative path (Rust/Go/TS compiler output)
       (let ((dir (file-name-directory test-file))
             (rel "ghostel.el"))
-        ;; Nonexistent bare relative path: no link
+        ;; Pattern-only bare relative path: linkified without stat'ing it.
         (with-temp-buffer
           (setq default-directory dir)
           (insert (format "   --> wrapped/%s:43\n" rel))
           (let ((ghostel-enable-url-detection t))
             (ghostel--detect-urls))
-          (should (null (find-fileref))))           ; nonexistent bare path skipped
+          (should (equal (concat "fileref:"
+                                 (expand-file-name (format "wrapped/%s" rel)
+                                                   dir)
+                                 ":43")
+                         (find-fileref))))
         ;; Existing bare relative path: linkified with line AND column preserved
         (with-temp-buffer
           (setq default-directory (file-name-directory (directory-file-name dir)))
@@ -790,14 +798,14 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
         (let ((ghostel-enable-url-detection t))
           (ghostel--detect-urls))
         (should (null (find-fileref))))            ; bare filename skipped
-      ;; TRAMP `default-directory' disables file detection entirely — otherwise
-      ;; every candidate would trigger a remote stat per redraw.
+      ;; TRAMP `default-directory' is safe because scanning is pattern-only.
       (with-temp-buffer
         (setq default-directory "/ssh:example.com:/tmp/")
         (insert (format "see %s here\n" test-file))
         (let ((ghostel-enable-url-detection t))
           (ghostel--detect-urls))
-        (should (null (find-fileref))))            ; TRAMP → detection skipped
+        (should (equal (concat "fileref:" test-file)
+                       (find-fileref))))
       ;; Custom path regex can opt into broader matching (bare filenames)
       (with-temp-buffer
         (setq default-directory (file-name-directory test-file))
@@ -816,12 +824,14 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
         (let ((he (find-fileref)))
           (should (and he (string-prefix-p "fileref:" he)))
           (should (and he (not (string-match-p ":[0-9]+\\'" he)))))) ; no line
-      ;; Path-only reference for a nonexistent file is not linkified.
+      ;; Pattern-only path references are linkified without stat'ing them.
       (with-temp-buffer
         (insert "see /no/such/path/exists here\n")
         (let ((ghostel-enable-url-detection t))
           (ghostel--detect-urls))
-        (should (null (find-fileref))))
+        (should (equal (concat "fileref:"
+                               (expand-file-name "/no/such/path/exists"))
+                       (find-fileref))))
       ;; ghostel--open-link with :line:col positions the cursor
       (let ((opened nil) (col-arg nil))
         (cl-letf (((symbol-function 'find-file-other-window)
@@ -840,7 +850,7 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
                    (lambda (&rest _) (setq moved t))))
           (ghostel--open-link (format "fileref:%s" test-file)))
         (should (equal test-file opened))
-        (should (null moved))))))
+        (should (null moved)))))))                   ; no line → no forward-line
 
 (ert-deftest ghostel-test-detect-urls-skips-active-input ()
   "Link detection rules around prompts and user input (issue #199).
@@ -2093,7 +2103,11 @@ app redraws all rows at new width via the filter pipeline."
           (set-window-buffer (selected-window) (current-buffer))
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 6 80 100))
-          (let* ((proc (start-process "ghostel-test-w" buf "sleep" "60"))
+          (let* ((proc (make-pipe-process :name "ghostel-test-w"
+                                          :buffer buf
+                                          :noquery t
+                                          :filter #'ignore
+                                          :sentinel #'ignore))
                  (ghostel--process proc)
                  (inhibit-read-only t))
             (set-process-coding-system proc 'binary 'binary)
@@ -2159,7 +2173,11 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
           (let* ((process-environment
                   (append (list "TERM=xterm-256color" "COLUMNS=40" "LINES=10")
                           process-environment))
-                 (proc (start-process "ghostel-test-pipe" buf "sleep" "60")))
+                 (proc (make-pipe-process :name "ghostel-test-pipe"
+                                          :buffer buf
+                                          :noquery t
+                                          :filter #'ignore
+                                          :sentinel #'ignore)))
             (setq ghostel--process proc)
             (set-process-coding-system proc 'binary 'binary)
             (set-process-window-size proc 10 40)
@@ -3537,7 +3555,8 @@ buffer rewrite at the right viewport row — non-trivial fixture work."
                         ghostel--force-next-redraw nil
                         ghostel-enable-url-detection nil
                         ghostel-enable-file-detection nil)
-            (insert "old-0\nold-1\nold-2\nold-3\nold-4")
+            (let ((inhibit-read-only t))
+              (insert "old-0\nold-1\nold-2\nold-3\nold-4"))
             (goto-char (point-max))
             (setq overlay (make-overlay (point) (point) buf))
             (overlay-put overlay 'before-string "ni")
@@ -3609,8 +3628,6 @@ overlay property."
       (kill-buffer buf))))
 
 
-
-
 ;;; Crash and internal-invariant regressions
 ;;
 ;; Tests for bugs that manifested as panics or internal state corruption
@@ -3659,6 +3676,300 @@ subtracts old_line_len from the newly-created page whose char_len is
                                      (point-min) (point-max))))))
       (kill-buffer buf))))
 
+
+(ert-deftest ghostel-test-title-callback-renames-buffer ()
+  "Test OSC 2 title change renames the current Ghostel buffer."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-title*"))
+        (title (format "Native Callback %s" (gensym))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((term (ghostel--new 25 80 1000)))
+            (setq-local ghostel--term term)
+            (ghostel--write-input term (format "\e]2;%s\e\\" title))
+            (should (equal title (ghostel--get-title term)))
+            (should (equal (format "*ghostel: %s*" title) (buffer-name)))
+            (should (equal (buffer-name) ghostel--managed-buffer-name))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-file-detection-is-pattern-only ()
+  "Plain file detection should not stat matching paths during redraw."
+  (skip-unless (not (eq system-type 'windows-nt)))
+  (with-temp-buffer
+    (insert "see /tmp/ghostel-missing-file.txt:12 for details\n")
+    (let ((ghostel-enable-url-detection nil)
+          (ghostel-enable-file-detection t)
+          (file-exists-called nil))
+      (cl-letf (((symbol-function 'file-exists-p)
+                 (lambda (&rest _args)
+                   (setq file-exists-called t)
+                   nil)))
+        (ghostel--detect-plain-links))
+      (should-not file-exists-called)
+      (goto-char (point-min))
+      (search-forward "/tmp/ghostel-missing-file.txt")
+      (should (string-prefix-p "fileref:"
+                               (get-text-property (match-beginning 0)
+                                                  'help-echo))))))
+
+(ert-deftest ghostel-test-plain-link-detection-allows-read-only-buffers ()
+  "Deferred plain link detection can annotate read-only Ghostel buffers."
+  (with-temp-buffer
+    (let ((inhibit-read-only t))
+      (insert "see https://example.com for details\n"))
+    (setq buffer-read-only t)
+    (let ((ghostel-enable-url-detection t)
+          (ghostel-enable-file-detection nil))
+      (ghostel--detect-plain-links (point-min) (point-max)))
+    (goto-char (point-min))
+    (search-forward "https://example.com")
+    (should (equal "https://example.com"
+                   (get-text-property (match-beginning 0) 'help-echo)))))
+
+(ert-deftest ghostel-test-queue-link-detection-coalesces-redraw-work ()
+  "Redraw-triggered link detection should be deferred and coalesced."
+  (with-temp-buffer
+    (let ((ghostel-plain-link-detection-delay 0.25)
+          (scheduled-count 0)
+          timer-delay timer-repeat timer-fn timer-args
+          detect-calls)
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (delay repeat fn &rest args)
+                   (setq scheduled-count (1+ scheduled-count)
+                         timer-delay delay
+                         timer-repeat repeat
+                         timer-fn fn
+                         timer-args args)
+                   'ghostel-test-link-timer))
+                ((symbol-function 'ghostel--detect-plain-links)
+                 (lambda (begin end)
+                   (push (list begin end) detect-calls))))
+        (ghostel--queue-plain-link-detection 10 20)
+        (ghostel--queue-plain-link-detection 5 25)
+        (should (= scheduled-count 1))
+        (should (= timer-delay 0.25))
+        (should (null timer-repeat))
+        (should (eq ghostel--plain-link-detection-timer 'ghostel-test-link-timer))
+        (should (= ghostel--plain-link-detection-begin 5))
+        (should (= ghostel--plain-link-detection-end 25))
+        (apply timer-fn timer-args)
+        (should (equal '((5 25)) detect-calls))
+        (should (null ghostel--plain-link-detection-timer))
+        (should (null ghostel--plain-link-detection-begin))
+        (should (null ghostel--plain-link-detection-end))))))
+
+(ert-deftest ghostel-test-url-detection-respects-bounds ()
+  "Test that URL detection can be restricted to a region."
+  (with-temp-buffer
+    (insert "before https://before.example\n"
+            "middle https://middle.example\n"
+            "after https://after.example")
+    (let ((ghostel-enable-url-detection t))
+      (save-excursion
+        (goto-char (point-min))
+        (forward-line 1)
+        (let ((begin (line-beginning-position))
+              (end (line-end-position)))
+          (goto-char (point-max))
+          (ghostel--detect-plain-links begin end))))
+    (should-not (get-text-property 8 'help-echo))
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (equal "https://middle.example"
+                     (get-text-property (+ (line-beginning-position) 8) 'help-echo))))
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 2)
+      (should-not (get-text-property (+ (line-beginning-position) 7) 'help-echo)))))
+
+(ert-deftest ghostel-test-set-buffer-face-skips-unchanged-colors ()
+  "Test that repeated identical default colors do not remap again."
+  (with-temp-buffer
+    (let ((ghostel--face-cookie nil)
+          (added 0)
+          (removed 0))
+      (cl-letf (((symbol-function 'face-remap-add-relative)
+                 (lambda (&rest _)
+                   (setq added (1+ added))
+                   'cookie))
+                ((symbol-function 'face-remap-remove-relative)
+                 (lambda (&rest _)
+                   (setq removed (1+ removed)))))
+        (ghostel--set-buffer-face "#112233" "#445566")
+        (ghostel--set-buffer-face "#112233" "#445566")
+        (should (= added 1))
+        (should (= removed 0))))))
+
+(ert-deftest ghostel-test-immediate-redraw-cancels-link-detection ()
+  "Immediate redraw should cancel any pending deferred link detection."
+  (with-temp-buffer
+    (let ((buf (current-buffer))
+          (ghostel--term 'fake)
+          (ghostel--pending-output nil)
+          (ghostel--redraw-timer nil)
+          (ghostel--plain-link-detection-timer 'pending-link-timer)
+          (ghostel--plain-link-detection-begin 10)
+          (ghostel--plain-link-detection-end 20)
+          (ghostel--last-send-time nil)
+          (ghostel-immediate-redraw-threshold 256)
+          (ghostel-immediate-redraw-interval 0.05)
+          (cancelled nil)
+          (immediate-called nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq immediate-called t)))
+                  ((symbol-function 'ghostel--invalidate) #'ignore)
+                  ((symbol-function 'cancel-timer)
+                   (lambda (timer) (push timer cancelled))))
+          (setq ghostel--last-send-time (current-time))
+          (ghostel--filter 'fake-proc "a")
+          (should immediate-called)
+          (should (equal '(pending-link-timer) cancelled))
+          (should (null ghostel--plain-link-detection-timer))
+          (should (null ghostel--plain-link-detection-begin))
+          (should (null ghostel--plain-link-detection-end)))))))
+
+(ert-deftest ghostel-test-commit-cropped-size-on-focus ()
+  "Focus return to a cropped ghostel window commits size and SIGWINCH."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (ghostel--force-next-redraw nil)
+          (set-size-args nil)
+          (swsize-args nil)
+          (redraw-called nil))
+      ;; Pass a real `(selected-window)' rather than a fake symbol so
+      ;; `with-selected-window' works without stubbing implementation
+      ;; internals (which differ across the supported Emacs versions).
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term h w &rest _) (setq set-size-args (list h w))))
+                ((symbol-function 'ghostel--delayed-redraw)
+                 (lambda (_buf) (setq redraw-called t)))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p h w) (setq swsize-args (list h w))))
+                ;; Regression guard for #192: if the function ever
+                ;; reverts to `window-body-height' instead of
+                ;; `window-screen-lines', the assertions below fail
+                ;; because 99 ≠ 25.
+                ((symbol-function 'window-body-height) (lambda (&rest _) 99))
+                ((symbol-function 'window-screen-lines) (lambda () 25.0))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size (selected-window))
+        (should (equal '(25 120) set-size-args))
+        (should (equal '(25 120) swsize-args))
+        (should (eql ghostel--term-rows 25))
+        (should (eql ghostel--term-cols 120))
+        (should ghostel--force-next-redraw)
+        (should redraw-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-cancels-link-detection ()
+  "Resize-triggered redraw should cancel pending deferred link detection."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (ghostel--plain-link-detection-timer 'pending-link-timer)
+          (ghostel--plain-link-detection-begin 11)
+          (ghostel--plain-link-detection-end 22)
+          (cancelled nil)
+          (redraw-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'ghostel--delayed-redraw)
+                  (lambda (_buf) (setq redraw-called t)))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                  (lambda (&rest _) nil))
+                ;; Regression guard for #192/#focus-resize: commit through the
+                ;; real selected window and size by `window-screen-lines'.
+                ((symbol-function 'window-body-height) (lambda (&rest _) 99))
+                ((symbol-function 'window-screen-lines) (lambda () 25.0))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1))
+                ((symbol-function 'cancel-timer)
+                  (lambda (timer) (push timer cancelled))))
+        (ghostel--commit-cropped-size (selected-window))
+        (should redraw-called)
+        (should (equal '(pending-link-timer) cancelled))
+        (should (null ghostel--plain-link-detection-timer))
+        (should (null ghostel--plain-link-detection-begin))
+        (should (null ghostel--plain-link-detection-end))))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-outside-minibuffer ()
+  "Focus change outside the minibuffer does not resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'minibuffer-depth) (lambda () 0)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-on-deselect ()
+  "Hook firing on WINDOW deselection does not resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-frame) (lambda (_w) 'test-frame))
+                ;; Selected window is *not* our window — we're being deselected.
+                ((symbol-function 'frame-selected-window)
+                 (lambda (_f) 'other-win))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-when-matched ()
+  "If the window already matches the committed size, do nothing."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w &rest _) (setq set-size-called t)))
+                ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'window-screen-lines) (lambda () 40.0))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size (selected-window))
+        (should-not set-size-called)
+        (should-not swsize-called)))))
 
 (provide 'ghostel-render-test)
 ;;; ghostel-render-test.el ends here
