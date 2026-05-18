@@ -228,10 +228,10 @@ jobs:
         run: git clone --depth 1 https://github.com/emacs-compat/compat.git "$RUNNER_TEMP/compat"
 
       - name: Run native module tests
-        shell: bash
+        shell: pwsh
         run: |
-          emacs --batch -Q -L "$RUNNER_TEMP/compat" -L lisp \
-            --eval '(setq ghostel-module-dir (expand-file-name "zig-out/bin" default-directory))' \
-            -l ert \
-            -l test/ghostel-test.el \
+          emacs --batch -Q -L "$env:RUNNER_TEMP/compat" -L lisp `
+            --eval '(setq ghostel-module-dir (expand-file-name "zig-out/bin" default-directory))' `
+            -l ert `
+            -l test/ghostel-test.el `
             -f ghostel-test-run-native
