@@ -4,7 +4,7 @@
 ///
 const std = @import("std");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty.zig");
 const Renderer = @import("Renderer.zig");
 
@@ -140,7 +140,7 @@ pub fn setColorBackground(self: *Self, color: *const gt.ColorRgb) !void {
 
 /// Set the color palette (256 entries).
 pub fn setColorPalette(self: *Self, palette: *const [256]gt.ColorRgb) !void {
-    try self.terminalSet(gt.OPT_COLOR_PALETTE, palette);
+    try self.terminalSet(gt.OPT_COLOR_PALETTE, @ptrCast(&palette[0]));
 }
 
 /// Set the terminal's working directory (from OSC 7).

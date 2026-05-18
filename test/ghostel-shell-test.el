@@ -51,6 +51,7 @@ newest-first list aligns with the buffer-order regions."
 (ert-deftest ghostel-test-shell-integration ()
   "Test shell process with echo command."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((buf (generate-new-buffer " *ghostel-test-shell*")))
     (unwind-protect
         (with-current-buffer buf
@@ -1228,7 +1229,11 @@ is re-confirmed (mirrors ghostty's ~200 ms termios polling cadence)."
               (should ghostel--password-mode-p)
               (should ghostel--password-confirm-timer)
               (should (= 0 calls))
-              (sleep-for 0.25)
+              (let ((deadline (+ (float-time) 2.0)))
+                (while (and (< (float-time) deadline)
+                            (or ghostel--password-confirm-timer
+                                (= 0 calls)))
+                  (accept-process-output nil 0.05)))
               (should (= 1 calls))
               (should-not ghostel--password-confirm-timer))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
@@ -1849,7 +1854,8 @@ but the cursor is at the end of the REPL's prompt."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert ">>> \n")
+          (let ((inhibit-read-only t))
+            (insert ">>> \n"))
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
           (setq ghostel--process 'fake-proc)
@@ -1900,6 +1906,79 @@ but the cursor is at the end of the REPL's prompt."
         (default-directory "/ssh:dan@myhost:/tmp/"))
     (ghostel--update-directory "file://myhost/home/dan")
     (should (equal "/ssh:dan@myhost:/home/dan/" default-directory))))
+
+
+
+(ert-deftest ghostel-test-ghostel-reuses-default-buffer ()
+  "Calling `ghostel' without a prefix reuses the default terminal buffer."
+  (let ((ghostel-buffer-name "*ghostel*")
+        (displayed nil)
+        (started 0)
+        (buf (generate-new-buffer "*ghostel*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq-local ghostel--term 'term-1))
+          (cl-letf (((symbol-function 'ghostel--native-runtime-ready-p)
+                     (lambda () t))
+                    ((symbol-function 'ghostel--new)
+                     (lambda (&rest _) 'unused))
+                    ((symbol-function 'ghostel--apply-palette)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (buffer-or-name &rest _)
+                        (setq displayed (get-buffer buffer-or-name))
+                        (set-buffer displayed)
+                        displayed))
+                    ((symbol-function 'ghostel--start-process)
+                     (lambda ()
+                       (setq started (1+ started)))))
+            (ghostel)
+            (should (eq buf displayed))
+            (should (equal 0 started))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-ghostel-clamps-initial-terminal-size-to-window-max-chars ()
+  "Initial terminal creation should use `window-max-chars-per-line'."
+  (let ((ghostel-buffer-name "*ghostel-size*")
+        (created-size nil)
+        (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'window-body-height)
+                   (lambda (&optional _) 22))
+                   ((symbol-function 'window-body-width)
+                    (lambda (&optional _window _pixelwise) 80))
+                  ;; Regression guard for #192: initial terminal sizing must use
+                  ;; `window-screen-lines', not `window-body-height'.
+                  ((symbol-function 'window-screen-lines)
+                   (lambda () 33.0))
+                  ((symbol-function 'window-max-chars-per-line)
+                   (lambda (&optional _) 120))
+                  ((symbol-function 'ghostel--initialize-native-modules)
+                   (lambda () nil))
+                  ((symbol-function 'ghostel--native-runtime-ready-p)
+                   (lambda () t))
+                  ((symbol-function 'ghostel--new)
+                   (lambda (height width _scrollback &rest _)
+                     (setq created-size (list height width))
+                     'fake-term))
+                  ((symbol-function 'ghostel--set-size)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--apply-palette)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'ghostel--start-process)
+                   (lambda () 'fake-proc))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (buffer-or-name &rest _)
+                      (setq buf (get-buffer buffer-or-name))
+                      (set-buffer buf)
+                      buf)))
+          (ghostel)
+          (should (equal '(33 120) created-size)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 (provide 'ghostel-shell-test)
 ;;; ghostel-shell-test.el ends here

@@ -379,10 +379,12 @@ unlike semi-char mode where it tracks the terminal cursor."
   (let ((buf (generate-new-buffer " *ghostel-test-copy-nav*")))
     (unwind-protect
         (with-current-buffer buf
-          (ghostel-mode)
-          (let ((ghostel--input-mode 'copy)
-                (ghostel--term 'fake-term)
-                (inhibit-read-only t))
+           (ghostel-mode)
+           (let ((ghostel--input-mode 'copy)
+                 (ghostel--copy-mode-active t)
+                 (ghostel--copy-mode-full-buffer t)
+                 (ghostel--term 'fake-term)
+                 (inhibit-read-only t))
             (insert (mapconcat #'number-to-string (number-sequence 1 20) "\n"))
             (insert "   \n\n")
             (goto-char (point-min))
@@ -391,28 +393,58 @@ unlike semi-char mode where it tracks the terminal cursor."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-copy-mode-recenter ()
-  "`ghostel-readonly-recenter' actually moves point toward window center."
-  (let ((buf (generate-new-buffer " *ghostel-test-recenter*")))
+  "Recenter scrolls terminal viewport to center the current line."
+  (let ((buf (generate-new-buffer " *ghostel-test-copy-mode-recenter*")))
     (unwind-protect
         (with-current-buffer buf
-          (set-window-buffer (selected-window) buf)
-          (dotimes (i 200) (insert (format "line %d\n" i)))
-          (goto-char (point-min))
-          (forward-line 100)
-          (set-window-point (selected-window) (point))
-          ;; Push point near the bottom of the window.
-          (recenter -1)
-          (let ((before-line (line-number-at-pos (window-point))))
-            ;; Sanity: point is well below the vertical midpoint.
-            (should (> before-line
-                       (+ (line-number-at-pos (window-start))
-                          (/ (window-body-height) 2))))
-            (ghostel-readonly-recenter)
-            (let* ((mid-line (+ (line-number-at-pos (window-start))
-                                (/ (window-body-height) 2)))
-                   (after-line (line-number-at-pos (window-point))))
-              ;; After recenter, point is within ~1 line of midpoint.
-              (should (<= (abs (- after-line mid-line)) 1)))))
+          (dotimes (i 20)
+            (insert (format "line-%02d" i) (make-string 33 ?x) "\n"))
+          (setq ghostel--term 'fake-term)
+          (setq ghostel--copy-mode-active t)
+          (setq buffer-read-only t)
+          (let ((scroll-delta nil)
+                (redraw-called nil)
+                (recenter-called nil))
+            ;; Mock redraw that changes the first line (simulates viewport shift).
+            (cl-letf (((symbol-function 'ghostel--scroll)
+                       (lambda (_term delta) (setq scroll-delta delta)))
+                      ((symbol-function 'ghostel--redraw)
+                       (lambda (_term _full)
+                         (setq redraw-called t)
+                         (let ((inhibit-read-only t))
+                           (save-excursion
+                             (goto-char (point-min))
+                             (delete-char 1)
+                             (insert "!")))))
+                      ((symbol-function 'window-body-height)
+                       (lambda (&rest _) 20))
+                      ((symbol-function 'recenter)
+                       (lambda (&rest _) (setq recenter-called t))))
+              ;; Point on line 5 (above center 10) -> scroll viewport up.
+              (goto-char (point-min))
+              (forward-line 4)
+              (ghostel-copy-mode-recenter)
+              (should (equal -5 scroll-delta))
+              (should redraw-called)
+              (should recenter-called))
+
+            ;; Mock redraw that does NOT change buffer (simulates clamped scroll).
+            (cl-letf (((symbol-function 'ghostel--scroll)
+                       (lambda (_term delta) (setq scroll-delta delta)))
+                      ((symbol-function 'ghostel--redraw)
+                       (lambda (_term _full) (setq redraw-called t)))
+                      ((symbol-function 'window-body-height)
+                       (lambda (&rest _) 20))
+                      ((symbol-function 'recenter)
+                       (lambda (&rest _) (setq recenter-called t))))
+              ;; Point on line 15 (below center), scroll clamped -> no-op.
+              (setq scroll-delta nil redraw-called nil recenter-called nil)
+              (goto-char (point-min))
+              (forward-line 14)
+              (ghostel-copy-mode-recenter)
+              (should (equal 5 scroll-delta))
+              (should redraw-called)
+              (should-not recenter-called))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-input-mode-default-is-semi-char ()
@@ -711,6 +743,90 @@ Otherwise the window stays where the user navigated."
               ;; Read-only flag is consistently off after returning.
               (should-not buffer-read-only))))
       (kill-buffer buf))))
+
+
+
+(ert-deftest ghostel-test-copy-mode-uses-mode-line-process ()
+  "Copy mode uses `mode-line-process' instead of mutating `mode-name'."
+  (let ((buf (generate-new-buffer " *ghostel-test-mode-line*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--copy-mode-active nil)
+                (ghostel--redraw-timer nil))
+            (ghostel-copy-mode)
+            (should (equal ":Copy" mode-line-process))
+            (should (equal "Ghostel" mode-name))
+            (ghostel-copy-mode-exit)
+            (should-not mode-line-process)
+            (should (equal "Ghostel" mode-name))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-suppress-interfering-modes-disables-pixel-scroll ()
+  "Ghostel disables pixel-scroll precision in terminal buffers."
+  (let ((buf (generate-new-buffer " *ghostel-test-pixel-scroll*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq-local pixel-scroll-precision-mode t)
+          (ghostel--suppress-interfering-modes)
+          (should-not pixel-scroll-precision-mode))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-copy-mode-load-all ()
+  "Test that `ghostel-copy-mode-load-all' sets full-buffer state."
+  (let ((buf (generate-new-buffer " *ghostel-test-load-all*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--copy-mode-active nil)
+                (ghostel--redraw-timer nil)
+                (ghostel--term 'fake-term))
+            ;; Enter copy mode
+            (ghostel-copy-mode)
+            (should ghostel--copy-mode-active)              ; in copy mode
+            (should-not ghostel--copy-mode-full-buffer)     ; not full yet
+            ;; Simulate a 3-line viewport with point on line 2, column 3
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert "aaa\nbbbXbb\nccc"))
+            (goto-char (point-min))
+            (forward-line 1)
+            (move-to-column 3)                              ; on 'X' in line 2
+            ;; Stub the native function and recenter (no window in batch).
+            ;; The real native redraw now owns temporary writability, so the
+            ;; test double must mirror that behavior when mutating the buffer.
+            ;; Returns viewport-line=3 (viewport starts at line 3 in full buffer)
+            (cl-letf (((symbol-function 'ghostel--redraw-full-scrollback)
+                       (lambda (_term)
+                         (let ((inhibit-read-only t))
+                           (erase-buffer)
+                           (insert "sb1\nsb2\naaa\nbbbXbb\nccc"))
+                         3))
+                      ((symbol-function 'recenter) #'ignore))
+              (ghostel-copy-mode-load-all)
+              (should ghostel--copy-mode-full-buffer)       ; now full
+              ;; Point should be on line 4 (viewport-line 3 + saved offset 1)
+              (should (= 4 (line-number-at-pos)))           ; preserved line
+              (should (= 3 (current-column))))
+            ;; Exit resets full-buffer state
+            (cl-letf (((symbol-function 'ghostel--scroll-bottom) #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore))
+              (ghostel-copy-mode-exit))
+            (should-not ghostel--copy-mode-full-buffer)))   ; reset on exit
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-ghostel-term-standard-value-respects-platform ()
+  "`ghostel-term' should default to a safe platform-specific TERM."
+  (let ((standard-value (car (get 'ghostel-term 'standard-value))))
+    (should (equal "xterm-ghostty"
+                   (let ((system-type 'gnu/linux))
+                     (eval standard-value))))
+    (should (equal "xterm-256color"
+                   (let ((system-type 'windows-nt))
+                     (eval standard-value))))))
 
 (provide 'ghostel-modes-test)
 ;;; ghostel-modes-test.el ends here

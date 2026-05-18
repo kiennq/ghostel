@@ -338,6 +338,7 @@ With the growing-buffer model the scrollback is always materialized into
 the Emacs buffer, so we just check the buffer text directly instead of
 scrolling libghostty's viewport."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((buf (generate-new-buffer " *ghostel-test-clear*")))
     (unwind-protect
         (with-current-buffer buf
@@ -1520,8 +1521,9 @@ buffer rewrite at the right viewport row — non-trivial fixture work."
                         ghostel--force-next-redraw nil
                         ghostel-enable-url-detection nil
                         ghostel-enable-file-detection nil)
-            (insert "old-0\nold-1\nold-2\nold-3\nold-4")
-            (goto-char (point-max))
+            (let ((inhibit-read-only t))
+              (insert "old-0\nold-1\nold-2\nold-3\nold-4")
+              (goto-char (point-max)))
             (setq overlay (make-overlay (point) (point) buf))
             (overlay-put overlay 'before-string "ni")
             (overlay-put overlay 'window (selected-window))
@@ -1531,13 +1533,14 @@ buffer rewrite at the right viewport row — non-trivial fixture work."
           (cl-letf (((symbol-function 'ghostel--mode-enabled)
                      (lambda (&rest _) nil))
                     ((symbol-function 'ghostel--redraw)
-                     (lambda (&rest _)
-                       ;; Simulate a destructive native redraw that leaves
-                       ;; point at the terminal cursor on a different row.
-                       (erase-buffer)
-                       (insert "new-0\nnew-1\nnew-2\nnew-3\nnew-4")
-                       (goto-char (point-min))
-                       (forward-line 1)))
+                      (lambda (&rest _)
+                        ;; Simulate a destructive native redraw that leaves
+                        ;; point at the terminal cursor on a different row.
+                        (let ((inhibit-read-only t))
+                          (erase-buffer)
+                          (insert "new-0\nnew-1\nnew-2\nnew-3\nnew-4")
+                          (goto-char (point-min))
+                          (forward-line 1))))
                     ((symbol-function 'ghostel--cursor-pending-wrap-p)
                      (lambda (&rest _)
                        (error "Preedit anchor should bypass clamp checks")))
@@ -2110,6 +2113,103 @@ pins to the viewport.  This guards the bootstrap path."
               (should (= vs ghostel--last-anchor-position)))))
       (when (buffer-live-p orig-buf)
         (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+
+
+(ert-deftest ghostel-test-scrollback-rotation-rebuild ()
+  "Verify cap rotation triggers a rebuild so the buffer reflects libghostty.
+The test fills libghostty past its scrollback cap with EARLY markers,
+redraws once so the buffer matches the current libghostty state, then
+writes a much bigger batch of LATE markers (without an intervening
+redraw).  When the next redraw runs, libghostty's `total_rows' is
+plateaued at the cap so the normal delta-detection sees nothing to do
+— the rotation-detect path must kick in, notice the first scrollback
+row's hash has changed, erase the buffer, and let the bootstrap fetch
+re-sync from libghostty so the buffer reflects the LATE rows."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-sb-rotate*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* (;; 4 KB cap empirically holds ~920 rows of short content
+                 ;; in libghostty's compact storage.
+                 (term (ghostel--new 5 80 (* 4 1024)))
+                 (inhibit-read-only t))
+            ;; Phase 1: write 5000 EARLY rows. libghostty's scrollback
+            ;; saturates at ~920 rows so the surviving rows are
+            ;; early-04080..early-04999 (the most recent 920 of 5000).
+            (dotimes (i 5000)
+              (ghostel--write-input term (format "early-%05d\r\n" i)))
+            (ghostel--redraw term t)
+            ;; After this redraw, buffer's scrollback_in_buffer matches
+            ;; libghostty's count (~920) and contains those high-numbered
+            ;; early rows.
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "early-04999" content)))
+            ;; Phase 2: write 5000 LATE rows WITHOUT redrawing in
+            ;; between. libghostty rotates: every new write evicts an
+            ;; early row and pushes a late row. After 5000 writes, all
+            ;; survivors are late-* (since 5000 > 920 cap).
+            (dotimes (i 5000)
+              (ghostel--write-input term (format "late-%05d\r\n" i)))
+            ;; Final redraw: total_rows hasn't changed (libghostty is
+            ;; still at the cap) but the content has fully rotated.
+            ;; Without rotation-detect this would be a no-op and the
+            ;; buffer would still show early-* rows.
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Late rows must be present (libghostty kept the most
+              ;; recent ones, the rebuild fetched them into the buffer).
+              (should (string-match-p "late-04999" content))
+              ;; Early rows must NOT be present anywhere — libghostty
+              ;; evicted them AND the rebuild flushed our stale copy.
+              (should-not (string-match-p "early-" content)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-copy-mode-full-buffer-scroll ()
+  "Test that scroll commands use Emacs navigation in full-buffer mode."
+  (let ((buf (generate-new-buffer " *ghostel-test-full-scroll*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--copy-mode-active t)
+                (ghostel--copy-mode-full-buffer t)
+                (ghostel--term 'fake-term)
+                (inhibit-read-only t))
+            ;; Insert content
+            (insert (mapconcat #'number-to-string (number-sequence 1 20) "\n"))
+            (goto-char (point-min))
+            ;; Test beginning/end of buffer
+            (ghostel-copy-mode-end-of-buffer)
+            (should (= (point) (point-max)))                ; jumped to end
+            (ghostel-copy-mode-beginning-of-buffer)
+            (should (= (point) (point-min)))                ; jumped to beginning
+            ;; Test line navigation
+            (ghostel-copy-mode-next-line)
+            (should (= 2 (line-number-at-pos)))             ; moved to line 2
+            (ghostel-copy-mode-previous-line)
+            (should (= 1 (line-number-at-pos)))))           ; moved back to line 1
+      (kill-buffer buf))))
+
+
+
+(ert-deftest ghostel-test-scrollback ()
+  "Test scrollback by overflowing visible rows."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-scrollback*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 100))
+                 (inhibit-read-only t))
+            (dotimes (i 10)
+              (ghostel--write-input term (format "line %d\r\n" i)))
+            (ghostel--redraw term t)
+            (let ((state (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "line [6-9]" state)))       ; recent lines visible
+            (ghostel--scroll term -5)
+            (ghostel--redraw term t)
+            (let ((state (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "line [0-4]" state)))))     ; scrollback shows earlier lines
       (kill-buffer buf))))
 
 (provide 'ghostel-scrollback-test)

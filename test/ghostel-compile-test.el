@@ -945,6 +945,7 @@ slot so a revert routes through the global-mode advice and lands
 on the same variant.  The advice passes its own tuple verbatim, so
 custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   ;; Direct call without a tuple → synthesized default.
   (let ((buf-name "*ghostel-test-compargs-direct*")
         (inhibit-message t)
@@ -1489,6 +1490,7 @@ drops the `permanent-local' property upstream this test catches it."
 It must also raise `read-process-output-max'.  Same reason as
 `ghostel--spawn-pty' (issue #85)."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((captured-adaptive 'unset)
         (captured-max nil)
         (orig-make-process (symbol-function #'make-process)))
