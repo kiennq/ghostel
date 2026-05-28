@@ -4,6 +4,80 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-05-28
+
+### Added
+- The `:Char` / `:Line` / `:Copy` / `:Emacs` input-mode lighter in
+  `mode-line-process` now has a `help-echo` tooltip (reflecting the
+  user's bindings and the live `ghostel-readonly-fast-exit` setting),
+  a `mode-line-highlight` mouse-face, and a `mouse-1` binding that
+  exits the mode (back to semi-char for char/line; back to the
+  pre-readonly mode for copy/emacs).
+  Closes [#329](https://github.com/dakra/ghostel/issues/329).
+
+### Changed
+- Copy and Emacs modes are now symmetric mode toggles.  Under the
+  default `ghostel-readonly-fast-exit`, `C-c C-e` and `C-c C-t` were
+  repurposed as exit shortcuts, so the eat-style mode-switch matrix
+  did not work from those modes (e.g. `C-c C-e` in copy mode exited
+  to semi-char instead of switching to Emacs mode).  `C-c C-e` now
+  toggles Emacs mode and `C-c C-t` toggles copy mode from every
+  read-only mode; the fast-exit affordances (`q`, `C-g`,
+  self-insert) are unchanged.
+  Fixes [#342](https://github.com/dakra/ghostel/issues/342).
+- `ghostel-keymap-exceptions` now takes effect when customized after
+  the package has loaded.  The semi-char keymap was populated once at
+  load time, so `use-package :config` + `add-to-list` had no effect;
+  a `:set` handler now rebuilds the keymap in place (preserving the
+  keymap object's identity so buffer-local references stay valid).
+  Related [#327](https://github.com/dakra/ghostel/issues/327).
+
+### Fixed
+- Evil insert-state Ctrl passthrough stays active in alt-screen apps
+  (vim, less, htop).  It used `evil-ghostel--active-p`, which
+  intentionally returns nil under DECSET 1049, so `C-u` fell back to
+  Evil's insert binding and deleted buffer text instead of reaching
+  the terminal.  A narrower passthrough predicate remains active in
+  semi-char mode during alt-screen sessions.
+- Reading large output (e.g. `rg` over a big tree in `emacs -nw`) no
+  longer pops the debugger for users with `debug-on-error` set.
+  `extractStringAlloc` now probes the required size with a NULL
+  buffer before copying instead of optimistically reusing the
+  existing buffer, which raised `memory-buffer-too-small` on every
+  chunk past the previous high-water mark.
+  Fixes [#338](https://github.com/dakra/ghostel/issues/338).
+- Mouse double/triple-click now selects the word/line and the
+  selection is protected.  `ghostel-mouse-release-or-set-point`
+  forwards PROMOTE-TO-REGION to `mouse-set-point` so the
+  word/line selection from the down-event survives, and a
+  multi-click in semi-char mode switches to the input mode configured
+  by `ghostel-mouse-drag-input-mode` so a redraw can't extend the
+  highlight to the cursor.
+  Fixes [#337](https://github.com/dakra/ghostel/issues/337).
+- Alt-screen rendering corrected: the alt screen is now treated
+  separately from the primary screen (it has scrollback that must not
+  be rendered), and a resize on a no-scrollback screen forces a full
+  rebuild.
+- Cursor-line padding is now rendered precisely.
+- `M->` in emacs and copy modes stays in isearch during motion.
+  `ghostel-readonly-end-of-buffer` lacked an `isearch-motion`
+  property, so with `isearch-allow-motion` on it exited search and
+  jumped to point-max instead of moving to the last match like the
+  global `end-of-buffer`.
+  Fixes [#327](https://github.com/dakra/ghostel/issues/327).
+
+### Internal
+- Buffer terminal initialization centralized; `ghostel--init-buffer`
+  no longer clears title/identity bookkeeping, so OSC 2 sequences
+  cannot auto-rename a user-renamed buffer on re-init.
+- Property-based renderer testing expanded: resizing operations and a
+  dape test-running helper for the Hypothesis suite, alt-screen
+  regression tests, more tests routed through
+  `ghostel-test--with-terminal-buffer`, and redraw invalidation logic
+  factored out into its own path.
+- `extractString` / `extractStringAlloc` now return errors instead of
+  null, and avoid a debug-mode free of a wrong-length slice.
+
 ## [0.30.0] — 2026-05-25
 
 ### Changed
