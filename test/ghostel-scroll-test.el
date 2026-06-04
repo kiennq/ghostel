@@ -168,6 +168,52 @@ SPEC is (BUFFER TERM ANCHORED-WINDOW HISTORY-WINDOW)."
 							  (should (= history-point-before (window-point history)))
 							  (should-not (ghostel-test-scroll--bottom-visible-p history)))))
 
+(defun ghostel-test-scroll--set-gui-anchor-start (win)
+  "Park WIN's `window-start' at the GUI-anchored steady state.
+The graphical branch of `ghostel--anchor-window' parks `window-start' one
+line above the topmost grid row to make room for its partial-top-line
+vscroll, so a bottom-anchored GUI window has
+`ws-lines-to-end' = floor(window-screen-lines) + 1.  That branch is gated
+on `display-graphic-p', which is never true in batch, so set
+`window-start' directly to reproduce the same position."
+  (let* ((target (1+ (floor (with-selected-window win
+                              (window-screen-lines)))))
+         (start (save-excursion
+                  (goto-char (point-max))
+                  (forward-line (- target))
+                  (line-beginning-position))))
+    (set-window-start win start t)))
+
+(ert-deftest ghostel-test-window-anchored-p-survives-mode-line-toggle ()
+  "`ghostel--window-anchored-p' ignores the mode-line's height (issue #373).
+A GUI-anchored window's `window-start' sits floor(window-screen-lines)+1
+lines above `point-max'.  The predicate must judge it \"following output\"
+whether or not a mode-line is present.  Measuring the threshold from the
+full `window-pixel-height' (mode-line included) only worked because the
+mode-line donated the +1 line of slack; disabling it removed that slack
+and stranded the cursor off-screen.
+
+In batch the GUI anchor's `forward-line -1' (display-graphic-p only)
+cannot run, so `window-start' is set directly; toggling the mode-line in
+batch reproduces the GUI geometry shift (the window body grows by one line
+while `window-pixel-height' stays constant)."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let ((win (selected-window)))
+      (ghostel-test-scroll--write-lines term "scroll" 60)
+      (ghostel--redraw term t)
+      ;; Control: mode-line present — an anchored window reads as following.
+      (ghostel-test-scroll--set-gui-anchor-start win)
+      (should (ghostel--window-anchored-p win))
+      ;; Disable the mode-line and let the geometry settle; the body grows
+      ;; by one line.  Re-derive the anchored `window-start' for the larger
+      ;; body and assert the predicate still follows.  (Fails on HEAD
+      ;; before the fix; passes after.)
+      (setq-local mode-line-format nil)
+      (redisplay t)
+      (ghostel-test-scroll--set-gui-anchor-start win)
+      (should (ghostel--window-anchored-p win)))))
+
 (ert-deftest ghostel-test-second-window-does-not-disturb-scrollback ()
   "Opening another window on the buffer does not move a scrolled peer."
   :tags '(native)

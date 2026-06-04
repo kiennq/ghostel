@@ -5953,19 +5953,23 @@ remain handled inside the renderer."
      (or begin (ghostel--viewport-start) (point-min))
      (or end (point-max)))))
 
-(defun ghostel--window-anchored-p (window &optional pixel-height)
-  "Non-nil if WINDOW is auto-following the new output.
-When PIXEL-HEIGHT is non-nil, that value is used for calculation rather than
-`(window-pixel-height)'."
+(defun ghostel--window-anchored-p (window &optional body-pixel-height)
+  "Non-nil if WINDOW is scrolled to follow the live terminal output.
+WINDOW follows the output when the lines from its `window-start' to
+`point-max' fit within its body, measured from BODY-PIXEL-HEIGHT (default
+`window-body-height' in pixels, excluding the mode-line and header-line to
+match the terminal grid), plus one line of tolerance for the partial top
+line the graphical anchor leaves via `window-vscroll'."
   (with-current-buffer (window-buffer window)
     (when-let* (((derived-mode-p 'ghostel-mode))
                 ((not (eq ghostel--input-mode 'emacs)))
                 (dlh (default-line-height))
-                (pixel-height (or pixel-height (window-pixel-height window)))
-                (line-count (/ (float pixel-height) (float dlh)))
+                (body-pixel-height (or body-pixel-height
+                                       (window-body-height window t)))
+                (screen-lines (/ (float body-pixel-height) (float dlh)))
                 (ws (window-start window))
                 (ws-lines-to-end (count-lines ws (point-max))))
-      (<= ws-lines-to-end line-count))))
+      (<= ws-lines-to-end (1+ (floor screen-lines))))))
 
 (defconst ghostel--set-window-vscroll-preserve-supported-p
   (let ((max-args (cdr (subr-arity (symbol-function 'set-window-vscroll)))))
@@ -6211,7 +6215,7 @@ If WINDOW was already anchored at the active area before resizing, WINDOW will
 scroll to active area to keep it focused even during resize."
   (with-current-buffer (window-buffer window)
     (when (ghostel--window-anchored-p window
-                                      (window-old-pixel-height window))
+                                      (window-old-body-pixel-height window))
       (ghostel--anchor-window window))))
 
 (defun ghostel--minibuffer-exit ()
