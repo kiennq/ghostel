@@ -60,7 +60,12 @@ to dismiss the buffer."
      (when (buffer-live-p buffer)
        (with-current-buffer buffer
          (goto-char (point-max))
-         (local-set-key (kbd "q") #'kill-current-buffer)
+         ;; Bind `q' in a fresh buffer-local map to not mutate the shared
+         ;; `ghostel-semi-char-mode-map' and leak into other buffers.
+         (let ((map (make-sparse-keymap)))
+           (set-keymap-parent map (current-local-map))
+           (keymap-set map "q" #'kill-current-buffer)
+           (use-local-map map))
          (dolist (win (get-buffer-window-list buffer nil t))
            (set-window-point win (point-max))))))))
 

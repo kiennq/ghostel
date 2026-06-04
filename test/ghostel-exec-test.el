@@ -116,5 +116,30 @@ buffer eventually shows up."
       (eshell/ghostel "vim" "file.txt")
       (should (equal captured '("vim" "file.txt"))))))
 
+(ert-deftest ghostel-test-eshell-visual-exit-q-binding-is-buffer-local ()
+  "`ghostel-eshell--visual-exit' must not leak `q' into the shared keymap.
+It binds `q' to `kill-current-buffer' in the finished buffer's own
+local map; the shared `ghostel-semi-char-mode-map' must stay
+unmodified so later visual buffers still send `q' to the program."
+  (let ((buf (generate-new-buffer " *ghostel-visual-exit*")))
+    (unwind-protect
+        ;; Run the `run-at-time' deferral synchronously so the test is
+        ;; not at the mercy of timer scheduling.
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_time _repeat fn &rest args) (apply fn args))))
+          (with-current-buffer buf
+            (ghostel-mode))
+          ;; Sanity: the shared map has no direct `q' binding to begin
+          ;; with (bare `q' resolves through the self-insert remap).
+          (should-not (lookup-key ghostel-semi-char-mode-map (kbd "q")))
+          (ghostel-eshell--visual-exit buf "finished\n")
+          ;; The finished buffer dismisses on `q'...
+          (with-current-buffer buf
+            (should (eq (lookup-key (current-local-map) (kbd "q"))
+                        #'kill-current-buffer)))
+          ;; ...but the shared map is untouched (no leak, issue #372).
+          (should-not (lookup-key ghostel-semi-char-mode-map (kbd "q"))))
+      (kill-buffer buf))))
+
 (provide 'ghostel-exec-test)
 ;;; ghostel-exec-test.el ends here
