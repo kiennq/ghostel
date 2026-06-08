@@ -416,6 +416,157 @@ and the live cursor advancing would extend the region."
       (should-not emacs-mode-called)
       (should (equal '(set-point copy-mode) (nreverse call-order))))))
 
+(ert-deftest ghostel-test-mouse-1-release-single-click-already-selected-enters-copy-mode ()
+  "Plain single click in an already-selected semi-char window enters copy mode.
+Mirrors the drag/multi-click handlers: point is set first, then the
+buffer freezes so streaming output cannot clobber the view."
+  :tags '(native)
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (ghostel-mouse-drag-input-mode 'copy)
+        (ghostel--mouse-press-was-selected t)
+        (set-point-event nil)
+        (copy-mode-called nil)
+        (emacs-mode-called nil)
+        (call-order nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (event &optional _promote)
+                   (setq set-point-event event)
+                   (push 'set-point call-order)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda ()
+                   (setq copy-mode-called t)
+                   (push 'copy-mode call-order)))
+                ((symbol-function 'ghostel-emacs-mode)
+                 (lambda () (setq emacs-mode-called t))))
+        (ghostel-mouse-release-or-set-point fake-event 1))
+      (should (equal fake-event set-point-event))
+      (should copy-mode-called)
+      (should-not emacs-mode-called)
+      ;; Point must be set before copy mode freezes the buffer.
+      (should (equal '(set-point copy-mode) (nreverse call-order))))))
+
+(ert-deftest ghostel-test-mouse-1-release-single-click-focus-click-only-focuses ()
+  "A focus click of an unselected window only focuses.
+With the feature on (`ghostel-mouse-drag-input-mode' non-nil) the click
+does not enter copy mode (the #257 case) and snaps point to the live
+cursor (`ghostel--cursor-char-pos'), not the click position."
+  :tags '(native)
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (ghostel-mouse-drag-input-mode 'copy)
+        (ghostel--mouse-press-was-selected nil)
+        (set-point-called nil)
+        (copy-mode-called nil))
+    (with-temp-buffer
+      (insert "hello world")
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (setq-local ghostel--cursor-char-pos 11)  ; live input position
+      (goto-char 8)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (_event &optional _promote) (setq set-point-called t)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t))))
+        (ghostel-mouse-release-or-set-point fake-event 1))
+      (should-not set-point-called)
+      (should-not copy-mode-called)
+      ;; Cursor snapped to the live input position, not the click.
+      (should (= (point) 11)))))
+
+(ert-deftest ghostel-test-mouse-1-release-focus-click-feature-off-sets-point ()
+  "With the feature off, a focus click sets point like standard Emacs.
+When `ghostel-mouse-drag-input-mode' is nil, a single click in a
+previously-unselected window sets point normally and enters no mode."
+  :tags '(native)
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (ghostel-mouse-drag-input-mode nil)
+        (ghostel--mouse-press-was-selected nil)
+        (set-point-event nil)
+        (copy-mode-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (event &optional _promote) (setq set-point-event event)))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t))))
+        (ghostel-mouse-release-or-set-point fake-event 1))
+      (should (equal fake-event set-point-event))
+      (should-not copy-mode-called))))
+
+(ert-deftest ghostel-test-mouse-1-release-single-click-already-selected-nil-target-stays ()
+  "Already-selected single click with a nil target only sets point.
+With `ghostel-mouse-drag-input-mode' nil there is no copy/Emacs mode to
+switch to, so the click just sets point and enters no mode."
+  :tags '(native)
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (ghostel-mouse-drag-input-mode nil)
+        (ghostel--mouse-press-was-selected t)
+        (copy-mode-called nil)
+        (emacs-mode-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (_event &optional _promote) nil))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'ghostel-emacs-mode)
+                 (lambda () (setq emacs-mode-called t))))
+        (ghostel-mouse-release-or-set-point fake-event 1))
+      (should-not copy-mode-called)
+      (should-not emacs-mode-called))))
+
+(ert-deftest ghostel-test-mouse-1-release-single-click-already-selected-emacs-target ()
+  "Single click in an already-selected window honors `ghostel-mouse-drag-input-mode' = `emacs'."
+  :tags '(native)
+  (let ((fake-event `(mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (ghostel-mouse-drag-input-mode 'emacs)
+        (ghostel--mouse-press-was-selected t)
+        (copy-mode-called nil)
+        (emacs-mode-called nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-set-point)
+                 (lambda (_event &optional _promote) nil))
+                ((symbol-function 'ghostel-copy-mode)
+                 (lambda () (setq copy-mode-called t)))
+                ((symbol-function 'ghostel-emacs-mode)
+                 (lambda () (setq emacs-mode-called t))))
+        (ghostel-mouse-release-or-set-point fake-event 1))
+      (should emacs-mode-called)
+      (should-not copy-mode-called))))
+
+(ert-deftest ghostel-test-mouse-1-press-records-was-selected ()
+  "Press records `ghostel--mouse-press-was-selected' for the clicked window.
+The window in the event equals `(selected-window)', so the press flags
+it as an already-selected (non-focus) click."
+  :tags '(native)
+  (let ((fake-event `(down-mouse-1 (,(selected-window) 1 (10 . 5) 0)))
+        (ghostel--mouse-press-was-selected nil))
+    (with-temp-buffer
+      (setq-local ghostel--term 'fake)
+      (setq-local ghostel--input-mode 'semi-char)
+      (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term _mode) nil))
+                ((symbol-function 'mouse-drag-region) (lambda (_event) nil))
+                ((symbol-function 'select-window) (lambda (&rest _) nil)))
+        (ghostel-mouse-press-or-copy-mode fake-event))
+      (should ghostel--mouse-press-was-selected))))
+
 (ert-deftest ghostel-test-mouse-1-release-tracking-forwards ()
   "Release with active tracking forwards via `ghostel--mouse-release'."
   :tags '(native)

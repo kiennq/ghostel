@@ -765,7 +765,7 @@ Customize the faces `ghostel-fake-cursor' and
   :type 'boolean)
 
 (defcustom ghostel-mouse-drag-input-mode 'copy
-  "Input mode to switch to after a left-button drag or multi-click selects text.
+  "Input mode to switch to after a left-button mouse click or selection.
 
 - `copy' (default): enter `ghostel-copy-mode'.  Pauses redraws -
   the selection is stable and the buffer is read-only.
@@ -777,7 +777,7 @@ Customize the faces `ghostel-fake-cursor' and
 
 Has no effect when a DEC mouse-tracking mode (1000/1002/1003) is
 active (the press is forwarded to the program) or when the buffer
-is not in semi-char-mode when the drag completes."
+is not in semi-char-mode when the gesture completes."
   :type '(choice (const :tag "Copy mode (default)" copy)
                  (const :tag "Emacs mode"          emacs)
                  (const :tag "Do not switch"       nil)))
@@ -2471,6 +2471,11 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
 
 ;;; Mouse input
 
+(defvar ghostel--mouse-press-was-selected nil
+  "Non-nil if the window under the last left-press was already selected.
+Set at press, read at release to tell a focus click (which only focuses)
+from a click in an already-focused window (which enters copy mode).")
+
 (defvar-local ghostel--mouse-drag-button nil
   "Button number held during an in-progress mouse-tracking drag.
 Nil when no drag is in progress.")
@@ -2626,36 +2631,47 @@ to consume mouse input."
 
 (defun ghostel-mouse-press-or-copy-mode (event)
   "Forward EVENT to the terminal, or hand off to `mouse-drag-region'.
-When a DEC mouse-tracking mode (1000/1002/1003) is enabled, behaves
-like `ghostel--mouse-press' and forwards the press to the running
-program.  Otherwise hands EVENT off to `mouse-drag-region' so Emacs's
-standard click-to-set-point and drag-to-select work.  Copy mode is
-not entered here - a pure click should only focus the window and
-move point.  When the press grows into a drag,
-`ghostel-mouse-drag-or-set-region' enters copy mode after the region
-is set so subsequent terminal output cannot clobber the selection."
+With a DEC mouse-tracking mode (1000/1002/1003) on, forwards the press
+to the program; otherwise hands off to `mouse-drag-region'.  Records in
+`ghostel--mouse-press-was-selected' whether the window was already
+selected before focusing it, for `ghostel-mouse-release-or-set-point'."
   (interactive "e")
-  (select-window (posn-window (event-start event)))
-  (if (ghostel--mouse-tracking-active-p)
-      (ghostel--mouse-press event)
-    (mouse-drag-region event)))
+  (let ((win (posn-window (event-start event))))
+    (setq ghostel--mouse-press-was-selected (eq win (selected-window)))
+    (select-window win)
+    (if (ghostel--mouse-tracking-active-p)
+        (ghostel--mouse-press event)
+      (mouse-drag-region event))))
 
 (defun ghostel-mouse-release-or-set-point (event &optional promote-to-region)
-  "Forward EVENT to the terminal, or hand off to `mouse-set-point'.
-Companion to `ghostel-mouse-press-or-copy-mode' for the left-button
-release event.  With tracking off, defers to Emacs's standard
-click handler so the release of a non-drag click sets point normally.
-PROMOTE-TO-REGION is passed through to `mouse-set-point' so that
-double-click and triple-click events keep the word/line selection."
+  "Forward EVENT to the terminal, or set point / switch input mode.
+With tracking off, sets point (PROMOTE-TO-REGION keeps the word/line
+selection of a multi-click) and, in semi-char mode, switches to
+`ghostel-mouse-drag-input-mode' after a multi-click or a single click
+in an already-selected window.  A single click that only focuses a
+previously-unselected window instead snaps point to the live cursor and
+stays in semi-char (skipped when `ghostel-mouse-drag-input-mode' is nil)."
   (interactive "e\np")
-  (if (ghostel--mouse-tracking-active-p)
-      (ghostel--mouse-release event)
-    (mouse-set-point event promote-to-region)
-    (when (and (eq ghostel--input-mode 'semi-char)
-               (> (event-click-count event) 1))
-      (pcase ghostel-mouse-drag-input-mode
-        ('copy  (ghostel-copy-mode))
-        ('emacs (ghostel-emacs-mode))))))
+  (let ((active (and ghostel-mouse-drag-input-mode
+                     (eq ghostel--input-mode 'semi-char))))
+    (cond
+     ((ghostel--mouse-tracking-active-p)
+      (ghostel--mouse-release event))
+     ;; Pure focus click of a previously-unselected window: just focus,
+     ;; snapping point to the live input cursor instead of the click.
+     ((and active
+           (= (event-click-count event) 1)
+           (not ghostel--mouse-press-was-selected))
+      (goto-char (or ghostel--cursor-char-pos (point-max)))
+      (deactivate-mark))
+     ;; Multi-click, or a single click in an already-selected window: set
+     ;; point/selection, then freeze (a focus click never reaches here).
+     (t
+      (mouse-set-point event promote-to-region)
+      (when active
+        (pcase ghostel-mouse-drag-input-mode
+          ('copy  (ghostel-copy-mode))
+          ('emacs (ghostel-emacs-mode))))))))
 
 (defun ghostel-mouse-drag-or-set-region (event)
   "Forward EVENT to the terminal, or hand off to `mouse-set-region'.
