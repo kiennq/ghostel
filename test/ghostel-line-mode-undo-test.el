@@ -62,7 +62,8 @@ live PTY.  Leaves the buffer in line mode with point at the input."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((inhibit-read-only t))
+            (insert (propertize "$ " 'ghostel-prompt t)))
           ;; Fresh ghostel-mode buffer: recording off.
           (should (eq buffer-undo-list t))
           (let ((ghostel--term 'fake)
@@ -140,39 +141,40 @@ pre-redraw history is discarded, and a subsequent edit undoes
 correctly against the input's new position."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (set-window-buffer (selected-window) buf)
-    (setq ghostel--process 'fake-proc)
-    (ghostel-line-mode-undo-test--enter-line-mode term)
-    (should (eq ghostel--input-mode 'line))
-    (insert "foo")
-    (undo-boundary)
-    ;; Drive a redraw between edits: shell output streams in and a new
-    ;; prompt is painted.  The renderer rewrites the whole viewport
-    ;; (line mode forces full redraws).
-    (ghostel--write-vt term "some output\r\n\e]133;A\e\\$ \e]133;B\e\\")
-    (ghostel--redraw-now buf)
-    ;; (a) Regression guard: the input survived snapshot/restore.
-    (should (equal (ghostel--line-mode-input-text) "foo"))
-    ;; (b) The renderer's whole-viewport delete/insert storm did NOT
-    ;; pollute undo: the only thing left is the empty re-armed history.
-    (should (null buffer-undo-list))
-    ;; (c) A new edit after the redraw undoes correctly — proving the
-    ;; history refers to the input's CURRENT position, not the stale
-    ;; pre-redraw one (which would have deleted renderer output).
-    (let ((scrollback-before (buffer-substring-no-properties
-                              (point-min)
-                              (marker-position ghostel--line-input-start))))
-      (goto-char (marker-position ghostel--line-input-end))
-      (insert "bar")
+    (let ((ghostel-detect-password-prompts nil))
+      (set-window-buffer (selected-window) buf)
+      (setq ghostel--process 'fake-proc)
+      (ghostel-line-mode-undo-test--enter-line-mode term)
+      (should (eq ghostel--input-mode 'line))
+      (insert "foo")
       (undo-boundary)
-      (should (equal (ghostel--line-mode-input-text) "foobar"))
-      (ghostel-line-mode-undo-test--undo t)
+      ;; Drive a redraw between edits: shell output streams in and a new
+      ;; prompt is painted.  The renderer rewrites the whole viewport
+      ;; (line mode forces full redraws).
+      (ghostel--write-vt term "some output\r\n\e]133;A\e\\$ \e]133;B\e\\")
+      (ghostel--redraw-now buf)
+      ;; (a) Regression guard: the input survived snapshot/restore.
       (should (equal (ghostel--line-mode-input-text) "foo"))
-      ;; And the scrollback the renderer wrote is untouched by the undo.
-      (should (equal (buffer-substring-no-properties
-                      (point-min)
-                      (marker-position ghostel--line-input-start))
-                     scrollback-before)))))
+      ;; (b) The renderer's whole-viewport delete/insert storm did NOT
+      ;; pollute undo: the only thing left is the empty re-armed history.
+      (should (null buffer-undo-list))
+      ;; (c) A new edit after the redraw undoes correctly — proving the
+      ;; history refers to the input's CURRENT position, not the stale
+      ;; pre-redraw one (which would have deleted renderer output).
+      (let ((scrollback-before (buffer-substring-no-properties
+                                (point-min)
+                                (marker-position ghostel--line-input-start))))
+        (goto-char (marker-position ghostel--line-input-end))
+        (insert "bar")
+        (undo-boundary)
+        (should (equal (ghostel--line-mode-input-text) "foobar"))
+        (ghostel-line-mode-undo-test--undo t)
+        (should (equal (ghostel--line-mode-input-text) "foo"))
+        ;; And the scrollback the renderer wrote is untouched by the undo.
+        (should (equal (buffer-substring-no-properties
+                        (point-min)
+                        (marker-position ghostel--line-input-start))
+                       scrollback-before))))))
 
 ;; 6.5 — sending a line clears the undo history.
 (ert-deftest ghostel-test-line-mode-send-clears-undo ()
