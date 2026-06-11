@@ -1410,11 +1410,12 @@ it into the spawn-capture plist.  Self-removing — fires at most once."
   (apply orig args))
 
 (defun ghostel-debug--capture-spawn-pty
-    (orig program program-args extra-env &optional remote-p)
+    (orig program program-args height width stty-flags extra-env &optional remote-p)
   "Around-advice on `ghostel--spawn-pty' that snapshots the spawn.
-ORIG is the original function; PROGRAM, PROGRAM-ARGS, EXTRA-ENV, and
-REMOTE-P are forwarded verbatim and recorded into
-`ghostel-debug--spawn-capture'.  Self-removing — fires at most once.
+ORIG is the original function.  PROGRAM, PROGRAM-ARGS, HEIGHT,
+WIDTH, STTY-FLAGS, EXTRA-ENV, and REMOTE-P are forwarded verbatim and
+recorded into `ghostel-debug--spawn-capture'.  Self-removing — fires at
+most once.
 
 Captures the wrapper command via `cl-letf*' on `make-process' rather
 than reading `process-command' on the returned process: on TRAMP's
@@ -1456,7 +1457,8 @@ two differ, the renderer flags it."
                       (setq intercepted-cmd
                             (plist-get plist :command)))
                     (apply orig-make-process plist))))
-              (funcall orig program program-args extra-env remote-p))))
+              (funcall orig program program-args height width stty-flags
+                       extra-env remote-p))))
       ;; `ghostel--spawn-pty' runs in the new ghostel buffer (the
       ;; spawn target), so `setq-local' here lands on the right
       ;; buffer-local.
@@ -1467,8 +1469,9 @@ two differ, the renderer flags it."
                   :remote-p (and remote-p t)
                   :program program
                   :program-args program-args
-                  :cols ghostel--term-cols
-                  :rows ghostel--term-rows
+                  :cols (or ghostel--term-cols width)
+                  :rows (or ghostel--term-rows height)
+                  :stty-flags stty-flags
                   :extra-env extra-env
                   :process-environment spawn-env
                   :command intercepted-cmd
