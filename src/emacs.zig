@@ -51,7 +51,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     pub fn intern(self: Env, name: [*:0]const u8) Value {
@@ -260,7 +262,7 @@ pub const Env = struct {
     }
 
     pub fn vecSize(self: Env, vec: Value) c_long {
-        return self.raw.vec_size.?(self.raw, vec);
+        return @intCast(self.raw.vec_size.?(self.raw, vec));
     }
 
     pub fn nonLocalExitCheck(self: Env) FuncallExit {
@@ -274,6 +276,8 @@ pub const Env = struct {
     pub fn nonLocalExitSignal(self: Env, symbol: Value, data: Value) void {
         self.raw.non_local_exit_signal.?(self.raw, symbol, data);
     }
+
+    // --- Function registration ---
 
     pub fn makeFunction(
         self: Env,
@@ -295,6 +299,19 @@ pub const Env = struct {
     }
 
     /// Register a named Elisp function backed by a C function.
+    pub fn bindFunction(
+        self: Env,
+        name: [*:0]const u8,
+        min_arity: i32,
+        max_arity: i32,
+        func: *const fn (?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,
+        docstring: [*:0]const u8,
+    ) void {
+        const fun = self.makeFunction(min_arity, max_arity, func, docstring, null);
+        _ = self.f("fset", .{ self.intern(name), fun });
+    }
+
+    /// Register a named Elisp function backed by a C function.
     pub fn registerFunction(self: Env, entry: *const FunctionEntry) void {
         const wrapped_fn = struct {
             fn call(
@@ -307,11 +324,15 @@ pub const Env = struct {
                 const prev_env = current_env;
                 current_env = env;
                 defer current_env = prev_env;
-                return entry.impl.call(env, nargs, args) catch |e| {
-                    env.logStackTrace(@errorReturnTrace());
-                    env.signalError("error in %s: %s", .{ entry.name, @errorName(e) });
-                    return env.nil();
-                };
+                const result = entry.impl.call(env, nargs, args);
+                return if (comptime @typeInfo(@TypeOf(result)) == .error_union)
+                    result catch |e| {
+                        env.logStackTrace(@errorReturnTrace());
+                        env.signalErrorf("error in %s: %s", .{ entry.name, @errorName(e) });
+                        return env.nil();
+                    }
+                else
+                    result;
             }
         }.call;
         const fun = self.makeFunction(entry.arity[0], entry.arity[1], &wrapped_fn, entry.doc, null);
@@ -323,6 +344,71 @@ pub const Env = struct {
         inline for (entries) |*entry| self.registerFunction(entry);
     }
 
+    /// Call (provide 'feature).
+    pub fn provide(self: Env, feature: [*:0]const u8) void {
+        _ = self.funcall(sym.provide, &[_]Value{self.intern(feature)});
+    }
+
+    // --- Buffer helpers ---
+
+    pub fn point(self: Env) Value {
+        return self.f("point", .{});
+    }
+
+    pub fn gotoChar(self: Env, pos: anytype) void {
+        _ = self.f("goto-char", .{pos});
+    }
+
+    pub fn insert(self: Env, text: []const u8) void {
+        _ = self.f("insert", .{text});
+    }
+
+    pub fn forwardLine(self: Env, n: anytype) i64 {
+        return self.extractInteger(self.f("forward-line", .{n}));
+    }
+
+    pub fn moveToColumn(self: Env, col: i64) void {
+        _ = self.f("move-to-column", .{col});
+    }
+
+    pub fn eraseBuffer(self: Env) void {
+        _ = self.f("erase-buffer", .{});
+    }
+
+    pub fn pointMax(self: Env) Value {
+        return self.f("point-max", .{});
+    }
+
+    pub fn markMarker(self: Env) Value {
+        return self.f("mark-marker", .{});
+    }
+
+    pub fn markerPosition(self: Env, marker: Value) Value {
+        return self.f("marker-position", .{marker});
+    }
+
+    pub fn setMarker(self: Env, marker: Value, pos: Value) Value {
+        return self.f("set-marker", .{ marker, pos });
+    }
+
+    pub fn deleteRegion(self: Env, start: anytype, end: anytype) void {
+        _ = self.f("delete-region", .{ start, end });
+    }
+
+    pub fn eobp(self: Env) bool {
+        return self.isNotNil(self.f("eobp", .{}));
+    }
+
+    pub fn putTextProperty(
+        self: Env,
+        start: anytype,
+        end: anytype,
+        comptime prop: []const u8,
+        value: anytype,
+    ) void {
+        _ = self.f("put-text-property", .{ start, end, @field(sym, prop), value });
+    }
+
     /// Create a unibyte string (for binary data like PNG images).
     /// Returns null if the API is unavailable (Emacs < 28).
     pub fn makeUnibyteString(self: Env, str: []const u8) ?Value {
@@ -330,20 +416,27 @@ pub const Env = struct {
         return func(self.raw, str.ptr, @intCast(str.len));
     }
 
-    pub fn openChannel(self: Env, pipe: Value) std.posix.fd_t {
+    pub fn openChannel(self: Env, pipe: Value) c_int {
         return self.raw.open_channel.?(self.raw, pipe);
     }
 
     /// Signal an error with a message string.
-    pub fn signalError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
             sym.@"error",
-            self.f("list", .{self.format("ghostel: " ++ msg, objects)}),
+            self.f("list", .{msg}),
         );
     }
 
-    pub fn message(self: Env, msg: []const u8, objects: anytype) void {
-        const all_args = [1]Value{self.makeString(msg)} ++ self.makeValues(objects);
+    pub fn signalErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        self.nonLocalExitSignal(
+            sym.@"error",
+            self.f("list", .{self.format("ghostel: " ++ fmt, args)}),
+        );
+    }
+
+    pub fn message(self: Env, comptime fmt: []const u8, args: anytype) void {
+        const all_args = [1]Value{self.makeString(fmt)} ++ self.makeValues(args);
         _ = self.funcall(sym.message, &all_args);
     }
 
@@ -352,10 +445,10 @@ pub const Env = struct {
         return self.funcall(sym.format, &all_args);
     }
 
-    pub fn logError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn logError(self: Env, comptime fmt: []const u8, args: anytype) void {
         _ = self.f("display-warning", .{
             sym.ghostel,
-            self.format("ghostel: " ++ msg, objects),
+            self.format("ghostel: " ++ fmt, args),
             sym.@":error",
         });
     }
@@ -410,12 +503,15 @@ const interned_symbols = [_][:0]const u8{
     ":underline",
     ":weight",
     ":width",
+    "add-hook",
     "bold",
     "bright",
     "car",
-    "cdr",
+    "boundp",
     "char-after",
+    "char-before",
     "composition-get-gstring",
+    "cdr",
     "cons",
     "dash",
     "default",
@@ -499,12 +595,12 @@ const interned_symbols = [_][:0]const u8{
     "point-max",
     "pos-bol",
     "process-environment",
-    "process-live-p",
     "process-send-string",
     "process-tty-name",
     "propertize",
     "provide",
     "put-text-property",
+    "remhash",
     "reverse",
     "run-at-time",
     "selected-window",
@@ -541,6 +637,12 @@ fn SymbolCache(comptime symbols: []const [:0]const u8) type {
 }
 
 pub var sym: SymbolCache(&interned_symbols) = undefined;
+var sym_initialized = false;
+var debug_hook_installed = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
@@ -548,11 +650,8 @@ pub fn initModule(alloc: Allocator, raw: *c.emacs_env) void {
     module_alloc = alloc;
 
     const env = Env.init(raw);
-    inline for (std.meta.fields(@TypeOf(sym))) |field| {
-        @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
-    }
 
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == .Debug and !debug_hook_installed) {
         const cleanup_fn = env.makeFunction(
             0,
             0,
@@ -561,7 +660,16 @@ pub fn initModule(alloc: Allocator, raw: *c.emacs_env) void {
             null,
         );
         _ = env.funcall(env.intern("add-hook"), &[_]Value{ env.intern("kill-emacs-hook"), cleanup_fn });
+        debug_hook_installed = true;
     }
+}
+
+pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
+    inline for (std.meta.fields(@TypeOf(sym))) |field| {
+        @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
+    }
+    sym_initialized = true;
 }
 
 fn debugKillEmacsHook(_: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
