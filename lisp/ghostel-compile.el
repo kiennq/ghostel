@@ -628,7 +628,10 @@ the rendered buffer remains read-only in both cases."
       ;; `ghostel-mode'
       ;; so the renderer/timer/resize hooks (which all gate on `derived-mode-p
       ;; \\='ghostel-mode\\=') keep working; only input handling changes.
-      (unless interactive
+      ;; `ghostel-mode' starts read-only by default, so explicitly unlock
+      ;; interactive compile buffers after resetting the major mode.
+      (if interactive
+          (setq buffer-read-only nil)
         (use-local-map ghostel-compile-view-mode-map)
         (setq buffer-read-only t))
       ;; Enable the live toggle (`C-c C-j' / `C-c C-e') in compile
