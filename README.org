@@ -1126,8 +1126,8 @@ tables below group them by area; defaults shown are the out-of-the-box values.
 | =ghostel-kill-buffer-on-exit=      | =t=                                             | Kill the buffer when the shell process exits.                                                                 |
 | =ghostel-query-before-killing=     | =auto=                                          | Confirm before killing a live buffer / exiting Emacs: =t=, =nil=, or =auto= (only while a command runs).            |
 | =ghostel-exit-functions=           | =nil=                                           | Hook run with =(BUFFER EVENT)= when the terminal process exits.                                                 |
-| =ghostel-command-start-functions=  | =(ghostel--query-before-killing-on-cmd-start)=  | Hook run with =(BUFFER)= on OSC 133 C (command start).                                                          |
-| =ghostel-command-finish-functions= | =(ghostel--query-before-killing-on-cmd-finish)= | Hook run with =(BUFFER EXIT-STATUS)= on OSC 133 D (command finish).                                             |
+| =ghostel-command-start-functions=  | =nil=                                           | Hook run with =(BUFFER)= on OSC 133 C (command start).                                                          |
+| =ghostel-command-finish-functions= | =nil=                                           | Hook run with =(BUFFER EXIT-STATUS)= on OSC 133 D (command finish).                                             |
 
 ** Native module
 

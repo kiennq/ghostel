@@ -279,6 +279,35 @@ The caller must call `delete-process' when done."
     (set-process-query-on-exit-flag proc nil)
     proc))
 
+(defun ghostel-bench--windows-p ()
+  "Return non-nil when benchmarks are running on native Windows."
+  (eq system-type 'windows-nt))
+
+(defun ghostel-bench--windows-cat-candidates ()
+  "Return common Windows locations for cat.exe."
+  (let ((program-files (getenv "ProgramFiles"))
+        (program-files-x86 (getenv "ProgramFiles(x86)")))
+    (delq nil
+          (list (and program-files
+                     (expand-file-name "Git/usr/bin/cat.exe" program-files))
+                (and program-files-x86
+                     (expand-file-name "Git/usr/bin/cat.exe" program-files-x86))
+                "C:/Program Files/Git/usr/bin/cat.exe"
+                "C:/msys64/usr/bin/cat.exe"))))
+
+(defun ghostel-bench--windows-cat-program ()
+  "Return the cat executable for the Windows ConPTY benchmark."
+  (or (executable-find "cat")
+      (cl-loop for candidate in (ghostel-bench--windows-cat-candidates)
+               when (file-exists-p candidate)
+               return candidate)
+      (error "cat executable not found; install Git for Windows or add cat.exe to PATH")))
+
+(defun ghostel-bench--windows-output-shell (data-file)
+  "Return a cat shell spec that writes DATA-FILE bytes to stdout."
+  (list (ghostel-bench--windows-cat-program)
+        (expand-file-name data-file)))
+
 ;; =========================================================================
 ;; SECTION 1: End-to-end cross-emulator benchmark
 ;;
@@ -385,6 +414,52 @@ drive the post-exit timers."
                 (accept-process-output nil 0.01)))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
+(defun ghostel-bench--e2e-ghostel-windows-conpty (data-file detect-p)
+  "Benchmark Ghostel's production ConPTY process path on Windows."
+  (let* ((rows 24) (cols 80)
+         (buf (generate-new-buffer " *ghostel-e2e-bench*"))
+         (ghostel-kill-buffer-on-exit nil)
+         (ghostel-enable-url-detection (and detect-p t))
+         (ghostel-enable-file-detection (and detect-p t))
+         (ghostel-plain-link-detection-delay 0)
+         (done nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq ghostel--term
+                (ghostel--new rows cols
+                              (* ghostel-bench-scrollback 1024)))
+          (setq ghostel--term-rows rows ghostel--term-cols cols)
+          (when (window-live-p (selected-window))
+            (set-window-buffer (selected-window) buf))
+          (setq-local ghostel-shell
+                      (ghostel-bench--windows-output-shell data-file))
+          (setq-local ghostel-shell-integration nil)
+          (let ((proc (ghostel--start-process)))
+            (setq ghostel--process proc)
+            (set-process-sentinel
+             proc
+             (lambda (process event)
+               (ghostel--sentinel process event)
+               (setq done t)))
+            (while (not done)
+              (accept-process-output proc 30))
+            (ghostel--redraw-now buf)
+            (while (and ghostel--link-detection-timer
+                        (not (memq (timer--triggered ghostel--link-detection-timer)
+                                   '(nil t))))
+              (accept-process-output nil 0.01))))
+      (when (buffer-live-p buf)
+        (when (and (boundp 'ghostel--term) ghostel--term)
+          (ignore-errors (ghostel--kill-native-process ghostel--term)))
+        (kill-buffer buf)))))
+
+(defun ghostel-bench--e2e-ghostel-platform (data-file detect-p)
+  "Benchmark Ghostel's production process path for the current platform."
+  (if (ghostel-bench--windows-p)
+      (ghostel-bench--e2e-ghostel-windows-conpty data-file detect-p)
+    (ghostel-bench--e2e-ghostel data-file detect-p)))
+
 (defun ghostel-bench--e2e-vterm (data-file)
   "Benchmark vterm processing `cat DATA-FILE' through `vterm--filter'.
 
@@ -451,7 +526,8 @@ For ghostel, exercises the full `ghostel-mode' pipeline including
 `*--filter' (decode loop, control-seq split or output queue, per-chunk
 update).  `term' installs `term-emulate-terminal' directly as its
 process filter, which both parses and renders in one call."
-  (message "\n--- End-to-End (real backend pipelines, cat %s) ---"
+  (message "\n--- End-to-End (real backend pipelines, %s %s) ---"
+           (if (ghostel-bench--windows-p) "Ghostel ConPTY / cat" "cat")
            (ghostel-bench--human-size ghostel-bench-data-size))
   (message "  ghostel: filter / invalidate / delayed-redraw / link-detection")
   (message "  vterm:   vterm--filter (decode + control-seq split + update)")
@@ -467,10 +543,10 @@ process filter, which both parses and renders in one call."
           (message "  [plain ASCII data]")
           (ghostel-bench--measure
            "e2e/plain/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file t)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file t)))
           (ghostel-bench--measure
            "e2e/plain/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file nil)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file nil)))
           (when ghostel-bench-include-vterm
             (ghostel-bench--measure
              "e2e/plain/vterm" ghostel-bench-data-size ghostel-bench-iterations
@@ -492,10 +568,10 @@ process filter, which both parses and renders in one call."
           (message "  [URL & file-path heavy data]")
           (ghostel-bench--measure
            "e2e/urls/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file t)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file t)))
           (ghostel-bench--measure
            "e2e/urls/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file nil)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file nil)))
           (when ghostel-bench-include-vterm
             (ghostel-bench--measure
              "e2e/urls/vterm" ghostel-bench-data-size ghostel-bench-iterations
@@ -517,10 +593,10 @@ process filter, which both parses and renders in one call."
           (message "  [mixed emoji/CJK/ASCII data]")
           (ghostel-bench--measure
            "e2e/mixed/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file t)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file t)))
           (ghostel-bench--measure
            "e2e/mixed/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file nil)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file nil)))
           (when ghostel-bench-include-vterm
             (ghostel-bench--measure
              "e2e/mixed/vterm" ghostel-bench-data-size ghostel-bench-iterations

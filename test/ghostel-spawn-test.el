@@ -37,10 +37,13 @@ need to exercise the PTY matrix here."
   (declare (indent 1))
   `(let (,capture)
      (cl-letf (((symbol-function 'ghostel--spawn-process)
-                (lambda (program program-args remote-p)
+                (lambda (program program-args height width stty-flags remote-p)
                   (setq ,capture
                         (list :program program
                               :args (copy-tree program-args)
+                              :height height
+                              :width width
+                              :stty-flags stty-flags
                               :env (copy-sequence process-environment)
                               :adaptive process-adaptive-read-buffering
                               :read-max read-process-output-max
@@ -294,6 +297,7 @@ written by `ghostel-test--pty-winsize-script'."
              ;; bash invocation.  Login-wrap behavior is covered by its own
              ;; dedicated tests.
              (ghostel-macos-login-shell nil)
+             (system-type 'gnu/linux)
              (default-directory "/tmp/"))
         (ghostel--start-process)
         (let ((env (plist-get capture :env)))
@@ -309,20 +313,21 @@ It must also raise `read-process-output-max'.  Before Emacs 31 the
 former defaulted to t and throttled bursty TUI redraws."
   (ghostel-test--with-spawn-process-capture capture
     (with-temp-buffer
-      (ghostel--spawn-pty "/bin/sh" nil nil nil)
+      (ghostel--spawn-pty "/bin/sh" nil 24 80 ghostel--default-stty nil nil)
       (should (null (plist-get capture :adaptive)))
       (should (>= (plist-get capture :read-max) (* 1024 1024))))))
 
 (ert-deftest ghostel-test-spawn-emacs-pty-enables-input-echo ()
   "The Emacs PTY path enables input echo before PROGRAM reads."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (skip-unless (file-executable-p "/bin/sh"))
   (let ((ghostel-use-native-pty nil))
     (ghostel-test--with-terminal-buffer (buf term 8 80 200)
       (let ((proc (ghostel--spawn-pty
                    "/bin/sh"
                    '("-c" "printf 'GHOSTEL_ECHO_READY\r\n'; IFS= read -r _line; printf 'GHOSTEL_ECHO_DONE\r\n'")
-                   nil nil)))
+                   8 80 ghostel--default-stty nil nil)))
         (ghostel-test--wait-for-text "GHOSTEL_ECHO_READY" proc 5)
         (ghostel--write-pty ghostel--term "GHOSTEL_ECHO_TOKEN\r")
         (ghostel-test--wait-for-text "GHOSTEL_ECHO_DONE" proc 5)
@@ -336,6 +341,7 @@ Emacs path `ghostel--spawn-via-emacs' calls `set-process-window-size'.
 Either way the child must read those dimensions, so this drives a real
 child through both backends and asserts the size it sees."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((python (executable-find "python3")))
     (skip-unless python)
     (ghostel-test--with-pty-matrix backend
@@ -354,6 +360,7 @@ DC1 and DC3; ghostel disables it — natively in C
 the direct key binding and send-next-key can deliver these bytes.
 Driven through both PTY backends."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((python (executable-find "python3")))
     (skip-unless python)
     (ghostel-test--with-pty-matrix backend
@@ -381,6 +388,7 @@ commits; committing resizes the PTY (native `pty.resize') or calls
 child's process group.  The child must then read the new dimensions,
 not the old ones — verified on both PTY backends."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((python (executable-find "python3")))
     (skip-unless python)
     (ghostel-test--with-pty-matrix backend
@@ -411,6 +419,7 @@ sentinel value, and verify the value reached `make-process'.  Also
 verifies the hook fires in the spawning buffer with `default-directory'
 intact (with-editor's `with-editor--setup' reads `default-directory')."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (ghostel-test--with-pty-matrix backend
     (let (captured-buffer
           captured-default-directory)
@@ -438,6 +447,7 @@ intact (with-editor's `with-editor--setup' reads `default-directory')."
 (ert-deftest ghostel-test-child-cwd-follows-default-directory-with-tilde ()
   "Child process starts in `default-directory', including abbreviated home paths."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (let* ((home-dir (file-name-as-directory (expand-file-name "~")))
          (test-dir (file-name-directory
                     (or (locate-library "ghostel-spawn-test")
