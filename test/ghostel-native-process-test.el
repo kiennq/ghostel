@@ -18,6 +18,34 @@
   "Record ARGS for native process event-filter tests."
   (push args ghostel-test-native-process--events))
 
+(ert-deftest ghostel-test-spawn-process-installs-resize-hook-on-native-transport ()
+  "`ghostel--spawn-process' installs the resize hook on the chosen transport."
+  (let ((pipe nil))
+    (unwind-protect
+        (ghostel-test--without-subr-trampolines
+          (cl-letf (((symbol-function 'ghostel--resolve-local-executable)
+                     #'identity)
+                    ((symbol-function 'ghostel--spawn-via-native)
+                     (lambda (&rest _)
+                       (setq pipe (make-pipe-process
+                                   :name "ghostel-native-process"
+                                   :buffer (current-buffer)
+                                   :noquery t))))
+                    ((symbol-function 'signal-process)
+                     #'ignore))
+            (with-temp-buffer
+              (let ((ghostel-use-native-pty t)
+                    (system-type 'gnu/linux))
+                (let ((process (ghostel--spawn-process
+                                "sh" nil 24 80 "-ixon" nil)))
+                  (should (eq pipe process)))
+                (should (process-live-p pipe))
+                (should (equal #'ghostel--window-adjust-process-window-size
+                               (process-get pipe 'adjust-window-size-function)))))))
+      (when (and pipe (process-live-p pipe))
+        (set-process-sentinel pipe #'ignore)
+        (delete-process pipe)))))
+
 (defun ghostel-test-native-process--with-events-filter (fn)
   "Call FN in a buffer-local `ghostel--events-filter' unit-test context.
 FN receives a fake pipe process value and a zero-argument function

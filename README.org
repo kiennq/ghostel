@@ -673,11 +673,12 @@ slave tty is in canonical mode with echo off, read via a small =tcgetattr= Zig
 binding.  This catches local programs that flip =!ECHO= (sudo, ssh's own prompt,
 gpg, ...).  A cursor-row regex fallback (=ghostel-password-prompt-regex=,
 defaulting to =comint-password-prompt-regexp=) covers cases the tty signal cannot
-see, but runs *only* when the foreground shell is on a remote host
+see.  It runs when the foreground shell is on a remote host
 (=ghostel--remote-shell-p=, derived from the TRAMP =default-directory= ghostel
-keeps in sync via OSC 7).  Gating it on remote-only avoids false positives from
-local raw-mode TUIs like vim or less, and structural anchoring keeps shell-typed
-lines such as =$ echo Password:= from triggering.  See =ghostel-debug-start= /
+keeps in sync via OSC 7), and on Windows where ConPTY does not expose POSIX
+termios state.  This gate avoids false positives from POSIX local raw-mode TUIs
+like vim or less, and structural anchoring keeps shell-typed lines such as
+=$ echo Password:= from triggering.  See =ghostel-debug-start= /
 =ghostel-debug-password-events-show= for diagnostics.
 
 The mode line shows = 🔒Password= while a prompt is open.  Wrong-password retries are detected automatically (the cursor moves to the new
@@ -1180,8 +1181,8 @@ tables below group them by area; defaults shown are the out-of-the-box values.
 | =ghostel-kill-buffer-on-exit=      | =t=                                             | Kill the buffer when the shell process exits.                                                                 |
 | =ghostel-query-before-killing=     | =auto=                                          | Confirm before killing a live buffer / exiting Emacs: =t=, =nil=, or =auto= (only while a command runs).            |
 | =ghostel-exit-functions=           | =nil=                                           | Hook run with =(BUFFER EVENT)= when the terminal process exits.                                                 |
-| =ghostel-command-start-functions=  | =(ghostel--query-before-killing-on-cmd-start)=  | Hook run with =(BUFFER)= on OSC 133 C (command start).                                                          |
-| =ghostel-command-finish-functions= | =(ghostel--query-before-killing-on-cmd-finish)= | Hook run with =(BUFFER EXIT-STATUS)= on OSC 133 D (command finish).                                             |
+| =ghostel-command-start-functions=  | =nil=                                           | Hook run with =(BUFFER)= on OSC 133 C (command start).                                                          |
+| =ghostel-command-finish-functions= | =nil=                                           | Hook run with =(BUFFER EXIT-STATUS)= on OSC 133 D (command finish).                                             |
 | =ghostel-bookmark-check-dir=       | =t=                                             | Restore the working directory when jumping to a ghostel [[#bookmarks][bookmark]] (=cd= into a reused buffer that moved).      |
 
 ** Native module
@@ -1239,7 +1240,7 @@ tables below group them by area; defaults shown are the out-of-the-box values.
 |-----------------------------------+------------------------------------+--------------------------------------------------------------------------|
 | =ghostel-detect-password-prompts=   | =t=                                  | Watch for password prompts and pop =read-passwd=.                          |
 | =ghostel-password-prompt-functions= | =(ghostel--default-password-source)= | Sources tried in order to obtain a password (prepend auth-source, etc.). |
-| =ghostel-password-prompt-regex=     | =comint-password-prompt-regexp=      | Cursor-row regex fallback (remote shells only).                          |
+| =ghostel-password-prompt-regex=     | =comint-password-prompt-regexp=      | Cursor-row regex fallback (remote shells and Windows ConPTY).            |
 | =ghostel-password-prompt-debounce=  | =0.2=                                | Seconds to wait after a rising edge before opening =read-passwd=.          |
 
 ** Notifications and progress
