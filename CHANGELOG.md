@@ -786,9 +786,10 @@ All notable changes to this project will be documented in this file.
   itself was anchored only at end-of-line.  The fallback regex
   now defaults to `comint-password-prompt-regexp` (structurally
   anchored at start-of-line or after curated trigger words), and
-  the fallback only runs when `ghostel--remote-shell-p` indicates
-  a remote shell — local raw-mode TUIs (vim, less, htop) don't
-  risk false positives from coincidental cursor-row content.
+  the fallback only runs when `ghostel--password-regex-fallback-p`
+  indicates a remote shell or Windows ConPTY — POSIX local raw-mode
+  TUIs (vim, less, htop) don't risk false positives from coincidental
+  cursor-row content.
   Fixes [#244](https://github.com/dakra/ghostel/issues/244).
 - `consult-line`, `consult-imenu`, and other `goto-char` jumps in
   line mode no longer snap back to the live cursor.  The
