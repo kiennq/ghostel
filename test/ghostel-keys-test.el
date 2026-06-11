@@ -154,7 +154,7 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
           (written nil)
           (immediate-called nil)
           (invalidate-called nil))
-      ;; Stub out process-buffer, native input, delayed-redraw, and invalidate.
+      ;; Stub out process-buffer, native input, redraw, and invalidate.
       (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
                 ((symbol-function 'ghostel--write-input)
                  (lambda (_term data) (setq written data)))
@@ -242,6 +242,320 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
         (should (equal "a" written))
         (should-not immediate-called)
         (should invalidate-called)))))
+
+(ert-deftest ghostel-test-typing-redraw-delay-during-recent-input ()
+  "Recent input uses the typing redraw delay for timer-rendered output."
+  (with-temp-buffer
+    (let ((ghostel-adaptive-fps t)
+          (ghostel-timer-delay 0.033)
+          (ghostel-typing-redraw-delay 0.004)
+          (ghostel-typing-redraw-window 0.08)
+          (ghostel--last-send-time (current-time))
+          (ghostel--last-output-time nil)
+          (ghostel--redraw-timer nil)
+          (ghostel--redraw-timer-deadline nil)
+          scheduled-delay)
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat _fn &rest _args)
+                   (setq scheduled-delay delay)
+                   'ghostel-test-timer)))
+        (ghostel--invalidate)
+        (should (equal scheduled-delay 0.004))
+        (should (eq ghostel--redraw-timer 'ghostel-test-timer))
+        (should ghostel--redraw-timer-deadline)))))
+
+(ert-deftest ghostel-test-typing-redraw-keeps-existing-adaptive-idle-delay ()
+  "Without recent input, adaptive FPS keeps its existing idle first-frame delay."
+  (with-temp-buffer
+    (let ((ghostel-adaptive-fps t)
+          (ghostel-timer-delay 0.033)
+          (ghostel-typing-redraw-delay 0.004)
+          (ghostel-typing-redraw-window 0.08)
+          (ghostel--last-send-time nil)
+          (ghostel--last-output-time (time-subtract (current-time) 1))
+          (ghostel--redraw-timer nil)
+          (ghostel--redraw-timer-deadline nil)
+          scheduled-delay)
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat _fn &rest _args)
+                   (setq scheduled-delay delay)
+                   'ghostel-test-timer)))
+        (ghostel--invalidate)
+        (should (equal scheduled-delay 0.016))))))
+
+(ert-deftest ghostel-test-typing-redraw-disabled-with-fixed-fps ()
+  "When adaptive FPS is disabled, typing boost does not override the fixed delay."
+  (with-temp-buffer
+    (let ((ghostel-adaptive-fps nil)
+          (ghostel-timer-delay 0.033)
+          (ghostel-typing-redraw-delay 0.004)
+          (ghostel-typing-redraw-window 0.08)
+          (ghostel--last-send-time (current-time))
+          (ghostel--last-output-time nil)
+          (ghostel--redraw-timer nil)
+          (ghostel--redraw-timer-deadline nil)
+          scheduled-delay)
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat _fn &rest _args)
+                   (setq scheduled-delay delay)
+                   'ghostel-test-timer)))
+        (ghostel--invalidate)
+        (should (equal scheduled-delay 0.033))))))
+
+(ert-deftest ghostel-test-typing-redraw-reschedules-slower-timer-earlier ()
+  "Typing output can replace an existing slower redraw timer."
+  (with-temp-buffer
+    (let* ((fixed-now (current-time))
+           (ghostel-adaptive-fps t)
+           (ghostel-timer-delay 0.033)
+           (ghostel-typing-redraw-delay 0.004)
+           (ghostel-typing-redraw-window 0.08)
+           (ghostel--last-send-time fixed-now)
+           (ghostel--last-output-time fixed-now)
+           (ghostel--redraw-timer 'slow-timer)
+           (ghostel--redraw-timer-deadline (time-add fixed-now 0.033))
+           cancelled
+           scheduled-delay)
+      (cl-letf (((symbol-function 'current-time)
+                 (lambda () fixed-now))
+                ((symbol-function 'cancel-timer)
+                 (lambda (timer) (push timer cancelled)))
+                ((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat _fn &rest _args)
+                   (setq scheduled-delay delay)
+                   'fast-timer)))
+        (ghostel--invalidate)
+        (should (equal cancelled '(slow-timer)))
+        (should (equal scheduled-delay 0.004))
+        (should (eq ghostel--redraw-timer 'fast-timer))
+        (should ghostel--redraw-timer-deadline)))))
+
+(ert-deftest ghostel-test-typing-redraw-keeps-faster-existing-timer ()
+  "Typing boost must not delay a redraw timer that is already earlier."
+  (with-temp-buffer
+    (let* ((now (current-time))
+           (ghostel-adaptive-fps t)
+           (ghostel-timer-delay 0.033)
+           (ghostel-typing-redraw-delay 0.004)
+           (ghostel-typing-redraw-window 0.08)
+           (ghostel--last-send-time now)
+           (ghostel--last-output-time now)
+           (ghostel--redraw-timer 'fast-timer)
+           (ghostel--redraw-timer-deadline (time-add now 0.001))
+           cancelled
+           scheduled-delay)
+      (cl-letf (((symbol-function 'cancel-timer)
+                 (lambda (timer) (push timer cancelled)))
+                ((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat _fn &rest _args)
+                   (setq scheduled-delay delay)
+                   'slower-timer)))
+        (ghostel--invalidate)
+        (should-not cancelled)
+        (should-not scheduled-delay)
+        (should (eq ghostel--redraw-timer 'fast-timer))))))
+
+(ert-deftest ghostel-test-typing-redraw-timer-does-not-redraw-copy-mode ()
+  "A typing-boosted timer still respects copy mode's frozen terminal."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--input-mode 'copy)
+          (ghostel--redraw-timer 'ghostel-test-timer)
+          (ghostel--redraw-timer-deadline (time-add (current-time) 0.004))
+          (redraw-called nil))
+      (cl-letf (((symbol-function 'cancel-timer) #'ignore)
+                ((symbol-function 'ghostel--redraw)
+                 (lambda (&rest _args) (setq redraw-called t))))
+        (ghostel--redraw-now (current-buffer))
+        (should-not redraw-called)
+        (should-not ghostel--redraw-timer)
+        (should-not ghostel--redraw-timer-deadline)))))
+
+(ert-deftest ghostel-test-synchronized-output-timeout-schedules-redraw ()
+  "A redraw blocked by DECSET 2026 schedules the timeout fallback."
+  (with-temp-buffer
+    (let* ((now (current-time))
+           (expected-deadline (time-add now 0.25))
+           (ghostel--term 'fake)
+           (ghostel--redraw-timer nil)
+           (ghostel--redraw-timer-deadline nil)
+           (ghostel--synchronized-output-redraw-deadline nil)
+           (ghostel--force-next-redraw nil)
+           (ghostel-synchronized-output-timeout 0.25)
+           scheduled-delay
+           scheduled-timer
+           scheduled-callback
+           scheduled-args
+           rendered)
+      (cl-letf (((symbol-function 'current-time) (lambda () now))
+                ((symbol-function 'ghostel--terminal-live-p) (lambda () t))
+                ((symbol-function 'ghostel--maybe-defer-redraw) (lambda (_buffer) nil))
+                ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                ((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (= mode 2026)))
+                ((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat fn &rest args)
+                   (setq scheduled-delay delay
+                         scheduled-callback fn
+                         scheduled-args args
+                         scheduled-timer (list :timer delay
+                                               :callback fn
+                                               :args args))
+                   scheduled-timer))
+                ((symbol-function 'ghostel--redraw)
+                 (lambda (&rest _args) (setq rendered t))))
+        (ghostel--redraw-now (current-buffer))
+        (should-not rendered)
+        (should (equal scheduled-delay 0.25))
+        (should (eq ghostel--redraw-timer scheduled-timer))
+        (should (equal ghostel--synchronized-output-redraw-deadline
+                       expected-deadline))
+        (should (equal ghostel--redraw-timer-deadline expected-deadline))
+        (should (eq scheduled-callback #'ghostel--redraw-now))
+        (should (equal scheduled-args (list (current-buffer))))))))
+
+(ert-deftest ghostel-test-synchronized-output-timeout-skips-before-deadline ()
+  "A synchronized-output redraw before the deadline is still skipped."
+  (with-temp-buffer
+    (let* ((now (current-time))
+           (deadline (time-add now 0.1))
+           (ghostel--term 'fake)
+           (ghostel--redraw-timer 'expired-redraw-timer)
+           (ghostel--redraw-timer-deadline now)
+           (ghostel--synchronized-output-redraw-deadline deadline)
+           (ghostel--force-next-redraw nil)
+           (ghostel-synchronized-output-timeout 0.25)
+           cancelled
+           scheduled-delay
+           scheduled-timer
+           scheduled-callback
+           scheduled-args
+           rendered)
+      (cl-letf (((symbol-function 'current-time) (lambda () now))
+                ((symbol-function 'cancel-timer) (lambda (timer) (push timer cancelled)))
+                ((symbol-function 'ghostel--terminal-live-p) (lambda () t))
+                ((symbol-function 'ghostel--maybe-defer-redraw) (lambda (_buffer) nil))
+                ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                ((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (= mode 2026)))
+                ((symbol-function 'run-with-timer)
+                 (lambda (delay _repeat fn &rest args)
+                   (setq scheduled-delay delay
+                         scheduled-callback fn
+                         scheduled-args args
+                         scheduled-timer (list :timer delay
+                                               :callback fn
+                                               :args args))
+                   scheduled-timer))
+                ((symbol-function 'ghostel--redraw)
+                 (lambda (&rest _args) (setq rendered t))))
+        (ghostel--redraw-now (current-buffer))
+        (should (equal cancelled '(expired-redraw-timer)))
+        (should-not rendered)
+        (should (< (abs (- scheduled-delay 0.1)) 0.0001))
+        (should (eq ghostel--redraw-timer scheduled-timer))
+        (should (equal ghostel--redraw-timer-deadline deadline))
+        (should (eq scheduled-callback #'ghostel--redraw-now))
+        (should (equal scheduled-args (list (current-buffer))))
+        (should (equal ghostel--synchronized-output-redraw-deadline deadline))))))
+
+(ert-deftest ghostel-test-synchronized-output-timeout-forces-redraw-after-deadline ()
+  "A broken DECSET 2026 session is rendered once the deadline passes."
+  (with-temp-buffer
+    (set-window-buffer (selected-window) (current-buffer))
+    (let* ((deadline (current-time))
+           (now (time-add deadline 0.001))
+           (ghostel--term 'fake)
+           (ghostel--redraw-timer 'expired-redraw-timer)
+           (ghostel--redraw-timer-deadline deadline)
+           (ghostel--synchronized-output-redraw-deadline deadline)
+           (ghostel--force-next-redraw nil)
+           (ghostel-synchronized-output-timeout 0.25)
+           cancelled
+           rendered)
+      (cl-letf (((symbol-function 'current-time) (lambda () now))
+                ((symbol-function 'cancel-timer) (lambda (timer) (push timer cancelled)))
+                ((symbol-function 'ghostel--terminal-live-p) (lambda () t))
+                ((symbol-function 'ghostel--maybe-defer-redraw) (lambda (_buffer) nil))
+                ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                ((symbol-function 'ghostel--mode-enabled)
+                 (lambda (_term mode) (= mode 2026)))
+                ((symbol-function 'ghostel--line-mode-pre-redraw) #'ignore)
+                ((symbol-function 'ghostel--line-mode-post-redraw) #'ignore)
+                ((symbol-function 'ghostel--redraw)
+                 (lambda (_term &optional _full) (setq rendered t)))
+                ((symbol-function 'ghostel--schedule-link-detection) #'ignore)
+                ((symbol-function 'ghostel--detect-password-prompt) #'ignore))
+        (ghostel--redraw-now (current-buffer))
+        (should rendered)
+        (should (equal cancelled '(expired-redraw-timer)))
+        (should-not ghostel--redraw-timer)
+        (should-not ghostel--redraw-timer-deadline)
+        (should-not ghostel--force-next-redraw)
+        (should-not ghostel--synchronized-output-redraw-deadline)))))
+
+(ert-deftest ghostel-test-synchronized-output-timeout-disabled-preserves-skip ()
+  "Nil or zero timeout keeps the old synchronized-output skip behavior."
+  (dolist (timeout '(nil 0))
+    (with-temp-buffer
+      (let ((ghostel--term 'fake)
+            (ghostel--redraw-timer nil)
+            (ghostel--redraw-timer-deadline nil)
+            (ghostel--synchronized-output-redraw-deadline nil)
+            (ghostel--force-next-redraw nil)
+            (ghostel-synchronized-output-timeout timeout)
+            scheduled-delay
+            rendered)
+        (cl-letf (((symbol-function 'ghostel--terminal-live-p) (lambda () t))
+                  ((symbol-function 'ghostel--maybe-defer-redraw) (lambda (_buffer) nil))
+                  ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (_term mode) (= mode 2026)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (delay _repeat fn &rest args)
+                     (setq scheduled-delay delay)
+                     (list :timer delay fn args)))
+                  ((symbol-function 'ghostel--redraw)
+                   (lambda (&rest _args) (setq rendered t))))
+          (ghostel--redraw-now (current-buffer))
+          (should-not rendered)
+          (should-not scheduled-delay)
+          (should-not ghostel--synchronized-output-redraw-deadline))))))
+
+(ert-deftest ghostel-test-synchronized-output-timeout-clears-after-normal-redraw ()
+  "A normal ESU/forced redraw clears stale synchronized-output deadline state."
+  (with-temp-buffer
+    (set-window-buffer (selected-window) (current-buffer))
+    (let ((ghostel--term 'fake)
+          (ghostel--redraw-timer 'stale-redraw-timer)
+          (ghostel--redraw-timer-deadline (current-time))
+          (ghostel--synchronized-output-redraw-deadline (current-time))
+          (ghostel--force-next-redraw nil)
+          cancelled
+          rendered)
+      (cl-letf (((symbol-function 'cancel-timer) (lambda (timer) (push timer cancelled)))
+                ((symbol-function 'ghostel--terminal-live-p) (lambda () t))
+                ((symbol-function 'ghostel--maybe-defer-redraw) (lambda (_buffer) nil))
+                ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                ((symbol-function 'ghostel--mode-enabled) (lambda (&rest _args) nil))
+                ((symbol-function 'ghostel--line-mode-pre-redraw) #'ignore)
+                ((symbol-function 'ghostel--line-mode-post-redraw) #'ignore)
+                ((symbol-function 'ghostel--redraw)
+                 (lambda (_term &optional _full) (setq rendered t)))
+                ((symbol-function 'ghostel--schedule-link-detection) #'ignore)
+                ((symbol-function 'ghostel--detect-password-prompt) #'ignore))
+        (ghostel--redraw-now (current-buffer))
+        (should rendered)
+        (should (equal cancelled '(stale-redraw-timer)))
+        (should-not ghostel--redraw-timer)
+        (should-not ghostel--redraw-timer-deadline)
+        (should-not ghostel--synchronized-output-redraw-deadline)))))
+
+(ert-deftest ghostel-test-synchronized-output-timeout-rejects-invalid-value ()
+  "Invalid synchronized-output timeout values signal instead of falling back."
+  (let ((ghostel-synchronized-output-timeout -1))
+    (should-error (ghostel--synchronized-output-timeout-delay)
+                  :type 'user-error)))
 
 (ert-deftest ghostel-test-input-coalesce-buffers-single-chars ()
   "Single-char sends are buffered when coalescing is enabled."
@@ -453,7 +767,8 @@ side effects have to happen explicitly inside the command."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "hello world")
+          (let ((inhibit-read-only t))
+            (insert "hello world"))
           (goto-char (point-min))
           (set-mark (point))
           (goto-char (point-max))
@@ -869,6 +1184,95 @@ External packages may still call the old internal name."
   "`ghostel-paste-string' signals `user-error' when not in a ghostel buffer."
   (with-temp-buffer
     (should-error (ghostel-paste-string "x") :type 'user-error)))
+
+
+
+(ert-deftest ghostel-test-send-key-dispatches-through-process-transport ()
+  "Immediate key sends should dispatch through the process transport helper."
+  (with-temp-buffer
+    (let* ((ghostel--process 'fake-process)
+           (ghostel--input-buffer nil)
+           (ghostel--input-timer nil)
+           (ghostel--last-send-time nil)
+           (ghostel-input-coalesce-delay 0)
+           (transport-send nil))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--process-send)
+                   (lambda (proc str)
+                     (setq transport-send (cons proc str))))
+                  ((symbol-function 'process-send-string)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct process-send-string: %S"
+                              args)))))
+           (ghostel--send-key "a")
+           (should (equal '(fake-process . "a") transport-send)))))))
+
+(ert-deftest ghostel-test-control-key-bindings-cover-upstream-range ()
+  "Ghostel binds the upstream control-key range plus C-@ passthrough."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'ghostel--send-string)
+               (lambda (key)
+                 (setq sent key))))
+      (dolist (entry '(("C-t" . "\x14")
+                       ("C-v" . "\x16")
+                       ("C-@" . "\x00")))
+        (setq sent nil)
+         (let ((binding (lookup-key ghostel-semi-char-mode-map (kbd (car entry)))))
+           (should binding)
+           (funcall binding)
+           (should (equal (cdr entry) sent)))))))
+
+(ert-deftest ghostel-test-meta-key-bindings-reach-terminal ()
+  "Meta-letter bindings stay routed to the terminal."
+  (dolist (key '("M-a" "M-z"))
+    (should (eq #'ghostel--send-event
+                (lookup-key ghostel-semi-char-mode-map (kbd key))))))
+
+(ert-deftest ghostel-test-window-resize-dispatches-through-process-transport ()
+  "Resize should use a transport helper instead of the PTY primitive directly."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake-term)
+          (ghostel--resize-timer nil)
+          (ghostel--force-next-redraw nil)
+          (resize-call nil)
+          (redraw-called nil)
+          (window 'fake-window)
+          (cur-buf (current-buffer)))
+      (let ((comp-enable-subr-trampolines nil)
+            (native-comp-enable-subr-trampolines nil))
+        (cl-letf (((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(80 . 25)))
+                  ((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'selected-window) (lambda () window))
+                  ((symbol-function 'window-buffer)
+                   (lambda (win)
+                     (when (eq win window)
+                       cur-buf)))
+                  ((symbol-function 'process-buffer) (lambda (_) cur-buf))
+                  ((symbol-function 'buffer-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--conpty-active-p) (lambda () t))
+                  ((symbol-function 'ghostel--set-size) #'ignore)
+                  ((symbol-function 'ghostel--redraw-now)
+                   (lambda (buf)
+                     (setq redraw-called buf)))
+                  ((symbol-function 'ghostel--process-set-window-size)
+                   (lambda (proc height width)
+                     (setq resize-call (list proc height width))))
+                  ((symbol-function 'set-process-window-size)
+                   (lambda (&rest args)
+                     (ert-fail
+                      (format "unexpected direct set-process-window-size: %S"
+                              args)))))
+          (should (equal '(80 . 25)
+                         (ghostel--window-adjust-process-window-size
+                          'fake-process (list window))))
+          (should (equal '(fake-process 25 80) resize-call))
+          (should (eq cur-buf redraw-called)))))))
 
 (provide 'ghostel-keys-test)
 ;;; ghostel-keys-test.el ends here

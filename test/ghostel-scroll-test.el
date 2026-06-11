@@ -593,6 +593,7 @@ rows in the viewport — with or without the trailing newline."
   "Paste scrolls the window to the live cursor."
   (let ((kill-ring '("hello"))
         (kill-ring-yank-pointer nil)
+        (interprogram-paste-function nil)
         sent-text)
     (ghostel-test--with-scroll-on-input-window t
       (cl-letf (((symbol-function 'ghostel--bracketed-paste-p)
@@ -611,6 +612,7 @@ rows in the viewport — with or without the trailing newline."
   (let ((kill-ring '("hello"))
         (kill-ring-yank-pointer nil)
         (ghostel-readonly-fast-exit nil)
+        (interprogram-paste-function nil)
         sent-text)
     (ghostel-test--with-scroll-on-input-window t
 	    (setq ghostel--input-mode 'emacs)

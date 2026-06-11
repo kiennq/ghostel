@@ -35,7 +35,7 @@ endif
 ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon symbols.map) \
                $(wildcard vendor/*.h)
 
-.PHONY: all build test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial clean regen-terminfo
+.PHONY: all build check test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial clean regen-terminfo
 
 # Recommended invocation: `make -j$(nproc) all' on Linux,
 # `make -j$(sysctl -n hw.ncpu) all' on macOS.  GNU make 4+ also accepts
@@ -46,6 +46,9 @@ build: $(MODULE)
 
 $(MODULE): $(ZIG_SOURCES)
 	zig build -Doptimize=ReleaseFast -Dcpu=baseline
+
+check:
+	zig build check
 
 test-zig:
 	zig build test
@@ -120,7 +123,7 @@ lint: byte-compile package-lint checkdoc docquotes
 # Provision both into an isolated `package-user-dir'
 # so `make package-lint' runs standalone.
 $(LINT_DEPS_STAMP): $(CORE_PACKAGE_FILE)
-	$(EMACS) --batch $(EMACSFLAGS) -Q \
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp \
 		--eval "(setq package-user-dir \"$(LINT_ELPA_DIR)\")" \
 		--eval "(package-initialize)" \
 		--eval "(package-refresh-contents)" \
@@ -205,7 +208,8 @@ bench-tui-partial:
 		--eval '(progn (setq ghostel-bench-include-vterm nil ghostel-bench-include-eat nil ghostel-bench-include-term nil) (ghostel-bench--load-backends) (ghostel-bench--run-tui-partial-scenarios))'
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
+	rm -f conpty-module.dll conpty-module.dylib conpty-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache .build
 
