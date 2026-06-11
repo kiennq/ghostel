@@ -1,1 +1,0 @@
-{ global: emacs_module_init; plugin_is_GPL_compatible; local: *; };

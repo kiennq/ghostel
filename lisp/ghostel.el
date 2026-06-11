@@ -122,10 +122,12 @@ Terminal.app and Ghostty), which sources `~/.zprofile' /
   :type '(choice (string :tag "Executable path")
                  (repeat :tag "Executable + arguments" string)))
 
-(defcustom ghostel-term "xterm-ghostty"
-  "Value of the TERM environment variable for ghostel processes.
+(defcustom ghostel-term (if (eq system-type 'windows-nt)
+                            "xterm-256color"
+                          "xterm-ghostty")
+  "Value of the TERM environment variable for Ghostel processes.
 
-The default \"xterm-ghostty\" advertises ghostel's capability set via
+When set to \"xterm-ghostty\", Ghostel advertises its capability set via
 the bundled terminfo entry: synchronized output (DEC 2026), Kitty
 keyboard protocol, true color, colored underlines, focus reporting,
 and more.  Apps that key off these capabilities — Claude Code, modern
@@ -142,10 +144,11 @@ Set to \"xterm-256color\" to fall back to a generic terminal.  When
 `TERM_PROGRAM=ghostty' are not advertised, so nothing claims to be
 Ghostty.  This is also the right setting if outbound `ssh' from a
 ghostel buffer trips up on remote hosts that lack the xterm-ghostty
-terminfo entry."
-  :type '(choice (const :tag "Ghostty (recommended)" "xterm-ghostty")
-                 (const :tag "Generic xterm-256color" "xterm-256color")
-                 (string :tag "Other")))
+terminfo entry.  On Windows, this remains the default unless the
+bundled xterm-ghostty terminfo is available."
+  :type '(choice (const :tag "Ghostty (recommended on Unix)" "xterm-ghostty")
+                  (const :tag "Generic xterm-256color" "xterm-256color")
+                  (string :tag "Other")))
 
 (defcustom ghostel-environment nil
   "Extra environment variables for ghostel shell processes.
@@ -298,6 +301,24 @@ When `ghostel-adaptive-fps' is non-nil, this serves as the base
 delay between frames during sustained output."
   :type 'number)
 
+(defcustom ghostel-synchronized-output-timeout 0.25
+  "Maximum seconds to wait before redrawing inside DECSET 2026.
+When an application enables synchronized output with CSI ? 2026 h
+and does not disable it promptly, Ghostel normally keeps parsing
+output but skips rendering intermediate frames.  This timeout forces
+one redraw after the configured delay so a broken application cannot
+freeze the visible buffer indefinitely.
+
+Set to nil or 0 to disable the fallback."
+  :type '(choice (const :tag "Disabled (nil)" nil)
+                 (const :tag "Disabled (0)" 0)
+                 (number :tag "Seconds"))
+  :set (lambda (sym val)
+         (unless (or (null val)
+                     (and (numberp val) (>= val 0)))
+           (user-error "%s must be nil or a non-negative number" sym))
+         (set-default sym val)))
+
 (defcustom ghostel-inhibit-redraw-functions nil
   "Abnormal hook run before a ghostel buffer redraw.
 Each function is called with the buffer as its sole argument, with
@@ -318,13 +339,45 @@ fixed `ghostel-timer-delay' unconditionally."
 (defcustom ghostel-immediate-redraw-interval 0.05
   "Maximum seconds since last keystroke for immediate redraw.
 Output arriving within this interval of a `ghostel--send-string'
-call is considered interactive echo and redrawn immediately."
+call is considered interactive echo and redrawn immediately
+when the output size is below `ghostel-immediate-redraw-threshold'."
   :type 'number)
+
+(defcustom ghostel-immediate-redraw-threshold 256
+  "Maximum output byte count for immediate redraw after recent input.
+Output larger than this is treated as bulk output and rendered by the
+normal redraw timer.  Set to 0 to disable immediate redraw."
+  :type 'integer)
+
+(defcustom ghostel-typing-redraw-delay 0.004
+  "Delay in seconds before redrawing while recent input is active.
+This only changes timer-scheduled redraws.  PTY output remains the
+source of truth; typed characters are not inserted speculatively."
+  :type 'number
+  :set (lambda (sym val)
+         (unless (and (numberp val) (>= val 0))
+           (user-error "%s must be a non-negative number" sym))
+         (set-default sym val)))
+
+(defcustom ghostel-typing-redraw-window 0.08
+  "Seconds after a key send where redraw timers use typing cadence.
+Set to 0 to disable the typing redraw boost."
+  :type 'number
+  :set (lambda (sym val)
+         (unless (and (numberp val) (>= val 0))
+           (user-error "%s must be a non-negative number" sym))
+         (set-default sym val)))
 
 (defcustom ghostel-full-redraw nil
   "When non-nil, always perform full redraws instead of incremental updates.
 Full redraws are more robust with TUI apps like Claude Code that do
 aggressive partial screen updates, but may use more CPU."
+  :type 'boolean)
+
+(defcustom ghostel-resize-only-when-selected-window nil
+  "When non-nil, only the selected Ghostel window may drive terminal resize.
+When nil, preserve the legacy behavior of forwarding Emacs's incoming
+window set to `window-adjust-process-window-size-function'."
   :type 'boolean)
 
 (defcustom ghostel-buffer-name "*ghostel*"
@@ -367,6 +420,18 @@ Set to nil to disable renaming entirely."
                  (function-item :tag "By directory — *ghostel: DIR*"
                                 ghostel-buffer-name-by-directory)
                  (function :tag "Custom function")))
+
+(defcustom ghostel-cursor-follow t
+  "When non-nil, keep Emacs point following the terminal cursor on redraw.
+When nil, redraw updates terminal content while leaving the current Emacs
+point and window position unchanged."
+  :type 'boolean)
+
+(defcustom ghostel-ignore-cursor-change nil
+  "When non-nil, ignore terminal requests to change cursor shape or visibility.
+Useful when editor-owned cursor behavior should take precedence over
+terminal-driven cursor changes.  Copy mode always forces a visible cursor."
+  :type 'boolean)
 
 (defcustom ghostel-kill-buffer-on-exit t
   "Kill the buffer when the terminal process exits."
@@ -423,7 +488,7 @@ non-nil so the debugger can fire)."
   :type 'hook)
 
 (defcustom ghostel-pre-spawn-hook nil
-  "Hook run just before spawning a new terminal process.
+  "Hook run just before Ghostel starts the shell backend.
 Each function is called with no arguments in the buffer that will
 host the new process.  `process-environment' is dynamically bound
 to the env that will be passed to the child, so hook functions can
@@ -567,10 +632,8 @@ clickable even if the program did not use OSC 8 hyperlink escapes."
 (defcustom ghostel-enable-file-detection t
   "Automatically detect and linkify file:line references in terminal output.
 When non-nil, patterns like /path/to/file.el:42 are made clickable,
-opening the file at the given line in another window.  Automatically
-disabled when `default-directory' is a TRAMP path, because each
-candidate would require a remote `file-exists-p' round-trip per
-redraw."
+opening the file at the given line in another window.  Detection is
+pattern-only: candidate paths are not stat'ed during scanning."
   :type 'boolean)
 
 (defcustom ghostel-plain-link-detection-delay 0.1
@@ -582,7 +645,7 @@ redraw.  Native OSC-8 hyperlinks remain applied during redraw."
   :type 'number)
 
 (defcustom ghostel-file-detection-path-regex
-  "[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
+  "\\(?:[[:alpha:]]:\\)?[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
   "Regex matching the PATH portion of a file:line[:col] reference.
 This is the middle of the full detection pattern; ghostel wraps it
 with a fixed leading path-boundary anchor (line start or any
@@ -590,18 +653,18 @@ non-path character) and a fixed `:LINE[:COL]' tail, so any match
 is guaranteed to end in `:DIGITS'.
 
 The matched path is resolved against `default-directory'; linkification
-only applies when that file exists.  The default matches absolute
+uses the expanded path text in `help-echo'.  The default matches absolute
 paths, explicit `./' paths, tilde-prefixed paths like `~/file.el',
-and bare relative paths containing at least one `/' (e.g. compiler
-output like `src/main.rs').  Paths embedded in punctuation like
-`(/home/user/index.js:17:5)' are supported via the fixed anchor.
+Windows drive paths like `c:/src/file.el', and bare relative paths
+containing at least one `/' (e.g. compiler output like
+`src/main.rs').  Paths
+embedded in punctuation like `(/home/user/index.js:17:5)' are
+supported via the fixed anchor.
 
-Performance: each match triggers a filesystem check on every redraw.
-Broadening this pattern (for example to match bare `file.go' without
-a `/') will cause `file-exists-p' to be called for every matching
-token, which can be expensive on slow or network filesystems (NFS,
-FUSE).  The default uses non-backtracking character classes so the
-per-redraw scan stays cheap."
+Performance: detection is pattern-only, so broadening this pattern
+\(for example to match bare `file.go' without a `/') will increase the
+number of matched tokens that get linkified.  The default uses
+non-backtracking character classes so the scan stays cheap."
   :type 'regexp)
 
 (defconst ghostel--file-detection-leading-anchor
@@ -637,6 +700,15 @@ nil        - do nothing; the user must install the module manually."
                  (const :tag "Download pre-built binary" download)
                  (const :tag "Compile from source" compile)
                  (const :tag "Do nothing" nil)))
+
+(defcustom ghostel-module-dir nil
+  "If non-nil, load and download native modules from this directory.
+
+When nil, Ghostel uses the package directory.  Source builds from
+`ghostel-module-compile' still build in the package directory first,
+then copy the finished modules here."
+  :type '(choice (const :tag "Use package directory" nil)
+                 directory))
 
 (defcustom ghostel-shell-integration t
   "Automatically inject shell integration on startup.
@@ -974,26 +1046,38 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 
 ;; Declare native module functions for the byte compiler
 
-(declare-function ghostel--encode-key "ghostel-module")
-(declare-function ghostel--encode-paste "ghostel-module" (term data))
-(declare-function ghostel--focus-event "ghostel-module")
-(declare-function ghostel--mode-enabled "ghostel-module")
-(declare-function ghostel--alt-screen-p "ghostel-module")
-(declare-function ghostel--copy-all-text "ghostel-module")
-(declare-function ghostel--module-version "ghostel-module")
-(declare-function ghostel--mouse-event "ghostel-module")
-(declare-function ghostel--new "ghostel-module")
-(declare-function ghostel--get-title "ghostel-module" (term))
-(declare-function ghostel--redraw "ghostel-module" (term &optional full))
-(declare-function ghostel--set-bold-config "ghostel-module")
-(declare-function ghostel--set-default-colors "ghostel-module")
-(declare-function ghostel--set-palette "ghostel-module")
-(declare-function ghostel--set-size "ghostel-module" (term rows cols &optional cell-w cell-h))
-(declare-function ghostel--write-vt "ghostel-module")
-(declare-function ghostel--write-pty "ghostel-module")
-(declare-function ghostel--pty-password-input-p "ghostel-module" (term))
-(declare-function ghostel--spawn-native-process "ghostel-module" (term command pipe))
-(declare-function ghostel--kill-native-process "ghostel-module" (term))
+(declare-function ghostel--copy-all-text "dyn-loader-module")
+(declare-function ghostel--alt-screen-p "dyn-loader-module")
+(declare-function ghostel--cursor-pending-wrap-p "dyn-loader-module")
+(declare-function ghostel--cursor-on-empty-row-p "dyn-loader-module")
+(declare-function ghostel--cursor-position "dyn-loader-module")
+(declare-function ghostel--cursor-row-char-offset "dyn-loader-module")
+(declare-function ghostel--encode-key "dyn-loader-module")
+(declare-function ghostel--encode-paste "dyn-loader-module" (term data))
+(declare-function ghostel--focus-event "dyn-loader-module")
+(declare-function ghostel--mode-enabled "dyn-loader-module")
+(declare-function ghostel--module-version "dyn-loader-module")
+(declare-function ghostel--mouse-event "dyn-loader-module")
+(declare-function ghostel--native-uri-at "dyn-loader-module")
+(declare-function ghostel--new "dyn-loader-module")
+(declare-function ghostel--get-title "dyn-loader-module" (term))
+(declare-function ghostel--get-pwd "dyn-loader-module" (term))
+(declare-function ghostel--pty-password-input-p "dyn-loader-module" (term))
+(declare-function ghostel--redraw "dyn-loader-module" (term &optional full))
+(declare-function ghostel--scroll "dyn-loader-module")
+(declare-function ghostel--scroll-bottom "dyn-loader-module")
+(declare-function ghostel--scroll-top "dyn-loader-module")
+(declare-function ghostel--set-bold-config "dyn-loader-module")
+(declare-function ghostel--set-default-colors "dyn-loader-module")
+(declare-function ghostel--set-palette "dyn-loader-module")
+(declare-function ghostel--set-process-pid "dyn-loader-module" (term pid))
+(declare-function ghostel--set-size "dyn-loader-module" (term rows cols &optional cell-w cell-h))
+(declare-function ghostel--kill-native-process "dyn-loader-module" (term))
+(declare-function ghostel--spawn-native-process "dyn-loader-module" (term command pipe))
+(declare-function ghostel--write-pty "dyn-loader-module" (term data))
+(declare-function ghostel--write-vt "dyn-loader-module")
+(declare-function dyn-loader-load-manifest "dyn-loader-module")
+(declare-function dyn-loader-reload "dyn-loader-module")
 
 (declare-function spinner-create "spinner")
 (declare-function spinner-start "spinner")
@@ -1007,6 +1091,106 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
 
+(defun ghostel--package-dir ()
+  "Return the Ghostel resource root directory."
+  (or (ghostel--resource-root)
+      (file-name-directory (or load-file-name
+                               (locate-library "ghostel")
+                               buffer-file-name))))
+
+(defun ghostel--effective-module-dir (&optional dir)
+  "Return the directory Ghostel should use for native module lookup.
+DIR is the fallback when no custom directory is configured."
+  (file-name-as-directory
+   (expand-file-name
+    (or dir ghostel-module-dir ghostel-module-directory (ghostel--package-dir)))))
+
+(defun ghostel--loader-module-file-path (&optional dir)
+  "Return the stable dyn-loader-module path in DIR."
+  (expand-file-name
+   (concat "dyn-loader-module" module-file-suffix)
+   (ghostel--effective-module-dir dir)))
+
+(defun ghostel--target-module-file-path (&optional dir)
+  "Return the stable ghostel target module path in DIR."
+  (expand-file-name
+   (concat "ghostel-module" module-file-suffix)
+   (ghostel--effective-module-dir dir)))
+
+(defconst ghostel--loader-api-version 1
+  "Ghostel API version the loader module is built against.
+Must stay in sync with the native module ABI.")
+
+(defconst ghostel--module-id "ghostel"
+  "Stable module id exported by the Ghostel target module.")
+
+(defconst ghostel--native-runtime-required-functions
+  '(ghostel--new
+    ghostel--write-vt
+    ghostel--set-size
+    ghostel--redraw
+    ghostel--scroll
+    ghostel--scroll-top
+    ghostel--scroll-bottom
+    ghostel--encode-key
+    ghostel--encode-paste
+    ghostel--mouse-event
+    ghostel--focus-event
+    ghostel--set-palette
+    ghostel--set-default-colors
+    ghostel--mode-enabled
+    ghostel--debug-state
+    ghostel--debug-feed
+    ghostel--module-version
+    ghostel--cursor-position
+    ghostel--redraw-full-scrollback
+    ghostel--copy-all-text
+    ghostel--enable-vt-log
+    ghostel--disable-vt-log
+    ghostel--get-title
+    ghostel--get-pwd
+    ghostel--cursor-pending-wrap-p
+    ghostel--alt-screen-p
+    ghostel--cursor-on-empty-row-p
+    ghostel--native-uri-at
+    ghostel--cursor-row-char-offset
+    ghostel--pty-password-input-p
+    ghostel--set-bold-config
+    ghostel--comint-make-state
+    ghostel--comint-filter
+    ghostel--comint-set-palette
+    ghostel--comint-set-default-colors
+    ghostel--write-pty
+    ghostel--spawn-native-process
+    ghostel--kill-native-process
+    ghostel--set-process-pid)
+  "Ghostel dyn-loader exports required for a complete native runtime.")
+
+(defun ghostel--loader-metadata-path (manifest-file &optional dir)
+  "Return the path to MANIFEST-FILE in DIR."
+  (expand-file-name manifest-file
+                    (ghostel--effective-module-dir dir)))
+
+(defun ghostel--native-runtime-specs (&optional dir)
+  "Return loader-managed runtime specs for DIR."
+  (let ((dir (ghostel--effective-module-dir dir)))
+    (list (list :id ghostel--module-id
+                :manifest (ghostel--loader-metadata-path "ghostel-module.json" dir)
+                :file (ghostel--target-module-file-path dir)))))
+
+(defvar ghostel--term)
+(defvar ghostel--process)
+(defvar ghostel--pending-output)
+(defvar ghostel--last-send-time)
+(defvar ghostel--redraw-timer)
+
+(defun ghostel--live-buffers ()
+  "Return `ghostel-mode' buffers whose `ghostel--term' handle is non-nil."
+  (seq-filter
+   (lambda (buf)
+     (with-current-buffer buf
+       (and (derived-mode-p 'ghostel-mode) ghostel--term)))
+   (buffer-list)))
 (defun ghostel--module-platform-tag ()
   "Return platform tag for the current system, e.g. \"x86_64-linux\".
 Returns nil if the platform is not recognized."
@@ -1016,9 +1200,10 @@ Returns nil if the platform is not recognized."
                  ("arm64" "aarch64")
                  (_ raw-arch)))
          (os (cond
-              ((eq system-type 'darwin) "macos")
-              ((eq system-type 'gnu/linux) "linux")
-              (t nil))))
+                ((eq system-type 'darwin) "macos")
+                ((eq system-type 'gnu/linux) "linux")
+                ((eq system-type 'windows-nt) "windows")
+                (t nil))))
     (when os
       (format "%s-%s" arch os))))
 
@@ -1026,7 +1211,7 @@ Returns nil if the platform is not recognized."
   "Return the expected release asset file name for the current platform."
   (let ((tag (ghostel--module-platform-tag)))
     (when tag
-      (format "ghostel-module-%s%s" tag module-file-suffix))))
+      (format "ghostel-module-%s.tar.xz" tag))))
 
 (defun ghostel--module-download-url (&optional version)
   "Return the download URL for the current platform's pre-built module.
@@ -1043,10 +1228,257 @@ When VERSION is nil, use the latest release download URL."
   "Return the release version embedded in URL, or nil.
 GitHub's `/releases/latest/download/<asset>' redirect resolves to
 `/releases/download/v<X.Y.Z>/<asset>'; extract the X.Y.Z segment."
-  (when (and url
-             (string-match "/releases/download/v\\([0-9]+\\.[0-9]+\\.[0-9]+\\)/"
-                           url))
+  (when (and (stringp url)
+              (string-match "/releases/download/v\\([0-9]+\\.[0-9]+\\.[0-9]+\\)/"
+                            url))
     (match-string 1 url)))
+
+(defun ghostel--same-path-p (left right)
+  "Return non-nil when LEFT and RIGHT name the same path."
+  (string-equal (downcase (expand-file-name left))
+                (downcase (expand-file-name right))))
+
+(defun ghostel--loader-metadata-alist (target-module)
+  "Build loader metadata for TARGET-MODULE."
+  `((loader_abi . ,ghostel--loader-api-version)
+    (module_path . ,target-module)))
+
+(defun ghostel--native-runtime-metadata-specs (&optional dir)
+  "Return manifest metadata specs for the native runtime bundle in DIR."
+  (let ((dir (ghostel--effective-module-dir dir)))
+    (list (list :manifest-file "ghostel-module.json"
+                :metadata (ghostel--loader-metadata-alist
+                           (file-name-nondirectory
+                            (ghostel--target-module-file-path dir)))))))
+
+(defun ghostel--loader-load-manifest (manifest-path)
+  "Ask dyn-loader-module to load MANIFEST-PATH."
+  (dyn-loader-load-manifest manifest-path))
+
+(defun ghostel--loader-reload (module-id)
+  "Ask dyn-loader-module to reload MODULE-ID from its stored manifest."
+  (dyn-loader-reload module-id))
+
+(defun ghostel--loader-loaded-modules ()
+  "Return module IDs currently registered with dyn-loader."
+  (and (boundp 'dyn-loader-loaded-modules)
+       (symbol-value 'dyn-loader-loaded-modules)))
+
+(defun ghostel--native-runtime-missing-specs ()
+  "Return native runtime specs missing from dyn-loader's registry."
+  (let ((loaded-modules (ghostel--loader-loaded-modules)))
+    (cl-loop for spec in (ghostel--native-runtime-specs)
+             for module-id = (plist-get spec :id)
+             unless (member module-id loaded-modules)
+             collect spec)))
+
+(defun ghostel--native-runtime-missing-module-ids ()
+  "Return native runtime module IDs missing from dyn-loader's registry."
+  (mapcar (lambda (spec) (plist-get spec :id))
+          (ghostel--native-runtime-missing-specs)))
+
+(defun ghostel--native-runtime-reloadable-p ()
+  "Return non-nil when dyn-loader can reload every native runtime module."
+  (and (featurep 'dyn-loader-module)
+       (fboundp 'dyn-loader-reload)
+       (null (ghostel--native-runtime-missing-module-ids))))
+
+(defun ghostel--recover-native-runtime-registrations ()
+  "Load missing native runtime manifests through dyn-loader."
+  (when (and (featurep 'dyn-loader-module)
+             (fboundp 'dyn-loader-load-manifest))
+    (dolist (spec (ghostel--native-runtime-missing-specs))
+      (ghostel--loader-load-manifest (plist-get spec :manifest)))))
+
+(defun ghostel--native-runtime-reload-error-message ()
+  "Return a diagnostic explaining why the native runtime cannot reload."
+  (cond
+   ((not (featurep 'dyn-loader-module))
+    "Ghostel native runtime is loaded without dyn-loader; restart Emacs to load the downloaded version")
+   ((not (fboundp 'dyn-loader-reload))
+    "Ghostel dyn-loader runtime does not support reload; restart Emacs to load the downloaded version")
+   (t
+    (let ((missing (ghostel--native-runtime-missing-module-ids))
+          (loaded (ghostel--loader-loaded-modules)))
+      (if missing
+          (format "Ghostel native runtime is not registered with dyn-loader for: %s (registered: %s); restart Emacs to load the downloaded version"
+                  (mapconcat #'identity missing ", ")
+                  (if loaded
+                      (mapconcat (lambda (module-id)
+                                   (format "%s" module-id))
+                                 loaded ", ")
+                    "none"))
+        "Ghostel native runtime cannot be reloaded; restart Emacs to load the downloaded version")))))
+
+(defun ghostel--reload-native-runtime (&optional close-live)
+  "Reload every loader-managed native runtime module from disk.
+Terminate live Ghostel terminals first.  CLOSE-LIVE is accepted
+for compatibility with older callers and is otherwise ignored."
+  (ignore close-live)
+  (unless (ghostel--native-runtime-reloadable-p)
+    (ghostel--recover-native-runtime-registrations))
+  (unless (ghostel--native-runtime-reloadable-p)
+    (user-error "%s" (ghostel--native-runtime-reload-error-message)))
+  (let ((live-buffers (ghostel--live-buffers)))
+    (when live-buffers
+      (ghostel--close-live-buffers live-buffers)))
+  ;; Let already-dead terminal finalizers run before dyn-loader swaps DLLs.
+  ;; Old DLLs are retired, not unloaded, so any remaining finalizers stay safe.
+  (garbage-collect)
+  (dolist (spec (ghostel--native-runtime-specs))
+    (ghostel--loader-reload (plist-get spec :id))))
+
+(defun ghostel-reload-module (&optional close-live)
+  "Reload the loader-managed Ghostel runtime bundle from disk.
+
+Live Ghostel terminals are terminated first.  CLOSE-LIVE is
+accepted for compatibility with older callers and is otherwise
+ignored."
+  (interactive "P")
+  (ghostel--reload-native-runtime close-live)
+  (message "ghostel: native runtime reloaded successfully"))
+
+(defun ghostel--write-loader-metadata-atomically (manifest-file dir metadata)
+  "Write loader METADATA for MANIFEST-FILE into DIR atomically."
+  (let* ((dir (ghostel--effective-module-dir dir))
+         (path (ghostel--loader-metadata-path manifest-file dir))
+         (temp (make-temp-file (expand-file-name ".ghostel-module." dir)
+                               nil ".json")))
+    (unwind-protect
+        (progn
+          (with-temp-file temp
+            (set-buffer-multibyte nil)
+            (insert (json-encode metadata)))
+          (rename-file temp path t))
+       (when (file-exists-p temp)
+         (delete-file temp)))))
+
+(defun ghostel--write-native-runtime-manifests (&optional dir)
+  "Write every loader manifest for the native runtime bundle in DIR."
+  (dolist (spec (ghostel--native-runtime-metadata-specs dir))
+    (ghostel--write-loader-metadata-atomically
+     (plist-get spec :manifest-file)
+     dir
+     (plist-get spec :metadata))))
+
+(defun ghostel--read-loader-metadata (&optional dir)
+  "Read and validate loader metadata JSON from DIR."
+  (let ((path (ghostel--loader-metadata-path "ghostel-module.json" dir)))
+    (unless (file-exists-p path)
+      (error "Ghostel loader metadata is missing: %s" path))
+    (with-temp-buffer
+      (insert-file-contents path)
+      (let* ((raw (json-parse-buffer :object-type 'alist
+                                     :array-type 'list
+                                     :null-object nil
+                                     :false-object nil))
+             (metadata (mapcar (lambda (entry)
+                                 (cons (if (symbolp (car entry))
+                                           (car entry)
+                                         (intern (car entry)))
+                                       (cdr entry)))
+                               raw)))
+        (dolist (field '(loader_abi module_path))
+          (unless (alist-get field metadata nil nil)
+            (error "Ghostel loader metadata is missing %s in %s" field path)))
+        metadata))))
+
+(defun ghostel--resolve-target-module-path (metadata &optional dir)
+  "Resolve the target module file from METADATA in DIR."
+  (let* ((module-dir (ghostel--effective-module-dir dir))
+         (target-module (alist-get 'module_path metadata)))
+    (unless (stringp target-module)
+      (error "Ghostel loader metadata has invalid module_path entry"))
+    (let ((target-path (expand-file-name target-module module-dir)))
+      (unless (file-exists-p target-path)
+        (error "Ghostel target module is missing: %s" target-path))
+      target-path)))
+
+(defun ghostel--next-module-backup-path (path)
+  "Return a fresh backup path for PATH that will not clobber older backups."
+  (let ((candidate (concat path ".bak"))
+        (index 1))
+    (while (file-exists-p candidate)
+      (setq candidate (format "%s.%d.bak" path index)
+            index (1+ index)))
+    candidate))
+
+(defun ghostel--replace-module-file (src dest)
+  "Copy SRC to DEST, deleting it first and rotating to a fresh backup on failure."
+  (unless (ghostel--same-path-p src dest)
+    (when (file-exists-p dest)
+      (condition-case nil
+          (delete-file dest)
+        (file-error
+         (rename-file dest (ghostel--next-module-backup-path dest) t))))
+    (copy-file src dest t)))
+
+(defun ghostel--extract-module-archive (archive dest-dir)
+  "Extract Ghostel ARCHIVE into DEST-DIR."
+  (unless (eq 0 (process-file "tar" nil "*ghostel-download*" nil
+                              "xJf" archive "-C" dest-dir))
+    (error "Ghostel archive extraction failed for %s" archive)))
+
+(defun ghostel--publish-downloaded-module-archive (archive dir)
+  "Extract ARCHIVE and publish loader and target modules into DIR."
+  (let ((staging (make-temp-file "ghostel-download-" t)))
+    (unwind-protect
+        (progn
+          (ghostel--extract-module-archive archive staging)
+          (ghostel--publish-built-module-artifacts staging dir))
+      (when (file-directory-p staging)
+        (delete-directory staging t)))))
+
+(defun ghostel--publish-built-module-artifacts (source-dir &optional dest-dir)
+  "Publish loader, target module, and metadata from SOURCE-DIR.
+When DEST-DIR is non-nil, publish the artifacts there."
+  (let* ((source-dir (ghostel--effective-module-dir source-dir))
+         (dest-dir (ghostel--effective-module-dir dest-dir))
+          (loader-src (ghostel--loader-module-file-path source-dir))
+          (loader-dest (ghostel--loader-module-file-path dest-dir))
+          (target-src (ghostel--target-module-file-path source-dir))
+          (target-dest (ghostel--target-module-file-path dest-dir))
+          (sidecar-src (ghostel--module-sidecar-path source-dir))
+          (sidecar-dest (ghostel--module-sidecar-path dest-dir))
+          (target-file (file-name-nondirectory target-dest)))
+    (unless (file-exists-p loader-src)
+      (error "Built Ghostel loader is missing: %s" loader-src))
+    (unless (file-exists-p target-src)
+      (error "Built Ghostel target module is missing: %s" target-src))
+    (unless (file-directory-p dest-dir)
+      (make-directory dest-dir t))
+    (when (file-exists-p sidecar-dest)
+      (delete-file sidecar-dest))
+    (ghostel--replace-module-file loader-src loader-dest)
+    (ghostel--replace-module-file target-src target-dest)
+    (when (file-exists-p sidecar-src)
+      (ghostel--replace-module-file sidecar-src sidecar-dest))
+    (ghostel--write-native-runtime-manifests dest-dir)
+    target-file))
+
+(defun ghostel--ensure-loader-loaded (loader-path)
+  "Load the stable loader module from LOADER-PATH when needed."
+  (unless (featurep 'dyn-loader-module)
+    (module-load loader-path)))
+
+(defun ghostel--bootstrap-native-runtime (&optional dir)
+  "Load every manifest in the native runtime bundle for DIR."
+  (dolist (spec (ghostel--native-runtime-specs dir))
+    (ghostel--loader-load-manifest (plist-get spec :manifest))))
+
+(defun ghostel--bootstrap-module (&optional dir)
+  "Validate metadata in DIR and activate the matching target module."
+  (ghostel--bootstrap-native-runtime dir))
+
+(defun ghostel--close-live-buffers (buffers)
+  "Terminate Ghostel BUFFERS and kill them."
+  (dolist (buf buffers)
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (process-live-p ghostel--process)
+          (delete-process ghostel--process)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 (defun ghostel--download-module (dir &optional version latest-release)
   "Download a pre-built module into DIR.
@@ -1055,15 +1487,15 @@ When LATEST-RELEASE is non-nil, use the latest release asset URL.
 On success, also writes the sidecar version file alongside the module.
 Returns non-nil on success."
   (condition-case err
-      (let* ((requested-version (unless latest-release
+      (let* ((dir (ghostel--effective-module-dir dir))
+             (requested-version (unless latest-release
                                   (or version ghostel--minimum-module-version)))
              (url (ghostel--module-download-url requested-version)))
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
           (make-directory dir t)
-          (let ((dest (expand-file-name
-                       (concat "ghostel-module" module-file-suffix) dir))
+          (let ((dest (expand-file-name (file-name-nondirectory url) dir))
                 (sidecar (ghostel--module-sidecar-path dir)))
             ;; Drop any pre-existing sidecar so that, if the download or the
             ;; subsequent sidecar write fails partway, the loader sees `absent'
@@ -1072,14 +1504,16 @@ Returns non-nil on success."
               (delete-file sidecar))
             (message "ghostel: downloading native module from %s..." url)
             (when-let* ((final-url (ghostel--download-file url dest)))
+              (ghostel--publish-downloaded-module-archive dest dir)
+              (ignore-errors (delete-file dest))
               ;; Resolve the version that was actually fetched.  For an
               ;; explicit version we trust the request; for `latest' we
               ;; parse the URL the server redirected us to.  If parsing
               ;; fails we fall back to the minimum so the sidecar still
               ;; reflects a safe lower bound.
               (let ((resolved (or requested-version
-                                  (ghostel--release-version-from-url final-url)
-                                  ghostel--minimum-module-version)))
+                                   (ghostel--release-version-from-url final-url)
+                                   ghostel--minimum-module-version)))
                 (ghostel--write-module-sidecar-version dir resolved))
               (message "ghostel: native module downloaded successfully")
               t))))
@@ -1093,34 +1527,32 @@ The build runs in `ghostel--resource-root' (which holds build.zig);
 on success the produced module and its sidecar are moved into DEST-DIR."
   (let* ((source-dir (ghostel--resource-root))
          (default-directory source-dir))
-    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (message "ghostel: compiling native module with zig build%s..."
+             (if (or ghostel-module-dir ghostel-module-directory)
+                 (format " (will copy to %s)"
+                         dest-dir)
+               " (this may take a moment)"))
     (condition-case err
         (let ((ret (process-file "zig" nil "*ghostel-build*" nil
-                                 "build" "-Doptimize=ReleaseFast" "-Dcpu=baseline")))
-          (if (not (eq ret 0))
-              (display-warning 'ghostel
-                               "Module compilation failed.  See *ghostel-build* buffer for details.")
-            (let* ((file-name (concat "ghostel-module" module-file-suffix))
-                   (built (expand-file-name file-name source-dir))
-                   (final (expand-file-name file-name dest-dir)))
-              (cond
-               ((not (file-exists-p built))
-                (display-warning 'ghostel
-                                 (format "Build succeeded but module not produced at %s"
-                                         built)))
-               ((equal built final)
-                (message "ghostel: native module compiled successfully"))
-               (t
-                (ghostel--install-module-pair
-                 built final
-                 (expand-file-name "ghostel-module.version" source-dir)
-                 (expand-file-name "ghostel-module.version" dest-dir))
-                (message "ghostel: native module compiled successfully"))))))
+                                 "build" "-Doptimize=ReleaseFast" "-Dcpu=baseline"))
+              (build-output-dir (expand-file-name "zig-out/bin" source-dir)))
+          (if (eq ret 0)
+              (progn
+                (ghostel--publish-built-module-artifacts
+                 build-output-dir
+                 dest-dir)
+                (message "ghostel: native module compiled successfully")
+                t)
+            (display-warning 'ghostel
+                             "Module compilation failed.  See *ghostel-build* buffer for details.")
+            nil))
       (file-missing
        (display-warning 'ghostel
-                        (format "zig executable not found while compiling in %s" source-dir)))
+                         (format "zig executable not found while compiling in %s" source-dir)))
       (error
-       (display-warning 'ghostel (error-message-string err))))))
+       (display-warning 'ghostel
+                         (error-message-string err))
+       nil))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -1222,9 +1654,9 @@ Prefers whichever layout is actually on disk:
 - MELPA-style flat install: `:files' flattens sources into the
   package root, so the resource root equals the Lisp directory.
 Falls back to the Lisp directory itself when neither layout is
-detectable (e.g. a standalone ghostel.el on `load-path' without the
-shipped resources), so callers always get a sensible
-`default-directory' to work in."
+ detectable (e.g. a standalone ghostel.el on `load-path' without the
+ shipped resources), so callers always get a sensible
+ `default-directory' to work in."
   (when-let* ((lisp-dir (ghostel--package-directory)))
     (or (and (file-directory-p (expand-file-name "etc" lisp-dir)) lisp-dir)
         (let ((parent (file-name-as-directory
@@ -1236,9 +1668,38 @@ shipped resources), so callers always get a sensible
   "Return the absolute directory where the native module lives.
 Honours `ghostel-module-directory' when set, otherwise falls back to
 the shipped resource root."
-  (when-let* ((dir (or ghostel-module-directory
-                       (ghostel--resource-root))))
-    (file-name-as-directory (expand-file-name dir))))
+  (ghostel--effective-module-dir))
+
+(defun ghostel--load-module-if-available (&optional dir prompt-user)
+  "Load the native module from DIR when it exists.
+When PROMPT-USER is non-nil, stale modules may trigger installation."
+  (let* ((module-dir (ghostel--effective-module-dir dir))
+         (loader-path (ghostel--loader-module-file-path module-dir))
+         (sidecar-ver (ghostel--read-module-sidecar-version module-dir))
+         (runtime-specs (ghostel--native-runtime-specs module-dir))
+         (runtime-bundle-files
+          (append (mapcar (lambda (spec) (plist-get spec :manifest))
+                          runtime-specs)
+                  (delq nil (mapcar (lambda (spec) (plist-get spec :file))
+                                    runtime-specs)))))
+    (when (and sidecar-ver
+               (version< sidecar-ver ghostel--minimum-module-version))
+      (display-warning
+       'ghostel
+       (format "Module version %s on disk is older than required %s"
+               sidecar-ver ghostel--minimum-module-version))
+      (when prompt-user
+        (ghostel--ensure-module module-dir)
+        (setq sidecar-ver (ghostel--read-module-sidecar-version module-dir))))
+    (when (and (or (not sidecar-ver)
+                   (not (version< sidecar-ver ghostel--minimum-module-version)))
+               (file-exists-p loader-path)
+               (cl-every #'file-exists-p runtime-bundle-files))
+      (ghostel--ensure-loader-loaded loader-path)
+      (ghostel--bootstrap-native-runtime module-dir)
+      (unless prompt-user
+        (ghostel--check-module-version module-dir nil))
+      t)))
 
 (defun ghostel--module-sidecar-path (dir)
   "Return the path of the module version sidecar inside DIR.
@@ -1286,57 +1747,54 @@ user stuck with a fresh module they cannot load."
   (when (file-exists-p built-sidecar)
     (rename-file built-sidecar final-sidecar t)))
 
+;;;###autoload
 (defun ghostel-download-module (&optional prompt-for-version)
   "Interactively download the pre-built native module for this platform.
 With PROMPT-FOR-VERSION, prompt for a release tag to download.
 Leaving the prompt empty downloads the latest release."
   (interactive "P")
-  (let* ((dir (ghostel--module-directory))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir))
+  (let* ((dir (ghostel--effective-module-dir))
+         (mod (ghostel--loader-module-file-path dir))
          (version (when prompt-for-version
-                    (ghostel--read-module-download-version)))
+                     (ghostel--read-module-download-version)))
          (latest-release (and prompt-for-version (null version))))
     (when (and (file-exists-p mod)
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
     (if (ghostel--download-module dir version latest-release)
-        (if (featurep 'ghostel-module)
-            (message "ghostel: module downloaded.  Restart Emacs to load the new version")
-          (module-load mod)
+        (if (ghostel--native-runtime-ready-p)
+            (progn
+              (ghostel--reload-native-runtime)
+              (ghostel--check-module-version dir)
+              (message "ghostel: module loaded successfully"))
+          (ghostel--ensure-loader-loaded mod)
+          (ghostel--bootstrap-native-runtime dir)
+          (ghostel--check-module-version dir)
           (message "ghostel: module loaded successfully"))
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
 (defun ghostel--install-built-module-on-finish (compile-buf source-dir dest-dir)
-  "Move the built module from SOURCE-DIR into DEST-DIR when COMPILE-BUF finishes.
+  "Publish built native runtime artifacts when COMPILE-BUF finishes.
 Registers a one-shot `compilation-finish-functions' handler that
-filters on COMPILE-BUF and removes itself on first match.  Used so the
-interactive `ghostel-module-compile' honours `ghostel-module-directory'.
-The sidecar version file written by `build.zig' is moved alongside the
-module."
-  (let* ((file-name (concat "ghostel-module" module-file-suffix))
-         (sidecar "ghostel-module.version")
-         handler)
+filters on COMPILE-BUF and removes itself on first match.  Runtime
+artifacts are read from SOURCE-DIR and published into DEST-DIR."
+  (let (handler)
     (setq handler
           (lambda (buf status)
             (when (eq buf compile-buf)
               (remove-hook 'compilation-finish-functions handler)
               (when (string-match-p "finished" status)
-                (let ((built (expand-file-name file-name source-dir))
-                      (final (expand-file-name file-name dest-dir))
-                      (built-sidecar (expand-file-name sidecar source-dir))
-                      (final-sidecar (expand-file-name sidecar dest-dir)))
-                  (when (file-exists-p built)
-                    (condition-case err
-                        (progn
-                          (ghostel--install-module-pair
-                           built final built-sidecar final-sidecar)
-                          (message "ghostel: module installed at %s" final))
-                      (error
-                       (display-warning
-                        'ghostel
-                        (format "Build succeeded but installing into %s failed: %s"
-                                dest-dir (error-message-string err)))))))))))
+                (condition-case err
+                    (progn
+                      (ghostel--publish-built-module-artifacts
+                       (expand-file-name "zig-out/bin" source-dir)
+                       dest-dir)
+                      (message "ghostel: module installed at %s" dest-dir))
+                  (error
+                   (display-warning
+                     'ghostel
+                     (format "Build succeeded but publishing native runtime to %s failed: %s"
+                             dest-dir (error-message-string err)))))))))
     (add-hook 'compilation-finish-functions handler)))
 
 (defun ghostel-module-compile ()
@@ -1347,7 +1805,7 @@ produced module is moved into that directory once the build
 finishes."
   (interactive)
   (let* ((source-dir (ghostel--resource-root))
-         (dest-dir (ghostel--module-directory))
+         (dest-dir (ghostel--effective-module-dir))
          (default-directory source-dir)
          (compile-buf (compile "zig build -Doptimize=ReleaseFast -Dcpu=baseline" t)))
     (unless (equal (file-name-as-directory (expand-file-name source-dir))
@@ -1373,6 +1831,69 @@ triggers an interactive prompt."
       (when prompt-user
         (ghostel--ensure-module dir)))))
 
+(defun ghostel--initialize-native-modules (&optional prompt-user)
+  "Load or refresh the native modules for the current Ghostel install.
+When PROMPT-USER is non-nil, failures signal `user-error'."
+  (let* ((dir (ghostel--effective-module-dir))
+         (mod (ghostel--loader-module-file-path dir))
+         (runtime-specs (ghostel--native-runtime-specs dir))
+         (runtime-manifests (mapcar (lambda (spec) (plist-get spec :manifest))
+                                    runtime-specs))
+         (runtime-files (delq nil (mapcar (lambda (spec) (plist-get spec :file))
+                                          runtime-specs)))
+         (runtime-bundle-files (append runtime-manifests runtime-files)))
+    (unless (or (and (file-exists-p mod)
+                     (cl-every #'file-exists-p runtime-bundle-files))
+                (not prompt-user)
+                noninteractive)
+      (ghostel--ensure-module dir))
+    (if (and (file-exists-p mod)
+             (cl-every #'file-exists-p runtime-bundle-files))
+        (condition-case err
+            (if (featurep 'dyn-loader-module)
+                (if (ghostel--live-buffers)
+                    (display-warning
+                     'ghostel
+                     "Ghostel native module is already loaded with live buffers; restart Emacs or reload the native module after closing Ghostel terminals")
+                  (ghostel-reload-module))
+              (ghostel--load-module-if-available dir prompt-user))
+          (error
+           (let ((msg
+                  (if ghostel-module-dir
+                      (format "Failed to load native module: %s\nCheck or replace the module in %s"
+                              (error-message-string err)
+                              dir)
+                    (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
+                            (error-message-string err)))))
+             (if prompt-user
+                 (user-error "%s" msg)
+               (display-warning 'ghostel msg)))))
+      (let* ((missing-bundle-file
+              (cl-find-if (lambda (path)
+                            (not (file-exists-p path)))
+                          runtime-bundle-files))
+             (msg
+              (if ghostel-module-dir
+                  (if (file-exists-p mod)
+                      (if (member missing-bundle-file runtime-manifests)
+                          (concat "Native module metadata not found: " missing-bundle-file
+                                  "\nRun M-x ghostel-download-module or install/copy the module there")
+                        (concat "Native runtime file not found: " missing-bundle-file
+                                "\nRun M-x ghostel-download-module or install/copy the module there"))
+                    (concat "Native module not found: " mod
+                            "\nRun M-x ghostel-download-module or install/copy the module there"))
+                (if (file-exists-p mod)
+                    (if (member missing-bundle-file runtime-manifests)
+                        (concat "Native module metadata not found: " missing-bundle-file
+                                "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")
+                      (concat "Native runtime file not found: " missing-bundle-file
+                              "\nRun M-x ghostel-download-module or M-x ghostel-module-compile"))
+                  (concat "Native module not found: " mod
+                          "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
+        (if prompt-user
+            (user-error "%s" msg)
+          (display-warning 'ghostel msg))))))
+
 (defun ghostel--load-module (&optional prompt-user)
   "Ensure the ghostel native module is loaded.
 When PROMPT-USER is non-nil (called from an interactive command like
@@ -1385,7 +1906,7 @@ existing module file and warns if one is missing or stale.  Module
 installation only happens on an explicit user action: `M-x ghostel',
 `M-x ghostel-download-module', or `M-x ghostel-module-compile'.
 
-Before calling `module-load' the sidecar file
+Before loading the dyn-loader module and runtime manifests, the sidecar file
 `ghostel-module.version' (written by `build.zig' and the downloader)
 is consulted.  When the sidecar reports a version older than
 `ghostel--minimum-module-version' the .so is NOT mapped into this
@@ -1396,79 +1917,169 @@ extra restart.
 The guard also honours `ghostel--new' being already `fboundp', which
 covers the pure-Elisp test path where `cl-letf' stubs the native
 entry points so tests run without the module present."
-  (let* ((dir (ghostel--module-directory))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir))
-         (sidecar-ver (ghostel--read-module-sidecar-version dir)))
-    (unless (or (featurep 'ghostel-module)
-                (fboundp 'ghostel--new))
-      (cond
-       ;; Sidecar tells us the on-disk module is too old.  Refuse to map
-       ;; it so a subsequent install can `module-load' the fresh file in
-       ;; this same Emacs process.
-       ((and sidecar-ver
-             (version< sidecar-ver ghostel--minimum-module-version))
-        (display-warning
-         'ghostel
-         (format "Module version %s on disk is older than required %s"
-                 sidecar-ver ghostel--minimum-module-version))
-        (when prompt-user
-          (ghostel--ensure-module dir)
-          (let ((new-ver (ghostel--read-module-sidecar-version dir)))
-            (when (and (file-exists-p mod)
-                       new-ver
-                       (not (version< new-ver
-                                      ghostel--minimum-module-version)))
-              (condition-case err
-                  (module-load mod)
-                (error
-                 (user-error "Failed to load ghostel native module: %s"
-                             (error-message-string err))))))))
-       ;; Module file missing.
-       ((not (file-exists-p mod))
-        (cond
-         (prompt-user
-          (ghostel--ensure-module dir)
-          (when (file-exists-p mod)
-            (condition-case err
-                (module-load mod)
-              (error
-               (user-error "Failed to load ghostel native module: %s"
-                           (error-message-string err))))))
-         (t
-          (display-warning
-           'ghostel
-           (concat "Native module not found: " mod
-                   "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
-       ;; File exists and the sidecar (when present) is fresh.  Load it.
-       ;; When the sidecar is absent (existing installs predating it),
-       ;; fall back to a live version check post-load.  We skip the live
-       ;; check here when PROMPT-USER is non-nil; the tail below runs it
-       ;; instead, avoiding a double prompt.
-       (t
-        (condition-case err
-            (progn
-              (module-load mod)
-              (unless prompt-user
-                (ghostel--check-module-version dir nil)))
-          (error
-           (if prompt-user
-               (user-error "Failed to load ghostel native module: %s"
-                           (error-message-string err))
-             (display-warning
-              'ghostel
-              (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
-                      (error-message-string err)))))))))
-    ;; Surface the version check at every interactive entry point — not
-    ;; just when this call loaded the module.  Otherwise a stale .so
-    ;; mapped in by an earlier load (e.g. sidecar absent at startup) is
-    ;; silently kept and the user only ever sees the bare warning.
-    (when (and prompt-user (featurep 'ghostel-module))
-      (ghostel--check-module-version dir t))))
+  (let ((dir (ghostel--effective-module-dir))
+        (stubbed-runtime
+         (and (fboundp 'ghostel--new)
+              (not (or (featurep 'ghostel-module)
+                       (featurep 'dyn-loader-module))))))
+    (unless (or (ghostel--native-runtime-ready-p) stubbed-runtime)
+      (ghostel--initialize-native-modules prompt-user))
+    ;; Surface stale live runtimes at interactive entry, including modules
+    ;; loaded earlier when no sidecar existed.
+    (when (and prompt-user
+               (ghostel--native-runtime-ready-p)
+               (not stubbed-runtime))
+      (ghostel--check-module-version dir t))
+    (when (and prompt-user
+               (not (or (ghostel--native-runtime-ready-p) stubbed-runtime)))
+      (user-error "Ghostel native module not available"))))
+
+
+(defun ghostel--native-runtime-ready-p ()
+  "Return non-nil when Ghostel's dyn-loader-managed runtime is ready."
+  (and (cl-every #'fboundp ghostel--native-runtime-required-functions)
+       (ghostel--native-runtime-reloadable-p)))
 
 ;; Load the native module now so the rest of this file (declare-function,
 ;; feature consumers) sees it.  Failure is non-fatal at load time.
 (ghostel--load-module)
+
+(defvar-local ghostel--term-rows nil
+  "Last process-facing terminal height in rows.")
+
+(defvar-local ghostel--term-cols nil
+  "Column count of the native terminal.
+Updated whenever the terminal is created or resized.")
+
+(defconst ghostel--default-stty "-nl sane iutf8 -ixon erase '^?'"
+  "Baseline stty flags applied before exec'ing the spawned program.
+`sane' resets line discipline to known-good defaults — including
+echo, canonical mode, and signal handling - which defends against
+upstreams that leave the PTY in an unexpected state by the time the
+spawned shell starts (TRAMP env stripping, custom remote /etc/bashrc, old
+bash readline init order).  The explicit flags layer on top of `sane':
+- `iutf8': kernel UTF-8 awareness so backspace erases multi-byte
+  characters correctly.  `sane' may clear it on some implementations,
+  so set it explicitly afterwards.
+- `-ixon': disable XON/XOFF flow control so the XON/XOFF characters
+  pass through to the application instead of being swallowed by the
+  PTY line discipline.
+- `erase ^?': Emacs PTYs leave VERASE undefined, but shells like
+  fish check VERASE at startup to decide whether the DEL byte
+  means backspace.")
+
+(defun ghostel--start-process-state ()
+  "Return the shared startup state for Ghostel process backends."
+  ;; `ghostel--init-buffer' seeds these buffer-locals from the window actually
+  ;; displaying this buffer.  Prefer them so popups do not start against the
+  ;; selected window's size when the Ghostel window itself was never selected.
+  (let* ((size (ghostel--terminal-size (or ghostel--term-cols
+                                           (window-max-chars-per-line))
+                                       (or ghostel--term-rows
+                                           (window-body-height))))
+          (width (car size))
+          (height (cdr size))
+          (remote-p (file-remote-p default-directory))
+          (shell-spec (ghostel--resolve-shell-spec))
+          (shell (car shell-spec))
+          (extra-shell-args (cdr shell-spec))
+          (ghostel-dir (or (ghostel--resource-root) default-directory))
+          (detected-shell (ghostel--detect-shell shell))
+          (shell-type (and ghostel-shell-integration
+                           (or (not remote-p)
+                               (and detected-shell
+                                    (or (eq ghostel-tramp-shell-integration t)
+                                        (and (listp ghostel-tramp-shell-integration)
+                                             (memq detected-shell
+                                                   ghostel-tramp-shell-integration)))
+                                    detected-shell))
+                           detected-shell))
+         (remote-integration
+          (when (and remote-p shell-type)
+            (ghostel--setup-remote-integration shell-type)))
+         (integration-env
+          (if remote-integration
+              (plist-get remote-integration :env)
+            (and (not remote-p)
+                 (pcase shell-type
+                   ('bash
+                    (let ((inject-script (expand-file-name
+                                          "etc/shell/bootstrap/bash/inject.bash"
+                                          ghostel-dir))
+                          (env (list "GHOSTEL_BASH_INJECT=1")))
+                      (when (file-readable-p inject-script)
+                        (let ((old-env (getenv "ENV")))
+                          (when old-env
+                            (push (format "GHOSTEL_BASH_ENV=%s" old-env) env)))
+                        (push (format "ENV=%s" inject-script) env)
+                        (unless (getenv "HISTFILE")
+                          (push (format "HISTFILE=%s/.bash_history"
+                                        (expand-file-name "~"))
+                                env)
+                          (push "GHOSTEL_BASH_UNEXPORT_HISTFILE=1" env))
+                        env)))
+                   ('zsh
+                    (let ((zsh-dir (expand-file-name
+                                    "etc/shell/bootstrap/zsh" ghostel-dir)))
+                      (when (file-directory-p zsh-dir)
+                        (let ((env nil)
+                              (old-zdotdir (getenv "ZDOTDIR")))
+                          (when old-zdotdir
+                            (push (format "GHOSTEL_ZSH_ZDOTDIR=%s" old-zdotdir) env))
+                          (push (format "ZDOTDIR=%s" zsh-dir) env)
+                          env))))
+                   ('fish
+                    (let ((integ-dir (expand-file-name
+                                      "etc/shell/bootstrap" ghostel-dir)))
+                      (when (file-directory-p integ-dir)
+                        (let ((xdg (or (getenv "XDG_DATA_DIRS")
+                                       "/usr/local/share:/usr/share")))
+                          (list
+                           (format "XDG_DATA_DIRS=%s:%s" integ-dir xdg)
+                           (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
+                                   integ-dir))))))))))
+         (integration-args (cond
+                            (remote-integration
+                             (plist-get remote-integration :args))
+                            ((and (eq shell-type 'bash) integration-env)
+                             (list "--posix"))
+                            (t nil)))
+         (shell-args (append extra-shell-args integration-args))
+         (stty-flags (if remote-integration
+                         (plist-get remote-integration :stty)
+                       ghostel--default-stty))
+         (spawn-spec (if (and ghostel-macos-login-shell
+                              (not remote-p)
+                              (eq system-type 'darwin))
+                         (ghostel--macos-login-wrap shell shell-args)
+                       (cons shell shell-args)))
+         (spawn-program (if remote-p
+                            (car spawn-spec)
+                          (ghostel--resolve-local-executable (car spawn-spec))))
+         (spawn-args (cdr spawn-spec)))
+    (list :height height
+         :width width
+         :remote-p remote-p
+          :spawn-program spawn-program
+          :spawn-args spawn-args
+          :stty-flags stty-flags
+          :extra-env (append
+                      (unless remote-p
+                        (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
+                      integration-env)
+          :remote-integration remote-integration)))
+
+;;; Transport abstraction
+
+(defun ghostel--process-live-p (&optional process)
+  "Return non-nil when Ghostel's active transport is alive.
+PROCESS defaults to `ghostel--process'."
+  (let ((proc (or process ghostel--process)))
+    (and proc (process-live-p proc))))
+
+(defun ghostel--process-set-window-size (process height width)
+  "Resize PROCESS to HEIGHT and WIDTH through Ghostel's active transport."
+  (set-process-window-size process height width))
 
 
 ;;; Internal variables
@@ -1574,17 +2185,41 @@ local code should not assume it is signalable unless the process is local.")
 (defvar-local ghostel--redraw-timer nil
   "Timer for delayed redraw.")
 
+(defvar-local ghostel--redraw-timer-deadline nil
+  "Absolute time when `ghostel--redraw-timer' is expected to fire.")
+
+(defvar-local ghostel--synchronized-output-redraw-deadline nil
+  "Absolute time when synchronized-output redraw skipping must stop.
+Nil means no DECSET 2026 fallback redraw is pending.")
+
 (defvar-local ghostel--plain-link-detection-timer nil
-  "Timer for delayed redraw-triggered plain-text link detection.")
+  "Timer for deferred redraw-triggered plain-text link detection.")
 
 (defvar-local ghostel--plain-link-detection-begin nil
-  "Queued start bound for redraw-triggered plain-text link detection.")
+  "Queued beginning position for deferred plain-text link detection.")
 
 (defvar-local ghostel--plain-link-detection-end nil
-  "Queued end bound for redraw-triggered plain-text link detection.")
+  "Queued end position for deferred plain-text link detection.")
 
 (defvar-local ghostel--force-next-redraw nil
   "When non-nil, redraw regardless of synchronized output mode.")
+
+(defvar-local ghostel--windows-needing-snap nil
+  "List of windows that must anchor to the viewport on the next redraw.
+Populated when a window starts displaying this buffer after hidden
+output, and cleared after `ghostel--redraw-now' anchors those
+windows to the freshly rendered viewport.")
+
+(defvar-local ghostel--pending-output nil
+  "Accumulated output chunks waiting to be fed to the terminal.
+When non-nil, a list of unibyte strings (in reverse order) that
+will be concatenated and passed to `ghostel--write-vt' at the
+next redraw.  Batching writes reduces per-call overhead in the
+VT parser.")
+(defvar-local ghostel--has-wide-chars nil
+  "Set by the native renderer when wide characters are present.
+Cleared before each redraw; checked afterwards to decide whether
+pixel-based trailing-space compensation is needed.")
 
 (defvar-local ghostel--last-send-time nil
   "Time of the last `ghostel--send-string' call, for immediate-redraw detection.")
@@ -2045,10 +2680,11 @@ of waiting for a continuation keystroke."
           (message "ghostel: unrecognized key %S" event)))))))
 
 (defun ghostel--send-string (string)
-  "Send STRING as raw bytes to the terminal's PTY.
+  "Send STRING as raw bytes to the terminal process.
 Records the send time for immediate-redraw detection."
-  (setq ghostel--last-send-time (current-time))
-  (ghostel--write-pty ghostel--term string))
+  (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+    (setq ghostel--last-send-time (current-time))
+    (ghostel--write-pty ghostel--term string)))
 
 (define-obsolete-function-alias 'ghostel--send-key
   #'ghostel--send-string "0.16.0")
@@ -2323,8 +2959,8 @@ pastes the selected entry into the terminal."
         (setq ghostel--yank-index (1+ ghostel--yank-index))
         (ghostel--on-user-input)
         ;; Erase previous paste: send backspaces
-        (ghostel--write-pty ghostel--term
-                            (make-string prev-len ?\x7f))
+        (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+          (ghostel--send-string (make-string prev-len ?\x7f)))
         ;; Paste the next entry
         (ghostel--paste-text (current-kill ghostel--yank-index t))
         (setq this-command 'ghostel-yank-pop))
@@ -2387,7 +3023,8 @@ pasted using bracketed paste."
     (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)
     ;; Send form-feed to the shell so it redraws its prompt.
-    (ghostel--write-pty ghostel--term "\f")))
+    (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+      (ghostel--send-string "\f"))))
 
 (defun ghostel-clear ()
   "Clear the visible screen, preserving scrollback history."
@@ -2397,7 +3034,8 @@ pasted using bracketed paste."
     (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)
     ;; Send form-feed to the shell so it redraws its prompt.
-    (ghostel--write-pty ghostel--term "\f")))
+    (when (and ghostel--process (ghostel--process-live-p ghostel--process))
+      (ghostel--send-string "\f"))))
 
 (defun ghostel--forward-scroll-event (event button)
   "Try to forward a scroll EVENT as mouse BUTTON to the terminal.
@@ -2428,7 +3066,6 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
   (interactive)
   (end-of-line)
   (skip-chars-backward " \t"))
-
 
 ;;; Mouse input
 
@@ -2697,9 +3334,6 @@ the prompt."
         (ghostel--on-user-input)
         (ghostel--paste-text text)))))
 
-
-;;; Input modes — state helpers
-
 (defvar-local ghostel--saved-cursor-type nil
   "Saved `cursor-type' before entering a read-only mode.")
 
@@ -2808,14 +3442,13 @@ redraw timer — that is the caller's job when freezing."
 (defun ghostel--leave-readonly-state ()
   "Common teardown when leaving a read-only mode.
 Restores the cursor style, deactivates the mark, disables
-`hl-line-mode' again, and clears `buffer-read-only'."
+`hl-line-mode' again, and keeps the renderer-owned buffer read-only."
   (remove-hook 'pre-redisplay-functions #'ghostel--fake-cursor-update t)
   (ghostel--fake-cursor-clear)
   (setq cursor-type ghostel--saved-cursor-type)
   (deactivate-mark)
   (when ghostel--saved-hl-line-mode
-    (hl-line-mode -1))
-  (setq buffer-read-only nil))
+    (hl-line-mode -1)))
 
 (defun ghostel--freeze-terminal ()
   "Cancel the redraw timer so new output stops updating the buffer."
@@ -2903,6 +3536,7 @@ Most keys are sent to the terminal; keys in
       ('line  (ghostel--line-mode-teardown)))
     (setq ghostel--char-mode-override-active nil)
     (setq ghostel--input-mode 'semi-char)
+    (setq buffer-read-only t)
     (use-local-map ghostel-semi-char-mode-map)
     (setq ghostel--mode-line-tag nil)
     (ghostel--mode-line-refresh)
@@ -2929,6 +3563,7 @@ Even keys listed in `ghostel-keymap-exceptions' (\\`C-c', \\`C-x',
       ('emacs (ghostel--leave-readonly-state))
       ('line  (ghostel--line-mode-teardown)))
     (setq ghostel--input-mode 'char)
+    (setq buffer-read-only t)
     ;; Route char mode through `emulation-mode-map-alists' so it
     ;; overrides minor-mode keymaps (without this, a minor mode that
     ;; binds a prefix like \\`C-c' would steal those keys before
@@ -3460,7 +4095,7 @@ ACTIVE-BOUNDS is a (BOL . EOL) cons covering the cursor's line."
            (>= pos (car active-bounds))
            (<= pos (cdr active-bounds)))))
 
-(defun ghostel--detect-urls (&optional begin end)
+(defun ghostel--detect-plain-links (&optional begin end)
   "Scan a buffer region for plain-text URLs and file:line references.
 BEGIN and END default to `point-min' and `point-max' respectively.
 Skips regions that already have a `help-echo' property (e.g. from OSC 8)
@@ -3498,7 +4133,7 @@ when called from the deferred-detection timer outside the redraw scope."
       ;; "/tmp/bar.rs:10", or bare relative paths like "src/main.rs:42:4"
       ;; from compiler output).  The full regex is assembled from fixed anchor
       ;; + user-tunable path + fixed `:LINE[:COL]' tail so group 1 (path) and
-      ;; group 2 (line[:col]) are always present — no nil-guarding needed in
+      ;; group 2 (line[:col]) are always present -- no nil-guarding needed in
       ;; the hot loop.  A small hash memoizes `file-exists-p' so repeated paths
       ;; in a redraw (common in multi-line compiler diagnostics) don't re-stat.
       ;; Skip entirely over TRAMP: every candidate would `expand-file-name' to
@@ -3531,6 +4166,11 @@ when called from the deferred-detection timer outside the redraw scope."
                     (put-text-property beg mend 'mouse-face 'highlight)
                     (put-text-property beg mend 'keymap ghostel-link-map)))))))))))
 
+(defun ghostel--detect-urls (&optional begin end)
+  "Compatibility wrapper for `ghostel--detect-plain-links'.
+BEGIN and END bound the region to scan."
+  (ghostel--detect-plain-links begin end))
+
 (defun ghostel--run-queued-plain-link-detection (buffer)
   "Run any queued redraw-triggered plain-text link detection for BUFFER."
   (when (buffer-live-p buffer)
@@ -3541,7 +4181,7 @@ when called from the deferred-detection timer outside the redraw scope."
               ghostel--plain-link-detection-begin nil
               ghostel--plain-link-detection-end nil)
         (when (and begin end (<= begin end))
-          (ghostel--detect-urls begin end))))))
+          (ghostel--detect-plain-links begin end))))))
 
 (defun ghostel--queue-plain-link-detection (begin end)
   "Coalesce redraw-triggered plain-text link detection for BEGIN..END."
@@ -3561,6 +4201,46 @@ when called from the deferred-detection timer outside the redraw scope."
               (run-with-timer ghostel-plain-link-detection-delay nil
                               #'ghostel--run-queued-plain-link-detection
                               (current-buffer)))))))
+
+(defun ghostel--queue-redraw-post-processing ()
+  "Queue deferred redraw-time post-processing for the current buffer.
+Currently this covers plain-text URL and file:line detection.  Native
+OSC-8 hyperlink spans remain handled inside the renderer."
+  (ghostel--queue-plain-link-detection (point-min) (point-max)))
+(defun ghostel--compensate-wide-chars ()
+  "Shrink trailing spaces on lines where wide-char glyphs cause pixel overflow.
+Emoji glyphs often render wider than `char-width' times `frame-char-width'
+pixels, making the display engine treat the line as wider than the window
+even though `string-width' equals the terminal column count.  For each
+overflowing line we replace the trailing whitespace with a single stretch
+glyph of exactly the remaining pixel width."
+  (let ((win (get-buffer-window)))
+    (when (and win (display-graphic-p))
+      (let ((win-w (window-body-width win t))
+            (inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-min))
+          (while (not (eobp))
+            (let* ((bol (line-beginning-position))
+                   (eol (line-end-position))
+                   (spaces-start (save-excursion
+                                   (goto-char eol)
+                                   (skip-chars-backward " " bol)
+                                   (point)))
+                   (avail (- eol spaces-start)))
+              (when (> avail 0)
+                ;; Strip stale compensation so pixel measurement is accurate.
+                (remove-text-properties spaces-start eol '(display nil))
+                (let* ((content-pw (car (window-text-pixel-size win bol spaces-start)))
+                       (remaining (max 0 (- win-w content-pw)))
+                       (natural-pw (* avail (frame-char-width (window-frame win)))))
+                  ;; Only compensate when we would shrink the trailing spaces;
+                  ;; never widen them as that could introduce truncation on
+                  ;; lines that fit naturally.
+                  (when (< remaining natural-pw)
+                    (put-text-property spaces-start eol 'display
+                                       `(space :width (,remaining)))))))
+            (forward-line 1)))))))
 
 
 ;;; Prompt navigation (OSC 133)
@@ -3904,7 +4584,9 @@ Two arms:
 
 Returns nil on miss, or a symbol naming the arm on hit (`zig' or`regex')."
   (cond
-   ((ghostel--pty-password-input-p ghostel--term) 'zig)
+   ((and (fboundp 'ghostel--pty-password-input-p)
+         (ghostel--pty-password-input-p ghostel--term))
+    'zig)
    ((and (ghostel--remote-shell-p)
          (ghostel--password-regex-matches-cursor-row-p))
     'regex)))
@@ -4093,8 +4775,8 @@ Parses the command and arguments, looks up the command in
         (condition-case err
             (apply (cadr entry) args)
           (error
-           (message "ghostel: error calling %s: %s"
-                    command (error-message-string err))))
+           (message "ghostel: error calling %s: %s" command
+                    (error-message-string err))))
       (message "ghostel: unknown eval command %S (add to `ghostel-eval-cmds' to allow)"
                command))))
 
@@ -4243,6 +4925,10 @@ PROGRESS is an integer 0-100 or nil."
           (error
            (message "ghostel: progress handler error: %s"
                     (error-message-string err))))))))
+(defun ghostel--terminal-size (width height)
+  "Return the process-facing terminal size for WIDTH and HEIGHT."
+  (cons (max 1 width)
+        (max 1 height)))
 
 (defvar-local ghostel--face-cookie nil
   "Cookie from `face-remap-add-relative' for the terminal default face.")
@@ -4256,7 +4942,6 @@ dirty redraw, even when the default colors have not changed.
 generated a hundreds-of-Hz FMLU storm that starved the minibuffer
 of redisplay slots.  Comparing against this cache short-circuits
 the no-op case.")
-
 (defun ghostel--set-buffer-face (fg bg)
   "Set the buffer's default face to FG foreground and BG background.
 This ensures terminal text is visible regardless of the Emacs theme.
@@ -4555,7 +5240,19 @@ materialized buffer."
         ;; reads anchored to this ghostel buffer.
         (save-current-buffer
           (ghostel--write-vt ghostel--term output))
-                (ghostel--invalidate)))))
+        ;; Immediate redraw for interactive echo: small output arriving
+        ;; within `ghostel-immediate-redraw-interval' of last keystroke.
+        (if (and (> ghostel-immediate-redraw-threshold 0)
+                 ghostel--last-send-time
+                 (<= (length output) ghostel-immediate-redraw-threshold)
+                 (< (float-time (time-subtract (current-time)
+                                               ghostel--last-send-time))
+                    ghostel-immediate-redraw-interval))
+            (progn
+              (ghostel--cancel-plain-link-detection)
+              (ghostel--redraw-now (current-buffer)))
+          ;; Bulk output: schedule a later redraw.
+          (ghostel--invalidate))))))
 
 (defun ghostel--events-filter (pipe output)
   "Process native PTY events received from PIPE.
@@ -4604,9 +5301,14 @@ EVENT is the state-change description passed by Emacs."
   (let ((buf (process-buffer process)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
+        ;; Flush any pending output before cleanup.
+        (when ghostel--term
+          (ghostel--flush-pending-output))
         (when ghostel--redraw-timer
-          (cancel-timer ghostel--redraw-timer)
-          (setq ghostel--redraw-timer nil))
+          (cancel-timer ghostel--redraw-timer))
+        (setq ghostel--redraw-timer nil
+              ghostel--redraw-timer-deadline nil
+              ghostel--synchronized-output-redraw-deadline nil)
         (when ghostel--plain-link-detection-timer
           (cancel-timer ghostel--plain-link-detection-timer)
           (setq ghostel--plain-link-detection-timer nil
@@ -4709,6 +5411,11 @@ directory component is expanded relative to `default-directory'."
       (error "Searching for program: No such file or directory, %s" program))
     resolved))
 
+(defun ghostel--posix-shell-quote-argument (argument)
+  "Quote ARGUMENT for a POSIX shell command, independent of host OS."
+  (let ((system-type 'gnu/linux))
+    (shell-quote-argument argument)))
+
 (defun ghostel--macos-login-wrap (program args)
   "Wrap PROGRAM/ARGS via `/usr/bin/login' to produce a macOS login shell.
 Returns (LOGIN-PROGRAM . LOGIN-ARGS).  Mirrors Ghostty's wrap:
@@ -4722,7 +5429,7 @@ of the final shell, which is what makes it a login shell.
 PROGRAM and ARGS are shell-quoted into the `-c' command."
   (let* ((user (user-login-name))
          (hush (file-exists-p (expand-file-name "~/.hushlogin")))
-         (quoted (mapconcat #'shell-quote-argument
+         (quoted (mapconcat #'ghostel--posix-shell-quote-argument
                             (cons program args) " "))
          (cmd (concat "exec -l " quoted))
          ;; Quote from Ghostty source:
@@ -5053,31 +5760,33 @@ verbatim.  `COLORTERM=truecolor' is exported unconditionally."
     (concat "TERM=" (shell-quote-argument ghostel-term)
             "; COLORTERM=truecolor; export TERM COLORTERM; "))))
 
-(defun ghostel--spawn-pty (program program-args extra-env &optional remote-p)
-  "Spawn PROGRAM with PROGRAM-ARGS as a PTY-backed process in the current buffer.
+(defun ghostel--spawn-pty (program program-args height width stty-flags
+                                  extra-env &optional remote-p)
+ "Spawn PROGRAM with PROGRAM-ARGS as a PTY-backed process in the current buffer.
 
 The native local path execs PROGRAM directly and configures the PTY
 in C (see `ghostel--spawn-via-native').  The Emacs path wraps PROGRAM
-in `/bin/sh -c' so `stty' can configure the PTY before PROGRAM reads
-its terminal attributes (see `ghostel--spawn-via-emacs').  EXTRA-ENV
-is prepended to `process-environment'.  Non-nil REMOTE-P spawns the
-process via the TRAMP file handler (for remote shells).
+in `/bin/sh -c' so STTY-FLAGS can configure the PTY with rows=HEIGHT
+columns=WIDTH before PROGRAM reads its terminal attributes (see
+`ghostel--spawn-via-emacs').  EXTRA-ENV is prepended to
+`process-environment'.  Non-nil REMOTE-P spawns the process via the
+TRAMP file handler (for remote shells).
 
 Returns the lifecycle process object for the PTY path: the shell
 process for Emacs-owned PTYs, or the event pipe process that stands in
 for the native child process."
-  (let* ((process-environment
-          (append
-           ghostel-environment
-           (cons "INSIDE_EMACS=ghostel"
-                 ;; The remote wrapper sets TERM/TERMINFO/COLORTERM/
-                 ;; TERM_PROGRAM* itself; keeping the local entries
-                 ;; here would also push the local TERMINFO path,
-                 ;; which is meaningless on the remote and (per
-                 ;; terminfo(5)) makes ncurses ignore system entries.
-                 (if remote-p '() (ghostel--terminal-env)))
-           extra-env
-           process-environment))
+ (let* ((process-environment
+         (append
+          ghostel-environment
+          (cons "INSIDE_EMACS=ghostel"
+                ;; The remote wrapper sets TERM/TERMINFO/COLORTERM/
+                ;; TERM_PROGRAM* itself; keeping the local entries
+                ;; here would also push the local TERMINFO path,
+                ;; which is meaningless on the remote and (per
+                ;; terminfo(5)) makes ncurses ignore system entries.
+                (if remote-p '() (ghostel--terminal-env)))
+          extra-env
+          process-environment))
          ;; Large TUI redraws (Claude Code, pi on resize) can emit
          ;; hundreds of KB in one write.  Before Emacs 31,
          ;; `process-adaptive-read-buffering' defaults to t and
@@ -5093,40 +5802,49 @@ for the native child process."
     ;; `setenv' to inject/override entries that the child inherits.
     ;; See `ghostel-pre-spawn-hook'.
     (run-hooks 'ghostel-pre-spawn-hook)
-    (ghostel--spawn-process program program-args remote-p)))
+    (ghostel--spawn-process program program-args height width stty-flags remote-p)))
 
-(defun ghostel--spawn-process (program program-args remote-p)
-  "Dispatch the spawn of PROGRAM (with PROGRAM-ARGS) to native or Emacs.
+(defun ghostel--spawn-process (program program-args height width stty-flags remote-p)
+  "Dispatch the spawn of PROGRAM with PROGRAM-ARGS to native or Emacs.
 Local PROGRAM is resolved to an absolute path before backend dispatch.
-Local buffers use the native PTY path when `ghostel-use-native-pty'
-is non-nil; remote (REMOTE-P) buffers always go through Emacs so
-TRAMP can manage the remote shell."
+HEIGHT, WIDTH, and STTY-FLAGS are used by the Emacs PTY wrapper.  Local
+buffers use the native PTY path when `ghostel-use-native-pty' is non-nil;
+remote (REMOTE-P) buffers always go through Emacs so TRAMP can manage
+the remote shell."
   (let ((program (if remote-p
                      program
                    (ghostel--resolve-local-executable program))))
     (setq ghostel--process
-          (if (and ghostel-use-native-pty (not remote-p))
-              (ghostel--spawn-via-native (cons program program-args))
-            (ghostel--spawn-via-emacs program program-args remote-p)))))
+          (cond
+           ((and (eq system-type 'windows-nt) remote-p)
+            (error "Ghostel native PTY does not support Windows TRAMP sessions"))
+           ((or (eq system-type 'windows-nt)
+                (and ghostel-use-native-pty (not remote-p)))
+            (ghostel--spawn-via-native (cons program program-args)))
+           (t
+            (ghostel--spawn-via-emacs program program-args
+                                      height width stty-flags remote-p))))))
 
-(defun ghostel--spawn-via-emacs (program program-args &optional remote-p)
+(defun ghostel--spawn-via-emacs (program program-args height width stty-flags
+                                         &optional remote-p)
   "Spawn PROGRAM with PROGRAM-ARGS through Emacs process machinery.
-PROGRAM is wrapped in `/bin/sh -c' so that `stty' (with
-`ghostel--default-stty') can configure the PTY line discipline before
-PROGRAM reads its terminal attributes; the screen is then cleared to
-hide the stty output and `exec' replaces the wrapper so only PROGRAM
-remains.  See `ghostel--default-stty' for the default flag set and
-rationale.  REMOTE-P is passed as `:file-handler' so TRAMP can run
-remote commands, and selects an on-remote TERM probe preamble.  The
-returned process owns the PTY and receives `ghostel--filter' and
+PROGRAM is wrapped in `/bin/sh -c' so that `stty' (with STTY-FLAGS,
+rows=HEIGHT, and columns=WIDTH) can configure the PTY line discipline
+before PROGRAM reads its terminal attributes; the screen is then cleared
+to hide the stty output and `exec' replaces the wrapper so only PROGRAM
+remains.  REMOTE-P is passed as `:file-handler' so TRAMP can run remote
+commands, and selects an on-remote TERM probe preamble.  The returned
+process owns the PTY and receives `ghostel--filter' and
 `ghostel--sentinel'."
   (let* ((shell-command
           (list "/bin/sh" "-c"
                 (concat
                  ;; Remote spawns: pick TERM via an on-remote probe
                  (and remote-p (ghostel--remote-term-preamble))
-                 "stty " ghostel--default-stty " 2>/dev/null; "
-                 "printf '\033[H\033[2J'; exec "
+                 "stty " stty-flags
+                 (format " rows %d columns %d" height width)
+                 " 2>/dev/null; "
+                 "printf '\\033[H\\033[2J'; exec "
                  (shell-quote-argument program)
                  (and program-args
                       (concat " "
@@ -5139,15 +5857,25 @@ returned process owns the PTY and receives `ghostel--filter' and
                 :connection-type 'pty
                 :file-handler remote-p
                 :filter #'ghostel--filter
-                :sentinel #'ghostel--sentinel
-                :noquery t)))
+                :sentinel #'ghostel--sentinel)))
     (setq ghostel--pid (process-id proc))
+    (when (and (not remote-p)
+               ghostel--term
+               (integerp ghostel--pid))
+      (ghostel--set-process-pid ghostel--term ghostel--pid))
     ;; Raw binary I/O — no encoding/decoding by Emacs
     (set-process-coding-system proc 'binary 'binary)
     ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
     ;; the program's line editor (readline/ZLE) can render properly.
-    (set-process-window-size proc ghostel--term-rows ghostel--term-cols)
-    (process-put proc 'adjust-window-size-function nil)
+    (set-process-window-size proc height width)
+    ;; For `auto', start nil — we spawn at a fresh prompt.  The
+    ;; OSC 133 C/D handlers flip the flag while a command runs.
+    (set-process-query-on-exit-flag
+     proc (if (eq ghostel-query-before-killing 'auto)
+              nil
+            ghostel-query-before-killing))
+    (process-put proc 'adjust-window-size-function
+                 #'ghostel--window-adjust-process-window-size)
     proc))
 
 (defun ghostel--spawn-via-native (command)
@@ -5183,99 +5911,25 @@ writes a final exit status before closing it."
     pipe))
 
 (defun ghostel--start-process ()
-  "Start the configured shell with a PTY.
-Local buffers use the native PTY path when `ghostel-use-native-pty'
-is non-nil.  Remote TRAMP buffers spawn through Emacs so TRAMP can
-run the shell on the remote host."
-  (let* ((remote-p (file-remote-p default-directory))
-         (shell-spec (ghostel--resolve-shell-spec))
-         (shell (car shell-spec))
-         (extra-shell-args (cdr shell-spec))
-         (ghostel-dir (ghostel--resource-root))
-         ;; Detect shell type when integration is enabled.
-         ;; For remote, also check ghostel-tramp-shell-integration.
-         (shell-type (and ghostel-shell-integration
-                          (or (not remote-p)
-                              (let ((st (ghostel--detect-shell shell)))
-                                (and st
-                                     (or (eq ghostel-tramp-shell-integration t)
-                                         (and (listp ghostel-tramp-shell-integration)
-                                              (memq st ghostel-tramp-shell-integration)))
-                                     st)))
-                          (ghostel--detect-shell shell)))
-         ;; For remote sessions, set up integration via temp files.
-         (remote-integration
-          (when (and remote-p shell-type)
-            (ghostel--setup-remote-integration shell-type)))
-         (integration-env
-          (if remote-integration
-              (plist-get remote-integration :env)
-            (and (not remote-p)
-                 (pcase shell-type
-                   ('bash
-                    (let ((inject-script (expand-file-name
-                                          "etc/shell/bootstrap/bash/inject.bash"
-                                          ghostel-dir))
-                          (env (list "GHOSTEL_BASH_INJECT=1")))
-                      (when (file-readable-p inject-script)
-                        (let ((old-env (getenv "ENV")))
-                          (when old-env
-                            (push (format "GHOSTEL_BASH_ENV=%s" old-env) env)))
-                        (push (format "ENV=%s" inject-script) env)
-                        (unless (getenv "HISTFILE")
-                          (push (format "HISTFILE=%s/.bash_history"
-                                        (expand-file-name "~"))
-                                env)
-                          (push "GHOSTEL_BASH_UNEXPORT_HISTFILE=1" env))
-                        env)))
-                   ('zsh
-                    (let ((zsh-dir (expand-file-name
-                                    "etc/shell/bootstrap/zsh" ghostel-dir)))
-                      (when (file-directory-p zsh-dir)
-                        (let ((env nil)
-                              (old-zdotdir (getenv "ZDOTDIR")))
-                          (when old-zdotdir
-                            (push (format "GHOSTEL_ZSH_ZDOTDIR=%s" old-zdotdir) env))
-                          (push (format "ZDOTDIR=%s" zsh-dir) env)
-                          env))))
-                   ('fish
-                    (let ((integ-dir (expand-file-name
-                                      "etc/shell/bootstrap" ghostel-dir)))
-                      (when (file-directory-p integ-dir)
-                        (let ((xdg (or (getenv "XDG_DATA_DIRS")
-                                       "/usr/local/share:/usr/share")))
-                          (list
-                           (format "XDG_DATA_DIRS=%s:%s" integ-dir xdg)
-                           (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
-                                   integ-dir))))))))))
-         (integration-args (cond
-                            (remote-integration
-                             (plist-get remote-integration :args))
-                            ((and (eq shell-type 'bash) integration-env)
-                             (list "--posix"))
-                            (t nil)))
-         (shell-args (append extra-shell-args integration-args))
-         (extra-env (append
-                     (unless remote-p
-                       (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
-                     integration-env))
-         ;; On macOS, wrap with `/usr/bin/login' so the shell starts as a login shell.
-         ;; See `ghostel-macos-login-shell' for the rationale.
-         ;; Skipped for remote spawns - login(1) is a local-session concept.
-         (spawn-spec (if (and ghostel-macos-login-shell
-                              (not remote-p)
-                              (eq system-type 'darwin))
-                         (ghostel--macos-login-wrap shell shell-args)
-                       (cons shell shell-args)))
-         (spawn-program (car spawn-spec))
-         (spawn-args (cdr spawn-spec))
-         (proc (ghostel--spawn-pty spawn-program spawn-args
-                                   extra-env remote-p)))
-    (when remote-integration
-      (ghostel--cleanup-temp-paths
-       (plist-get remote-integration :temp-files)
-       (plist-get remote-integration :temp-dirs)))
-    proc))
+  "Start the shell process with a PTY.
+When `default-directory' is a remote TRAMP path, spawn the shell
+on the remote host."
+  (let* ((state (ghostel--start-process-state))
+         (height (plist-get state :height))
+         (width (plist-get state :width))
+         (remote-p (plist-get state :remote-p))
+         (remote-integration (plist-get state :remote-integration)))
+    (unwind-protect
+        (ghostel--spawn-pty (plist-get state :spawn-program)
+                              (plist-get state :spawn-args)
+                              height width
+                              (plist-get state :stty-flags)
+                              (plist-get state :extra-env)
+                              remote-p)
+      (when remote-integration
+        (ghostel--cleanup-temp-paths
+         (plist-get remote-integration :temp-files)
+         (plist-get remote-integration :temp-dirs))))))
 
 
 ;;; Rendering
@@ -5293,37 +5947,109 @@ terminal windows."
                     wins)
         (car wins))))
 
-(defun ghostel--invalidate ()
-  "Trigger a redraw for pending terminal output.
-Output arriving within `ghostel-immediate-redraw-interval' of the last
-keystroke is interactive echo and redrawn immediately to minimize
-typing latency.  Otherwise the redraw is deferred to a coalescing
-timer; with `ghostel-adaptive-fps' that timer uses a shorter delay for
-the first frame after idle for snappier response."
-  ;; Interactive echo: output arriving within
-  ;; `ghostel-immediate-redraw-interval' of the last keystroke.
-  (if (and ghostel--last-send-time
-           (< (float-time (time-subtract (current-time)
-                                         ghostel--last-send-time))
-              ghostel-immediate-redraw-interval))
-      (ghostel--redraw-now (current-buffer))
-    ;; Bulk output: schedule a later redraw.
+(defun ghostel--typing-redraw-active-p ()
+  "Return non-nil when redraw timers should use the typing cadence."
+  (and ghostel-adaptive-fps
+       ghostel--last-send-time
+       (> ghostel-typing-redraw-window 0)
+       (< (float-time (time-subtract (current-time)
+                                     ghostel--last-send-time))
+          ghostel-typing-redraw-window)))
+
+(defun ghostel--redraw-delay ()
+  "Return the delay to use for the next scheduled redraw."
+  (if ghostel-adaptive-fps
+      (cond
+       ((ghostel--typing-redraw-active-p)
+        (min ghostel-typing-redraw-delay ghostel-timer-delay))
+       (ghostel--last-output-time
+        (let ((idle-secs (float-time
+                          (time-subtract (current-time)
+                                         ghostel--last-output-time))))
+          ;; If idle for more than 100ms, use a short delay for snappy
+          ;; first-frame response.
+          (if (> idle-secs 0.1)
+              (min 0.016 ghostel-timer-delay)
+            ghostel-timer-delay)))
+       (t ghostel-timer-delay))
+    ghostel-timer-delay))
+
+(defun ghostel--schedule-redraw (delay buffer &optional reschedule-earlier)
+  "Schedule BUFFER to redraw after DELAY seconds.
+When RESCHEDULE-EARLIER is non-nil, replace an existing redraw timer
+only if the new deadline is earlier than the current one."
+  (let ((deadline (time-add (current-time) delay)))
+    (when (and reschedule-earlier
+               ghostel--redraw-timer
+               (or (null ghostel--redraw-timer-deadline)
+                   (time-less-p deadline ghostel--redraw-timer-deadline)))
+      (cancel-timer ghostel--redraw-timer)
+      (setq ghostel--redraw-timer nil
+            ghostel--redraw-timer-deadline nil))
     (unless ghostel--redraw-timer
-      (let ((delay (if (and ghostel-adaptive-fps ghostel--last-output-time)
-                       (let ((idle-secs (float-time
-                                         (time-subtract (current-time)
-                                                        ghostel--last-output-time))))
-                         ;; If idle for more than 100ms, use a short delay
-                         ;; for snappy first-frame response.
-                         (if (> idle-secs 0.1)
-                             (min 0.016 ghostel-timer-delay)
-                           ghostel-timer-delay))
-                     ghostel-timer-delay)))
-        (setq ghostel--last-output-time (current-time))
-        (setq ghostel--redraw-timer
-              (run-with-timer delay nil
-                              #'ghostel--redraw-now
-                              (current-buffer)))))))
+      (setq ghostel--redraw-timer-deadline deadline)
+      (setq ghostel--redraw-timer
+            (run-with-timer delay nil #'ghostel--redraw-now buffer)))))
+
+(defun ghostel--synchronized-output-timeout-delay ()
+  "Return the DECSET 2026 fallback timeout, or nil when disabled."
+  (cond
+   ((null ghostel-synchronized-output-timeout)
+    nil)
+   ((and (numberp ghostel-synchronized-output-timeout)
+         (>= ghostel-synchronized-output-timeout 0))
+    (and (> ghostel-synchronized-output-timeout 0)
+         ghostel-synchronized-output-timeout))
+   (t
+    (user-error
+     "Ghostel synchronized output timeout must be nil or a non-negative number"))))
+
+(defun ghostel--synchronized-output-redraw-delay (deadline now)
+  "Return seconds from NOW until DEADLINE, never less than zero."
+  (max 0 (float-time (time-subtract deadline now))))
+
+(defun ghostel--defer-synchronized-output-redraw-p (buffer)
+  "Return non-nil when BUFFER redraw should wait for DECSET 2026.
+When the synchronized-output timeout expires, set
+`ghostel--force-next-redraw' and return nil so the caller renders the
+current terminal state."
+  (and (not ghostel--force-next-redraw)
+       (ghostel--mode-enabled ghostel--term 2026)
+       (let ((timeout (ghostel--synchronized-output-timeout-delay))
+             (now (current-time)))
+         (cond
+          ((not timeout)
+           t)
+          ((null ghostel--synchronized-output-redraw-deadline)
+           (setq ghostel--synchronized-output-redraw-deadline
+                 (time-add now timeout))
+           (ghostel--schedule-redraw timeout buffer t)
+           t)
+          ((time-less-p now ghostel--synchronized-output-redraw-deadline)
+           (ghostel--schedule-redraw
+            (ghostel--synchronized-output-redraw-delay
+             ghostel--synchronized-output-redraw-deadline now)
+            buffer t)
+           t)
+          (t
+           (setq ghostel--force-next-redraw t)
+           nil)))))
+
+(defun ghostel--invalidate ()
+  "Schedule a redraw after a short delay.
+With `ghostel-adaptive-fps', use a shorter delay for recent typing
+and for the first frame after idle."
+  (let ((delay (ghostel--redraw-delay)))
+    (setq ghostel--last-output-time (current-time))
+    (ghostel--schedule-redraw delay (current-buffer) t)))
+
+(defun ghostel--cancel-plain-link-detection ()
+  "Cancel any queued redraw-triggered plain-text link detection."
+  (when ghostel--plain-link-detection-timer
+    (cancel-timer ghostel--plain-link-detection-timer))
+  (setq ghostel--plain-link-detection-timer nil
+        ghostel--plain-link-detection-begin nil
+        ghostel--plain-link-detection-end nil))
 
 (defun ghostel--query-font-cached (font)
   "Return `query-font' metrics for FONT, caching during native redraw.
@@ -5332,6 +6058,19 @@ When `ghostel--query-font-cache' is nil, call `query-font' directly."
       (or (gethash font ghostel--query-font-cache)
           (puthash font (query-font font) ghostel--query-font-cache))
     (query-font font)))
+
+(defun ghostel--flush-pending-output ()
+  "Feed any accumulated output to the terminal in a single batch."
+  (when ghostel--pending-output
+    (let ((combined (apply #'concat (nreverse ghostel--pending-output))))
+      (setq ghostel--pending-output nil)
+      ;; An OSC 52;e callback dispatched synchronously from the native
+      ;; parser (e.g. `find-file-other-window') can change the current
+      ;; buffer via `select-window'.  Isolate that so callers keep
+      ;; reading buffer-locals -- notably `ghostel--term' -- from the
+      ;; ghostel buffer after this returns.
+      (save-current-buffer
+        (ghostel--write-vt ghostel--term combined)))))
 
 (defun ghostel--viewport-start ()
   "Position of the first line of the terminal viewport, or nil if rows<=0."
@@ -5426,19 +6165,20 @@ Emacs mode keeps its position.  Semi-char/char/line always anchor."
                         (ghostel--terminal-live-p))))))
     (with-selected-window window
       (with-current-buffer buffer
-        (let ((target (point-max)))
-          (if-let* ((anchor (and (display-graphic-p (window-frame window))
-                                 ghostel--pixel-anchor-supported-p
-                                 (ghostel--pixel-anchor window target))))
-              (progn
-                (set-window-start window (car anchor))
-                (ghostel--set-window-vscroll window (cdr anchor) t t))
-            (let ((lines (window-screen-lines)))
-              (goto-char target)
-              (forward-line (- (floor lines)))
-              (set-window-start window (point))
-              (ghostel--set-window-vscroll window 0 t t)))
-          (set-window-point window (or ghostel--cursor-char-pos target)))))))
+        (when (ghostel--terminal-live-p)
+          (let ((target (point-max)))
+            (if-let* ((anchor (and (display-graphic-p (window-frame window))
+                                   ghostel--pixel-anchor-supported-p
+                                   (ghostel--pixel-anchor window target))))
+                (progn
+                  (set-window-start window (car anchor))
+                  (ghostel--set-window-vscroll window (cdr anchor) t t))
+              (let ((lines (window-screen-lines)))
+                (goto-char target)
+                (forward-line (- (floor lines)))
+                (set-window-start window (point))
+                (ghostel--set-window-vscroll window 0 t t)))
+            (set-window-point window (or ghostel--cursor-char-pos target))))))))
 
 (defun ghostel--maybe-defer-redraw (buffer)
   "Defer BUFFER's redraw if a `ghostel-inhibit-redraw-functions' hook asks.
@@ -5447,9 +6187,7 @@ for BUFFER; return nil to let the redraw proceed."
   (when (with-demoted-errors "ghostel-inhibit-redraw-functions error: %S"
           (run-hook-with-args-until-success
            'ghostel-inhibit-redraw-functions buffer))
-    (setq ghostel--redraw-timer
-          (run-with-timer ghostel-timer-delay nil
-                          #'ghostel--redraw-now buffer))
+    (ghostel--schedule-redraw ghostel-timer-delay buffer)
     t))
 
 (defun ghostel--redraw-now (buffer)
@@ -5461,13 +6199,16 @@ live viewport."
     (with-current-buffer buffer
       (when ghostel--redraw-timer
         (cancel-timer ghostel--redraw-timer)
-        (setq ghostel--redraw-timer nil))
+        (setq ghostel--redraw-timer nil
+              ghostel--redraw-timer-deadline nil))
       (when (and ghostel--term
                  (ghostel--terminal-live-p)
                  (not (ghostel--maybe-defer-redraw buffer)))
-        ;; Skip during synchronized output unless forced by scroll/resize.
-        (unless (and (not ghostel--force-next-redraw)
-                     (ghostel--mode-enabled ghostel--term 2026))
+        (ghostel--flush-pending-output)
+        ;; Skip during synchronized output unless forced by scroll/resize
+        ;; or the synchronized-output timeout fallback has expired.
+        (unless (ghostel--defer-synchronized-output-redraw-p buffer)
+          (setq ghostel--synchronized-output-redraw-deadline nil)
           ;; Pause line mode if alt-screen just turned on — must run
           ;; before the line-snapshot block so that snapshot sees the
           ;; post-pause input mode and skips its own capture.
@@ -5475,8 +6216,11 @@ live viewport."
           (setq ghostel--force-next-redraw nil)
           (when-let* ((render-win (ghostel--get-render-window buffer)))
             (let* ((all-windows (get-buffer-window-list buffer nil t))
-                   (anchored (cl-remove-if-not #'ghostel--window-anchored-p
-                                               all-windows))
+                   (anchored (cl-union
+                              ghostel--windows-needing-snap
+                              (cl-remove-if-not #'ghostel--window-anchored-p
+                                                all-windows)
+                              :test #'eq))
                    ;; In line mode the user's in-progress input lives
                    ;; in the buffer past the prompt and is not in
                    ;; libghostty's grid; the renderer would otherwise
@@ -5497,6 +6241,7 @@ live viewport."
               (ghostel--apply-cursor-style)
 
               (dolist (win anchored) (ghostel--anchor-window win))
+              (setq ghostel--windows-needing-snap nil)
 
               (let* ((line-restored
                       (and line-snapshot
@@ -5572,45 +6317,66 @@ Convenience wrapper to keep the five resize sites consistent."
                      (ghostel--reported-cell-width)
                      (ghostel--reported-cell-height)))
 
-(defun ghostel--adjust-size (window)
-  "Resize the terminal to match WINDOW's buffer dimensions.
-If WINDOW was anchored to the live viewport before the size change,
-keep it anchored.  Redraw synchronously when the terminal size
-actually changes."
-  (when (ghostel--window-anchored-p
-         window (window-old-body-pixel-height window))
-    (ghostel--anchor-window window))
+(defun ghostel--window-adjust-process-window-size (process windows)
+  "Resize the terminal to match the new Emacs window dimensions.
+PROCESS is the shell process, WINDOWS is the list of windows."
   (let* ((adjust-fn (default-value 'window-adjust-process-window-size-function))
          (adjust-fn (if (functionp adjust-fn)
                         adjust-fn
-                      #'window-adjust-process-window-size-smallest))
-         (windows (get-buffer-window-list nil nil t))
-         (size (funcall adjust-fn ghostel--process windows))
+                       #'window-adjust-process-window-size-smallest))
+         (buffer (process-buffer process))
+         (selected (selected-window))
+         (selected-window-for-buffer
+          (and (eq (window-buffer selected) buffer)
+               (or (null windows)
+                   (memq selected windows))
+               selected))
+         (resize-windows (if ghostel-resize-only-when-selected-window
+                             (and selected-window-for-buffer
+                                  (list selected-window-for-buffer))
+                           windows))
+         (raw-size (and (or (not ghostel-resize-only-when-selected-window)
+                            selected-window-for-buffer)
+                        (funcall adjust-fn process resize-windows)))
+         (size (and raw-size
+                     (ghostel--terminal-size (car raw-size) (cdr raw-size))))
          (width (car size))
-         (height (cdr size)))
-    (when (and ghostel--term size)
-      (cond
-       ;; No change — skip entirely.
-       ((and (eql height ghostel--term-rows)
-             (eql width ghostel--term-cols))
-        (setq size nil))
-       ;; Don't resize on minibuffer-induced rows-only change.
-       ;; E.g. fish clears and re-emits its prompt on every SIGWINCH;
-       ;; a `consult-buffer'/`M-x' cycle that grows then shrinks the body
-       ;; would otherwise produce two prompt repaints in quick succession.
-       ;; Skip the deferral on the alt screen TUIs.
-       ((and (active-minibuffer-window)
-             (eql width ghostel--term-cols)
-             (not (ghostel--alt-screen-p ghostel--term)))
-        (setq size nil))
-       ;; Real resize — queue the terminal model resize and redraw.
-       (t
-        (ghostel--set-size-with-cell-dims
-         ghostel--term (max 1 height) (max 1 width))
-        (setq ghostel--force-next-redraw t)
-        ;; Redraw synchronously so the buffer is updated before
-        ;; Emacs displays the stale content at the new window size.
-        (ghostel--redraw-now (current-buffer)))))))
+         (height (cdr size))
+         (selected-drives-resize
+          (or (not ghostel-resize-only-when-selected-window)
+              selected-window-for-buffer)))
+    (when (and size selected-drives-resize (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (when ghostel--term
+          (cond
+           ;; No change — skip entirely.
+           ((and (eql height ghostel--term-rows)
+                 (eql width ghostel--term-cols))
+            (setq size nil))
+           ;; Crop: minibuffer is active, only height shrank, width unchanged,
+           ;; and the terminal is on the primary screen.  Defer the resize so
+           ;; no SIGWINCH is sent — the Emacs window naturally hides the bottom
+           ;; rows, just like a normal buffer.  Alt-screen apps (vim, htop) own
+           ;; the full viewport and must be told the real size to re-layout, so
+           ;; they take the normal-resize path.  If the user switches focus into
+           ;; the ghostel window while the minibuffer is still open,
+           ;; `ghostel--commit-cropped-size' commits the smaller size then.
+           ((and (> (minibuffer-depth) 0)
+                 (eql width ghostel--term-cols)
+                 (< height ghostel--term-rows)
+                 (not (ghostel--alt-screen-p ghostel--term)))
+            (setq size nil))
+           ;; Real resize — queue the terminal model resize and redraw.
+           (t
+            (ghostel--set-size-with-cell-dims
+             ghostel--term (max 1 height) (max 1 width))
+            (setq ghostel--force-next-redraw t)
+            ;; Redraw synchronously so the buffer is updated before
+            ;; Emacs displays the stale content at the new window size.
+            (ghostel--cancel-plain-link-detection)
+            (ghostel--redraw-now buffer))))))
+    ;; Return size so Emacs can drive PTY SIGWINCH after this hook.
+    (and size selected-drives-resize size)))
 
 (defun ghostel--sync-tty-composition (window)
   "Sync `auto-composition-mode' with WINDOW's frame for ghostel buffers.
@@ -5632,6 +6398,27 @@ and the TTY display that needs it off keeps working in parallel)."
              (eq (window-buffer window) (current-buffer)))
     (ghostel--anchor-window window)
     (ghostel--redraw-now (current-buffer))))
+
+(defun ghostel--reshow-snap (window)
+  "Mark WINDOW for viewport snap after the next redraw.
+When output arrives while a Ghostel buffer is hidden, the rendered
+viewport can advance only after the buffer is shown again.  Marking the
+window here lets `ghostel--redraw-now' anchor it to the new viewport
+after rendering the hidden output."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             ghostel--term)
+    (cl-pushnew window ghostel--windows-needing-snap)
+    (ghostel--invalidate)))
+
+(defun ghostel--anchor-on-resize (window)
+  "Scroll WINDOW to the active area if it was already anchored.
+If WINDOW was already anchored at the active area before resizing, WINDOW will
+scroll to active area to keep it focused even during resize."
+  (with-current-buffer (window-buffer window)
+    (when (ghostel--window-anchored-p window
+                                      (window-old-body-pixel-height window))
+      (ghostel--anchor-window window))))
 
 (defun ghostel--minibuffer-exit ()
   "Schedule anchoring of all the currently anchored Ghostel windows.
@@ -5672,6 +6459,47 @@ for both native and Emacs PTY paths."
                               (buffer-name (current-buffer)))))
         (_ t))))
 
+(defun ghostel--commit-cropped-size (window)
+  "Commit WINDOW's size when selection enters a resized ghostel window.
+When the minibuffer opens, `ghostel--window-adjust-process-window-size'
+skips the resize so the PTY keeps its original row count and the bottom
+rows are just hidden.  But if the user switches focus into the ghostel
+window while the minibuffer is still up, they are now actively using
+the smaller viewport — commit the size so the shell/app knows its real
+dimensions.  Likewise, when
+`ghostel-resize-only-when-selected-window' suppresses a background resize,
+commit the current selected window size when the user selects that
+ghostel window again.
+
+Intended for buffer-local `window-selection-change-functions'.  When
+registered buffer-locally, Emacs calls this with WINDOW and makes its
+buffer current; we only commit when WINDOW has become the selected
+window (not when it has just been deselected)."
+  (when (and (or (> (minibuffer-depth) 0)
+                 ghostel-resize-only-when-selected-window)
+             (window-live-p window)
+             (eq window (frame-selected-window (window-frame window)))
+             ghostel--term
+             ghostel--process
+             (process-live-p ghostel--process))
+    (let ((height (with-selected-window window
+                    (floor (window-screen-lines))))
+          (width (window-max-chars-per-line window))
+          (buf (current-buffer)))
+      (unless (and (eql height ghostel--term-rows)
+                   (eql width ghostel--term-cols))
+        (ghostel--set-size-with-cell-dims
+          ghostel--term (max 1 height) (max 1 width))
+        (setq ghostel--term-rows height
+              ghostel--term-cols width
+              ghostel--force-next-redraw t)
+        (ghostel--process-set-window-size ghostel--process
+                                          (max 1 height) (max 1 width))
+        (when ghostel--redraw-timer
+          (cancel-timer ghostel--redraw-timer)
+          (setq ghostel--redraw-timer nil))
+        (ghostel--cancel-plain-link-detection)
+        (ghostel--redraw-now buf)))))
 
 ;;; Major mode
 
@@ -5692,7 +6520,7 @@ for both native and Emacs PTY paths."
   ;; whether font-lock ends up on.  `ghostel-mode' has no keywords, so
   ;; skipping unfontify has no other effect.
   (setq-local font-lock-unfontify-region-function #'ignore)
-  (setq buffer-read-only nil)
+  (setq buffer-read-only t)
   (setq-local scroll-margin 0)
   (setq-local auto-hscroll-mode nil)
   (setq-local hscroll-margin 0)
@@ -5714,7 +6542,6 @@ for both native and Emacs PTY paths."
   (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
   (add-hook 'window-buffer-change-functions #'ghostel--window-buffer-change nil t)
   (add-hook 'window-buffer-change-functions #'ghostel--sync-tty-composition nil t)
-  (add-hook 'window-size-change-functions #'ghostel--adjust-size nil t)
   (add-hook 'minibuffer-exit-hook #'ghostel--minibuffer-exit)
   (add-hook 'minibuffer-exit-hook #'ghostel--minibuffer-exit-maybe-leave)
   (add-hook 'activate-mark-hook #'ghostel--mark-activated nil t)
@@ -5732,6 +6559,13 @@ for both native and Emacs PTY paths."
   (shell-completion-vars)
 
   (use-local-map ghostel-semi-char-mode-map)
+  (add-hook 'kill-buffer-hook #'ghostel--cancel-plain-link-detection nil t)
+  ;; Buffer-local so it only fires for windows showing this buffer, and
+  ;; receives WINDOW directly (rather than FRAME as the default binding).
+  (add-hook 'window-selection-change-functions
+            #'ghostel--commit-cropped-size nil t)
+  (add-hook 'window-buffer-change-functions
+            #'ghostel--reshow-snap nil t)
   (ghostel--suppress-interfering-modes)
   (ghostel-imenu-setup))
 
@@ -5749,7 +6583,12 @@ prevent redraw flicker."
   ;; Buffer-local hl-line-mode
   (when (bound-and-true-p hl-line-mode)
     (setq ghostel--saved-hl-line-mode t)
-    (hl-line-mode -1)))
+    (hl-line-mode -1))
+  ;; Pixel scrolling fights the terminal's own scroll handling.
+  (when (bound-and-true-p pixel-scroll-precision-mode)
+    (when (fboundp 'pixel-scroll-precision-mode)
+      (pixel-scroll-precision-mode -1))
+    (setq-local pixel-scroll-precision-mode nil)))
 
 
 ;;; Entry point
@@ -5801,7 +6640,10 @@ spawn after initialization."
           ghostel--pid nil
           ghostel--command-running nil
           ghostel--event-buf nil
+          ghostel--pending-output nil
           ghostel--redraw-timer nil
+          ghostel--redraw-timer-deadline nil
+          ghostel--synchronized-output-redraw-deadline nil
           ghostel--plain-link-detection-timer nil
           ghostel--plain-link-detection-begin nil
           ghostel--plain-link-detection-end nil
@@ -5810,15 +6652,18 @@ spawn after initialization."
           ghostel--cursor-char-pos nil
           ghostel--rendered-font nil)
     (let* ((w (or (get-buffer-window buffer t) (selected-window)))
-           (height (max 1 (or rows
-                              (if (window-live-p w)
-                                  (with-selected-window w
-                                    (floor (window-screen-lines)))
-                                24))))
-           (width  (max 1 (or cols
-                              (if (window-live-p w)
-                                  (window-max-chars-per-line w)
-                                80)))))
+           (size (ghostel--terminal-size
+                  (or cols
+                      (if (window-live-p w)
+                          (window-max-chars-per-line w)
+                        80))
+                  (or rows
+                      (if (window-live-p w)
+                          (with-selected-window w
+                            (floor (window-screen-lines)))
+                        24))))
+           (width (car size))
+           (height (cdr size)))
       (setq ghostel--term
             (ghostel--new height width
                           ghostel-max-scrollback
@@ -5938,7 +6783,8 @@ already has a live ghostel process."
     (with-current-buffer buffer
       (ghostel--init-buffer buffer height width)
       (let ((remote-p (file-remote-p default-directory)))
-        (ghostel--spawn-pty program args nil remote-p)))))
+        (ghostel--spawn-pty program args height width
+                            ghostel--default-stty nil remote-p)))))
 
 ;;;###autoload
 (defun ghostel-project (&optional arg)
