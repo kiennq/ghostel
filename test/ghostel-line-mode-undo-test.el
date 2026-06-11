@@ -62,7 +62,8 @@ live PTY.  Leaves the buffer in line mode with point at the input."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (let ((inhibit-read-only t))
+            (insert (propertize "$ " 'ghostel-prompt t)))
           ;; Fresh ghostel-mode buffer: recording off.
           (should (eq buffer-undo-list t))
           (let ((ghostel--term 'fake)
