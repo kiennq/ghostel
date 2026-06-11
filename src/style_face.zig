@@ -6,7 +6,7 @@
 /// same SGR-to-face plist mapping.  This module owns the data type
 /// (`CellProps`) and the plist builder so the two paths stay in sync.
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const FixedArrayList = @import("fixed_array_list.zig").FixedArrayList;
 
