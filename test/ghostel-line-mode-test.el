@@ -40,7 +40,7 @@ the input region back after each redraw so the user's typing is
 not clobbered."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (setq ghostel-detect-password-prompts nil)
+    (setq-local ghostel-detect-password-prompts nil)
     (set-window-buffer (selected-window) buf)
     (setq ghostel--process 'fake-proc)
     ;; First prompt with OSC 133 A/B markers.
@@ -2042,7 +2042,7 @@ The deferred entry stays armed across redraws with no detectable
 prompt and engages on the redraw that exposes one."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (setq ghostel-detect-password-prompts nil)
+    (setq-local ghostel-detect-password-prompts nil)
     (set-window-buffer (selected-window) buf)
     (setq ghostel--process 'fake-proc)
     ;; Arm exactly as `ghostel--apply-initial-input-mode' would.
@@ -2066,7 +2066,7 @@ prompt and engages on the redraw that exposes one."
   "A manual mode switch before the first prompt cancels deferred line entry."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (setq ghostel-detect-password-prompts nil)
+    (setq-local ghostel-detect-password-prompts nil)
     (set-window-buffer (selected-window) buf)
     (setq ghostel--process 'fake-proc)
     (setq ghostel--pending-initial-line-mode t)
