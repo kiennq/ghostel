@@ -1,8 +1,7 @@
 const std = @import("std");
 
 const gt = @import("ghostty-vt");
-
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 
 pub fn parseHexByte(hi: u8, lo: u8) !u8 {
     const h = try hexDigit(hi);

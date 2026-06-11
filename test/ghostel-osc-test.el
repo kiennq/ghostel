@@ -612,6 +612,7 @@ fresh."
 (ert-deftest ghostel-test-osc-color-query ()
   "Test that OSC 4/10/11 color queries get responses."
   :tags '(native)
+  (skip-unless (not (eq system-type 'windows-nt)))
   (let ((python (executable-find "python3")))
     (skip-unless python)
     ;; Each case pairs a payload written to the terminal with a CHECK on the

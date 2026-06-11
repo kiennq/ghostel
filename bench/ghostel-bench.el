@@ -12,9 +12,9 @@
 ;;     `ghostel-mode' pipeline (`ghostel--filter' → `ghostel--invalidate'
 ;;     → `ghostel--redraw-now' → `ghostel--schedule-link-detection' plus
 ;;     anchoring and wide-char compensation), and `vterm--filter' /
-;;     `eat--filter' / `term-emulate-terminal' for the others.  Every
-;;     backend here uses an Emacs-owned process, so for ghostel this is
-;;     the Emacs PTY path; see `backend/*' for the native PTY path.
+;;     `eat--filter' / `term-emulate-terminal' for the others.  On
+;;     Windows, ghostel uses the native PTY path because Emacs-owned TTY
+;;     processes are not available there.
 ;;
 ;;   * `backend/*' — ghostel-only native-vs-Emacs PTY comparison through
 ;;     the real `ghostel--start-process' dispatch (a real PTY both ways).
@@ -31,6 +31,56 @@
 ;;; Code:
 
 (require 'cl-lib)
+
+(defvar ghostel--plain-link-detection-timer)
+(defvar ghostel--process)
+(defvar ghostel--redraw-timer)
+(defvar ghostel--term)
+(defvar ghostel--term-cols)
+(defvar ghostel--term-rows)
+(defvar ghostel-enable-file-detection)
+(defvar ghostel-enable-url-detection)
+(defvar ghostel-full-redraw)
+(defvar ghostel-kill-buffer-on-exit)
+(defvar ghostel-macos-login-shell)
+(defvar ghostel-plain-link-detection-delay)
+(defvar ghostel-shell)
+(defvar ghostel-shell-integration)
+(defvar ghostel-use-native-pty)
+(defvar eat-maximum-latency)
+(defvar eat-minimum-latency)
+(defvar term-buffer-maximum-size)
+(defvar term-height)
+(defvar term-width)
+(defvar vterm--term)
+(defvar vterm--undecoded-bytes)
+
+(declare-function eat--filter "eat" (process output))
+(declare-function eat--sentinel "eat" (process event))
+(declare-function eat-term-delete "eat" (term))
+(declare-function eat-term-make "eat" (buffer point))
+(declare-function eat-term-process-output "eat" (term output))
+(declare-function eat-term-redisplay "eat" (term))
+(declare-function eat-term-resize "eat" (term cols rows))
+(declare-function eat-term-set-parameter "eat" (term parameter value))
+(declare-function ghostel--copy-all-text "ghostel" (term))
+(declare-function ghostel--filter "ghostel" (process output))
+(declare-function ghostel--kill-native-process "ghostel" (term))
+(declare-function ghostel--new "ghostel" (rows cols scrollback))
+(declare-function ghostel--redraw "ghostel" (term &optional full))
+(declare-function ghostel--redraw-now "ghostel" (buffer))
+(declare-function ghostel--send-string "ghostel" (string))
+(declare-function ghostel--sentinel "ghostel" (process event))
+(declare-function ghostel--start-process "ghostel" ())
+(declare-function ghostel--write-vt "ghostel" (term data))
+(declare-function ghostel-mode "ghostel" ())
+(declare-function term-emulate-terminal "term" (process output))
+(declare-function term-mode "term" ())
+(declare-function vterm--filter "vterm" (process output))
+(declare-function vterm--new "vterm" (rows cols scrollback &rest args))
+(declare-function vterm--redraw "vterm" (&rest args))
+(declare-function vterm--update "vterm" ())
+(declare-function vterm--write-input "vterm" (term data))
 
 ;; ---------------------------------------------------------------------------
 ;; Configuration
@@ -308,6 +358,35 @@ The caller must call `delete-process' when done."
     (set-process-query-on-exit-flag proc nil)
     proc))
 
+(defun ghostel-bench--windows-p ()
+  "Return non-nil when benchmarks are running on native Windows."
+  (eq system-type 'windows-nt))
+
+(defun ghostel-bench--windows-cat-candidates ()
+  "Return common Windows locations for cat.exe."
+  (let ((program-files (getenv "ProgramFiles"))
+        (program-files-x86 (getenv "ProgramFiles(x86)")))
+    (delq nil
+          (list (and program-files
+                     (expand-file-name "Git/usr/bin/cat.exe" program-files))
+                (and program-files-x86
+                     (expand-file-name "Git/usr/bin/cat.exe" program-files-x86))
+                "C:/Program Files/Git/usr/bin/cat.exe"
+                "C:/msys64/usr/bin/cat.exe"))))
+
+(defun ghostel-bench--windows-cat-program ()
+  "Return the cat executable for the Windows native PTY benchmark."
+  (or (executable-find "cat")
+      (cl-loop for candidate in (ghostel-bench--windows-cat-candidates)
+               when (file-exists-p candidate)
+               return candidate)
+      (error "cat executable not found; install Git for Windows or add cat.exe to PATH")))
+
+(defun ghostel-bench--windows-output-shell (data-file)
+  "Return a cat shell spec that writes DATA-FILE bytes to stdout."
+  (list (ghostel-bench--windows-cat-program)
+        (expand-file-name data-file)))
+
 ;; =========================================================================
 ;; SECTION 1: End-to-end cross-emulator benchmark
 ;;
@@ -399,20 +478,68 @@ drive the post-exit timers."
             (set-process-window-size proc rows cols)
             (while (not done)
               (accept-process-output proc 30))
-            ;; Force one final delayed-redraw so the pipeline runs
-            ;; against the post-sentinel state (sentinel flushed pending
-            ;; output to the native module but did not redraw).  Ensures
-            ;; link detection runs at least once per iteration.
-            (ghostel--redraw-now buf)
-            ;; Drive timers until link detection drains.  After cat exits
-            ;; there is no process to wake `accept-process-output', but
-            ;; passing nil polls timers; `sit-for' would also work.
-            (let ((deadline (+ (float-time) 30)))
-              (while (and (or ghostel--redraw-timer
-                              ghostel--plain-link-detection-timer)
-                          (< (float-time) deadline))
-                (accept-process-output nil 0.01)))))
+            (with-current-buffer buf
+              ;; Force one final delayed-redraw so the pipeline runs
+              ;; against the post-sentinel state (sentinel flushed pending
+              ;; output to the native module but did not redraw).  Ensures
+              ;; link detection runs at least once per iteration.
+              (ghostel--redraw-now buf)
+              ;; Drive timers until link detection drains.  After cat exits
+              ;; there is no process to wake `accept-process-output', but
+              ;; passing nil polls timers; `sit-for' would also work.
+              (let ((deadline (+ (float-time) 30)))
+                (while (and (or ghostel--redraw-timer
+                                ghostel--plain-link-detection-timer)
+                            (< (float-time) deadline))
+                  (accept-process-output nil 0.01))))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(defun ghostel-bench--e2e-ghostel-windows-native (data-file detect-p)
+  "Benchmark Ghostel's production native PTY process path on Windows."
+  (let* ((rows 24) (cols 80)
+         (buf (generate-new-buffer " *ghostel-e2e-bench*"))
+         (ghostel-kill-buffer-on-exit nil)
+         (ghostel-enable-url-detection (and detect-p t))
+         (ghostel-enable-file-detection (and detect-p t))
+         (ghostel-plain-link-detection-delay 0)
+         (done nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq ghostel--term
+                (ghostel--new rows cols
+                              (* ghostel-bench-scrollback 1024)))
+          (setq ghostel--term-rows rows ghostel--term-cols cols)
+          (when (window-live-p (selected-window))
+            (set-window-buffer (selected-window) buf))
+          (setq-local ghostel-shell
+                      (ghostel-bench--windows-output-shell data-file))
+          (setq-local ghostel-shell-integration nil)
+          (let ((proc (ghostel--start-process)))
+            (setq ghostel--process proc)
+            (set-process-sentinel
+             proc
+             (lambda (process event)
+               (ghostel--sentinel process event)
+               (setq done t)))
+            (while (not done)
+              (accept-process-output proc 30))
+            (with-current-buffer buf
+              (ghostel--redraw-now buf)
+              (while (and ghostel--plain-link-detection-timer
+                          (not (memq (timer--triggered ghostel--plain-link-detection-timer)
+                                     '(nil t))))
+                (accept-process-output nil 0.01)))))
+      (when (buffer-live-p buf)
+        (when (and (boundp 'ghostel--term) ghostel--term)
+          (ignore-errors (ghostel--kill-native-process ghostel--term)))
+        (kill-buffer buf)))))
+
+(defun ghostel-bench--e2e-ghostel-platform (data-file detect-p)
+  "Benchmark Ghostel's production process path for the current platform."
+  (if (ghostel-bench--windows-p)
+      (ghostel-bench--e2e-ghostel-windows-native data-file detect-p)
+    (ghostel-bench--e2e-ghostel data-file detect-p)))
 
 (defun ghostel-bench--e2e-vterm (data-file)
   "Benchmark vterm processing `cat DATA-FILE' through `vterm--filter'.
@@ -480,7 +607,8 @@ For ghostel, exercises the full `ghostel-mode' pipeline including
 `*--filter' (decode loop, control-seq split or output queue, per-chunk
 update).  `term' installs `term-emulate-terminal' directly as its
 process filter, which both parses and renders in one call."
-  (message "\n--- End-to-End (real backend pipelines, cat %s) ---"
+  (message "\n--- End-to-End (real backend pipelines, %s %s) ---"
+           (if (ghostel-bench--windows-p) "Ghostel native PTY / cat" "cat")
            (ghostel-bench--human-size ghostel-bench-data-size))
   (message "  ghostel: filter / invalidate / delayed-redraw / link-detection")
   (message "  vterm:   vterm--filter (decode + control-seq split + update)")
@@ -496,10 +624,10 @@ process filter, which both parses and renders in one call."
           (message "  [plain ASCII data]")
           (ghostel-bench--measure
            "e2e/plain/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file t)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file t)))
           (ghostel-bench--measure
            "e2e/plain/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file nil)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file nil)))
           (when ghostel-bench-include-vterm
             (ghostel-bench--measure
              "e2e/plain/vterm" ghostel-bench-data-size ghostel-bench-iterations
@@ -521,10 +649,10 @@ process filter, which both parses and renders in one call."
           (message "  [URL & file-path heavy data]")
           (ghostel-bench--measure
            "e2e/urls/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file t)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file t)))
           (ghostel-bench--measure
            "e2e/urls/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file nil)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file nil)))
           (when ghostel-bench-include-vterm
             (ghostel-bench--measure
              "e2e/urls/vterm" ghostel-bench-data-size ghostel-bench-iterations
@@ -546,10 +674,10 @@ process filter, which both parses and renders in one call."
           (message "  [mixed emoji/CJK/ASCII data]")
           (ghostel-bench--measure
            "e2e/mixed/ghostel" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file t)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file t)))
           (ghostel-bench--measure
            "e2e/mixed/ghostel-nodetect" ghostel-bench-data-size ghostel-bench-iterations
-           (lambda () (ghostel-bench--e2e-ghostel data-file nil)))
+           (lambda () (ghostel-bench--e2e-ghostel-platform data-file nil)))
           (when ghostel-bench-include-vterm
             (ghostel-bench--measure
              "e2e/mixed/vterm" ghostel-bench-data-size ghostel-bench-iterations
@@ -652,36 +780,38 @@ covers the full read -> libghostty -> buffer pipeline."
 Both legs use a real PTY and the full render pipeline, so this is the
 `time cat bigfile' the user experiences on each backend.  Reports the
 native-vs-Emacs ratio per data shape."
-  (message "\n--- Backend Comparison (native vs Emacs PTY, real spawn; cat %s) ---"
-           (ghostel-bench--human-size ghostel-bench-data-size))
-  (message "  native: Zig-owned PTY, background-thread reads, redraw on FD-block")
-  (message "  emacs:  Emacs-owned PTY, per-chunk `ghostel--filter' on main thread")
-  (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "MB/s")
-  (message "  %s" (make-string 90 ?-))
-  (dolist (scenario '(("plain" . ghostel-bench--gen-plain-ascii)
-                      ("mixed" . ghostel-bench--gen-mixed-emoji-cjk-ascii)))
-    (let ((name (car scenario))
-          (data-file (ghostel-bench--write-data-file (cdr scenario)))
-          (native nil)
-          (emacs nil))
-      (unwind-protect
-          (progn
-            (message "  [%s data]" name)
-            (setq native
-                  (ghostel-bench--measure
-                   (format "backend/%s/native" name)
-                   ghostel-bench-data-size ghostel-bench-iterations
-                   (lambda () (ghostel-bench--spawn-cat data-file t))))
-            (setq emacs
-                  (ghostel-bench--measure
-                   (format "backend/%s/emacs" name)
-                   ghostel-bench-data-size ghostel-bench-iterations
-                   (lambda () (ghostel-bench--spawn-cat data-file nil))))
-            (when (> (plist-get native :per-iter-ms) 0)
-              (message "    ^ native is %.2fx the Emacs path"
-                       (/ (plist-get emacs :per-iter-ms)
-                          (plist-get native :per-iter-ms)))))
-        (delete-file data-file)))))
+  (if (ghostel-bench--windows-p)
+      (message "\n--- Backend Comparison skipped: Windows always uses native PTY ---")
+    (message "\n--- Backend Comparison (native vs Emacs PTY, real spawn; cat %s) ---"
+             (ghostel-bench--human-size ghostel-bench-data-size))
+    (message "  native: Zig-owned PTY, background-thread reads, redraw on FD-block")
+    (message "  emacs:  Emacs-owned PTY, per-chunk `ghostel--filter' on main thread")
+    (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "MB/s")
+    (message "  %s" (make-string 90 ?-))
+    (dolist (scenario '(("plain" . ghostel-bench--gen-plain-ascii)
+                        ("mixed" . ghostel-bench--gen-mixed-emoji-cjk-ascii)))
+      (let ((name (car scenario))
+            (data-file (ghostel-bench--write-data-file (cdr scenario)))
+            (native nil)
+            (emacs nil))
+        (unwind-protect
+            (progn
+              (message "  [%s data]" name)
+              (setq native
+                    (ghostel-bench--measure
+                     (format "backend/%s/native" name)
+                     ghostel-bench-data-size ghostel-bench-iterations
+                     (lambda () (ghostel-bench--spawn-cat data-file t))))
+              (setq emacs
+                    (ghostel-bench--measure
+                     (format "backend/%s/emacs" name)
+                     ghostel-bench-data-size ghostel-bench-iterations
+                     (lambda () (ghostel-bench--spawn-cat data-file nil))))
+              (when (> (plist-get native :per-iter-ms) 0)
+                (message "    ^ native is %.2fx the Emacs path"
+                         (/ (plist-get emacs :per-iter-ms)
+                            (plist-get native :per-iter-ms)))))
+          (delete-file data-file))))))
 
 ;; =========================================================================
 ;; SECTION 2: Streaming benchmark — chunked write + periodic redraw
