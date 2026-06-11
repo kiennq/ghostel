@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 
 const gt = @import("ghostty-vt");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const style_face = @import("style_face.zig");
 const parseHexColor = @import("utils.zig").parseHexColor;
 
@@ -407,8 +407,12 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
 
 var module_alloc: Allocator = undefined;
 
-pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+pub fn setModuleAllocator(allocator: Allocator) void {
     module_alloc = allocator;
+}
+
+pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+    setModuleAllocator(allocator);
     env.registerFunctions(&emacs_functions);
 }
 

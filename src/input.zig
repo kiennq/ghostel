@@ -5,7 +5,7 @@
 /// (application cursor keys, Kitty keyboard protocol, etc.).
 const std = @import("std");
 const gt = @import("ghostty-vt");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const GhostelTerm = @import("GhostelTerm.zig");
 
 /// Map an Emacs key name to a GhosttyKey.
