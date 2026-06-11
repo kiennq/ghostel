@@ -398,7 +398,9 @@ so no actual shell is spawned."
                        (setq-local ghostel--term-rows 24)
                        (setq-local ghostel--term-cols 80)
                        (cl-incf calls)
-                       (ghostel--spawn-pty "/bin/sh" nil nil nil)))))
+                       (ghostel--spawn-pty "/bin/sh" nil
+                                           24 80 ghostel--default-stty
+                                           nil nil)))))
           (unwind-protect
               (progn
                 (ghostel-debug-ghostel)
