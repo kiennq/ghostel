@@ -402,6 +402,7 @@ in line mode (the interactive entry validates these)."
       ;; emacs/semi-char paths (timer already live) are unaffected.
       (when (and was-frozen ghostel--term)
         (ghostel--invalidate))
+      (setq buffer-read-only nil)
       ;; Save `cursor-type' and force the editor's default for the
       ;; duration of line mode.  The user moves point freely here, so
       ;; the cursor must be visible regardless of any CSI ?25l the

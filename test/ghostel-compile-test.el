@@ -11,6 +11,14 @@
 
 (defvar-local ghostel-test-compile--finish-continuation nil)
 
+(defun ghostel-compile-test--fake-live-process (name buf)
+  "Return a live process-like object named NAME for tests in BUF."
+  (make-pipe-process :name name
+                     :buffer buf
+                     :noquery t
+                     :filter #'ignore
+                     :sentinel #'ignore))
+
 (ert-deftest ghostel-test-compile-finalize-scans-errors ()
   "`ghostel-compile--finalize' parses errors in the scan region."
   (ghostel-test--with-compile-buffer buf
@@ -983,8 +991,8 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
                #'ignore)
               ((symbol-function 'ghostel-compile--spawn)
                (lambda (_cmd buf _h _w)
-                 (let ((p (start-process "ghostel-test-args" buf
-                                         "sleep" "100")))
+                 (let ((p (ghostel-compile-test--fake-live-process
+                           "ghostel-test-args" buf)))
                    (set-process-sentinel p #'ignore)
                    (set-process-query-on-exit-flag p nil)
                    (with-current-buffer buf (setq ghostel--process p))
@@ -1018,8 +1026,8 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
                #'ignore)
               ((symbol-function 'ghostel-compile--spawn)
                (lambda (_cmd buf _h _w)
-                 (let ((p (start-process "ghostel-test-args2" buf
-                                         "sleep" "100")))
+                 (let ((p (ghostel-compile-test--fake-live-process
+                           "ghostel-test-args2" buf)))
                    (set-process-sentinel p #'ignore)
                    (set-process-query-on-exit-flag p nil)
                    (with-current-buffer buf (setq ghostel--process p))
@@ -1328,10 +1336,9 @@ normally."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory)))
           (with-current-buffer buf
-            (ghostel-test--wait-for
-             ghostel--process
+            (ghostel-test--wait-until
              (lambda () ghostel-compile--finalized)
-             10)
+             ghostel--process 10)
             (should (equal 7 ghostel-compile--last-exit))
             (let ((text (buffer-substring-no-properties
                          (point-min) (point-max))))
@@ -1555,13 +1562,14 @@ It must also raise `read-process-output-max'.  Same reason as
 `ghostel--spawn-pty' (issue #85)."
   :tags '(native)
   (let ((captured-adaptive 'unset)
-        (captured-max nil)
-        (orig-make-process (symbol-function #'make-process)))
+        (captured-max nil))
     (cl-letf (((symbol-function #'make-process)
                (lambda (&rest plist)
                  (setq captured-adaptive process-adaptive-read-buffering
                        captured-max read-process-output-max)
-                 (apply orig-make-process plist))))
+                 (ghostel-compile-test--fake-live-process
+                  (plist-get plist :name)
+                  (plist-get plist :buffer)))))
       (with-temp-buffer
         (let ((proc (ghostel-compile--spawn "true" (current-buffer) 24 80)))
           (unwind-protect
@@ -1579,12 +1587,13 @@ so this path needs its own coverage — without it, users setting
 compile jobs.  Also pins the position: `compilation-environment'
 entries must precede `ghostel-environment', and both must precede
 ghostel's own `INSIDE_EMACS=...,compile' marker."
-  (let ((captured-env nil)
-        (orig-make-process (symbol-function #'make-process)))
+  (let ((captured-env nil))
     (cl-letf (((symbol-function #'make-process)
                (lambda (&rest plist)
                  (setq captured-env process-environment)
-                 (apply orig-make-process plist))))
+                 (ghostel-compile-test--fake-live-process
+                  (plist-get plist :name)
+                  (plist-get plist :buffer)))))
       (with-temp-buffer
         (let* ((default-directory "/tmp/")
                (compilation-environment '("COMPENV=first"))
