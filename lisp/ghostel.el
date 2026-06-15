@@ -2713,16 +2713,25 @@ handler so the selection survives release; without this,
 `mouse-drag-track's exit hook deactivates the mark and our
 intercept keeps `mouse-set-region' from re-establishing the region.
 When the buffer is in semi-char mode, switches input mode once the
-region is set to mode configured in `ghostel-mouse-drag-input-mode'."
+region is set to the mode configured in `ghostel-mouse-drag-input-mode'.
+An empty drag, a click that wiggled into a `drag-mouse-1' without selecting
+anything, is dispatched to `ghostel-mouse-release-or-set-point',
+so a focus click stays in semi-char like a plain click."
   (interactive "e")
-  (if (ghostel--mouse-tracking-active-p)
-      (ghostel--mouse-drag event)
+  (cond
+   ((ghostel--mouse-tracking-active-p)
+    (ghostel--mouse-drag event))
+   ;; An empty drag selected nothing: the wiggle was really a click
+   ((eq (posn-point (event-start event))
+        (posn-point (event-end event)))
+    (ghostel-mouse-release-or-set-point event))
+   (t
     (let ((ghostel--inhibit-mark-activation t))
       (mouse-set-region event))
     (when (eq ghostel--input-mode 'semi-char)
       (pcase ghostel-mouse-drag-input-mode
         ('copy  (ghostel-copy-mode))
-        ('emacs (ghostel-emacs-mode))))))
+        ('emacs (ghostel-emacs-mode)))))))
 
 (defun ghostel-mouse-down-2-or-noop (event)
   "Forward EVENT to the terminal when a mouse-tracking mode is on.

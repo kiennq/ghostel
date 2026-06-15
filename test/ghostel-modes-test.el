@@ -870,7 +870,10 @@ Exiting returns to whatever mode the user was in beforehand, mirroring
                       ;; The real mouse-set-region activates the mark.
                       ((symbol-function 'mouse-set-region)
                        (lambda (_event) (push-mark (point) t t))))
-              (ghostel-mouse-drag-or-set-region nil)
+              ;; A real drag selecting a region (distinct start/end points).
+              (ghostel-mouse-drag-or-set-region
+               `(drag-mouse-1 (,(selected-window) 1 (1 . 1) 0)
+                              (,(selected-window) 5 (5 . 1) 0)))
               ;; The mouse knob picked the mode — the hook stayed out.
               (should (eq ghostel--input-mode 'emacs)))))
       (kill-buffer buf))))

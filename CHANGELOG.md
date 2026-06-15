@@ -28,6 +28,11 @@ All notable changes to this project will be documented in this file.
   working when the window system's focus state is stale — notably on macOS (NS),
   where a dropped focus-out can leave `frame-focus-state' stuck reporting focus
   and previously made every refocus click enter copy mode after a while.
+- A focus click into an inactive Ghostel window no longer enters copy mode when
+  a tiny involuntary pointer movement makes Emacs report it as `drag-mouse-1`
+  instead of `mouse-1`.  Such a micro-drag selects nothing, so it now stays in
+  semi-char and snaps point to the live cursor, like the single-click focus path
+  (#403).
 
 ## [0.34.0] — 2026-06-08
 
