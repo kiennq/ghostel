@@ -412,5 +412,39 @@ intact (with-editor's `with-editor--setup' reads `default-directory')."
         (should (ghostel-test--terminal-text-line-p
                  "GHOSTEL_PRE_SPAWN_TEST=ok" text))))))
 
+(ert-deftest ghostel-test-child-cwd-follows-default-directory-with-tilde ()
+  "Child process starts in `default-directory', including abbreviated home paths."
+  :tags '(native)
+  (let* ((home-dir (file-name-as-directory (expand-file-name "~")))
+         (test-dir (file-name-directory
+                    (or (locate-library "ghostel-spawn-test")
+                        buffer-file-name
+                        default-directory)))
+         (tmpdir (file-name-as-directory
+                  (make-temp-file (expand-file-name "ghostel-cwd-test-"
+                                                     test-dir)
+                                  t)))
+         (default-directory (abbreviate-file-name tmpdir))
+         (expected-cwd (directory-file-name (file-truename tmpdir))))
+    (unwind-protect
+        (progn
+          (should (string-prefix-p "~/" default-directory))
+          (ghostel-test--with-pty-matrix backend
+            (let* ((process-environment
+                    `(,(format "HOME=%s" (directory-file-name home-dir))
+                      "PATH=/usr/bin:/bin"))
+                   (ghostel-shell
+                    '("/bin/sh" "-c"
+                      "printf 'GHOSTEL_CWD:%s\\n' \"$(pwd -P)\"; printf GHOSTEL_CWD_DONE"))
+                   (ghostel-shell-integration nil)
+                   (ghostel-macos-login-shell nil)
+                   (ghostel-kill-buffer-on-exit nil)
+                   (text (ghostel-test--start-process-and-wait-for-text
+                          "GHOSTEL_CWD_DONE")))
+              (should (ghostel-test--terminal-text-line-p
+                       (format "GHOSTEL_CWD:%s" expected-cwd)
+                       text)))))
+      (delete-directory tmpdir t))))
+
 (provide 'ghostel-spawn-test)
 ;;; ghostel-spawn-test.el ends here

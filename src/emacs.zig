@@ -425,6 +425,7 @@ const interned_symbols = [_][:0]const u8{
     "eobp",
     "erase-buffer",
     "error",
+    "expand-file-name",
     "face",
     "face-attribute",
     "find-composition",

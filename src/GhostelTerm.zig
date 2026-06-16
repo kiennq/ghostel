@@ -800,7 +800,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 defer process_env.deinit();
                 const cwd = try module_alloc.dupeZ(u8, try env.extractStringAlloc(
                     module_alloc,
-                    env.symbolValue("default-directory"),
+                    env.f("expand-file-name", .{env.symbolValue("default-directory")}),
                     &buf,
                 ));
                 defer module_alloc.free(cwd);
