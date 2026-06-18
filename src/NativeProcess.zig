@@ -23,7 +23,7 @@ event_pipe: posix.fd_t = -1,
 // few writes to Emacs.
 event_buf: FixedArrayList(u8, 16 * 1024) = .{},
 
-term_mutex: std.Thread.Mutex = .{},
+term_mutex: std.Thread.Mutex.Recursive = .init,
 term: *gt.Terminal,
 stream: gt.Stream(GhostelHandler(*Self)),
 
