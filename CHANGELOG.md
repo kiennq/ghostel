@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.35.3] — 2026-06-18
+
+### Added
+- Documentation now has a short README landing page plus a full README.org
+  manual, with generated Info/HTML targets and GitHub Pages publishing.
+
+### Fixed
+- Native PTY processing now tolerates benign re-entrant calls back into the
+  module while calling Emacs, avoiding crashes from incidental module access.
+
 ## [0.35.2] — 2026-06-18
 
 ### Fixed
