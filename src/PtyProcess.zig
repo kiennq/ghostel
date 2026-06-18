@@ -45,7 +45,7 @@ const Pty = struct {
 
         self.replica_fd = try posix.openZ(
             @ptrCast(&self.replica_name),
-            .{ .ACCMODE = .RDWR },
+            .{ .ACCMODE = .RDWR, .NOCTTY = true },
             0,
         );
         errdefer posix.close(self.replica_fd);
