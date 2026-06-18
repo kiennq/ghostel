@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.35.2] — 2026-06-18
+
+### Fixed
+- Native PTY startup now configures the terminal directly instead of shelling out
+  through `stty`, avoiding `ghostel-exec` resize issues while preserving UTF-8
+  erase handling and direct `C-q`/`C-s` delivery to the child process.
+
 ## [0.35.1] — 2026-06-18
 
 ### Fixed

@@ -1,6 +1,6 @@
 .{
     .name = .ghostel,
-    .version = "0.35.1",
+    .version = "0.35.2",
     .paths = .{""},
     .fingerprint = 0x5a44bdd1198a0f4b,
     .dependencies = .{
