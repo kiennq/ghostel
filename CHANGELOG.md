@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-06-21
+
+### Added
+- `ghostel-initial-input-mode` lets new `ghostel` terminals start in
+  semi-char, char, or line mode; line mode is entered automatically after the
+  first prompt is detected.
+
+### Changed
+- Pasting now uses libghostty's paste encoder, matching terminal state for
+  bracketed paste, newline normalization, and filtering unsafe control bytes.
+
+### Fixed
+- Resizing a terminal while the cursor is not on the bottom row no longer leaves
+  the rendered buffer out of sync.
+
+### Internal
+- Line-mode-specific code was split into `lisp/ghostel-line-mode.el`.
+- Renderer resize invalidation was simplified, and the renderer now owns native
+  terminal row/column bookkeeping when resizes are committed.
+- Hypothesis driver coverage was fixed.
+
 ## [0.36.0] — 2026-06-21
 
 ### Added
