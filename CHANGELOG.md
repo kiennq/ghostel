@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Emacs bookmark support for ghostel buffers: `bookmark-set` (`C-x r m`) records
+  a terminal's working directory and name, and `bookmark-jump` (`C-x r b`)
+  reopens it — reusing a live ghostel buffer of that name or starting a fresh
+  shell in the bookmarked directory. The new `ghostel-bookmark-check-dir`
+  (default `t`) controls whether the directory is restored (`cd`'d into a reused
+  buffer that has since moved elsewhere).
+  Fixes [#447](https://github.com/dakra/ghostel/issues/447).
+
 ## [0.37.0] — 2026-06-21
 
 ### Added

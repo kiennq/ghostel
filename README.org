@@ -599,6 +599,23 @@ Remote TRAMP buffers still use Emacs process machinery so TRAMP can spawn the
 shell on the remote host and apply its file handlers.  The rendering and input
 APIs are shared by both paths.
 
+** Bookmarks
+:properties:
+:custom_id: bookmarks
+:end:
+
+Ghostel buffers work with Emacs's built-in bookmarks.  =bookmark-set= (=C-x r
+m=) records the terminal's working directory and buffer name; =bookmark-jump=
+(=C-x r b=) reopens it — reusing a live ghostel buffer of that name, or starting
+a fresh shell in the bookmarked directory when none exists.  Bookmarks capture
+the directory and name only (not scrollback or session contents), matching
+vterm.
+
+=ghostel-bookmark-check-dir= (default =t=) controls directory restoration: a
+fresh buffer starts its shell in the bookmarked directory, and a reused buffer
+that has since moved elsewhere gets a =cd= typed into its shell.  Set it to =nil=
+to leave the directory alone.
+
 ** Links and file detection
 :properties:
 :custom_id: links-and-file-detection
@@ -1149,6 +1166,7 @@ tables below group them by area; defaults shown are the out-of-the-box values.
 | =ghostel-exit-functions=           | =nil=                                           | Hook run with =(BUFFER EVENT)= when the terminal process exits.                                                 |
 | =ghostel-command-start-functions=  | =(ghostel--query-before-killing-on-cmd-start)=  | Hook run with =(BUFFER)= on OSC 133 C (command start).                                                          |
 | =ghostel-command-finish-functions= | =(ghostel--query-before-killing-on-cmd-finish)= | Hook run with =(BUFFER EXIT-STATUS)= on OSC 133 D (command finish).                                             |
+| =ghostel-bookmark-check-dir=       | =t=                                             | Restore the working directory when jumping to a ghostel [[#bookmarks][bookmark]] (=cd= into a reused buffer that moved).      |
 
 ** Native module
 
@@ -1828,6 +1846,7 @@ while ghostel and vterm trade a compile step for a C/Zig engine.
 | Elisp eval from shell         | ✅      | ✅       | ❌       |
 | TRAMP remote terminals        | ✅      | ✅       | ✅       |
 | Eshell integration            | ✅      | ❌       | ✅       |
+| Bookmark support              | ✅      | ✅       | ❌       |
 |-------------------------------+---------+----------+----------|
 | Input modes (char/semi/emacs) | ✅      | partial  | ✅       |
 | Line mode (local editing)     | ✅      | ❌       | ✅       |

@@ -999,6 +999,9 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 (declare-function spinner-start "spinner")
 (declare-function spinner-stop "spinner")
 
+;; Lazily loaded on first bookmark use; see ghostel-bookmark.el.
+(declare-function ghostel--bookmark-make-record "ghostel-bookmark")
+
 
 ;;; Automatic download and compilation of native module
 
@@ -5701,6 +5704,8 @@ for both native and Emacs PTY paths."
   (setq-local line-spacing 0)
   ;; expose cwd to buffer-menu/ibuffer
   (setq-local list-buffers-directory (expand-file-name default-directory))
+  ;; bookmark this buffer's cwd (loads ghostel-bookmark.el lazily on use)
+  (setq-local bookmark-make-record-function #'ghostel--bookmark-make-record)
   (setq ghostel--input-mode 'semi-char)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
