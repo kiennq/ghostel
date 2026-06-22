@@ -4576,7 +4576,9 @@ Copy mode is never anchored (the viewport is frozen).  Emacs mode is
 anchored only when FORCE is non-nil, reserved for deliberate anchors such
 as paste/yank that should scroll to the live cursor even in Emacs mode;
 auto-follow callers leave FORCE nil so a buffer reading its scrollback in
-Emacs mode keeps its position.  Semi-char/char/line always anchor."
+Emacs mode keeps its position.  Semi-char/char always anchor and snap
+point to the live cursor; line mode anchors the viewport but keeps the
+user's point, since its input region is user-owned."
   (when-let* ((window (or window (selected-window)))
               (buffer (window-buffer window))
               ((with-current-buffer buffer
@@ -4586,7 +4588,10 @@ Emacs mode keeps its position.  Semi-char/char/line always anchor."
                         (ghostel--terminal-live-p))))))
     (with-selected-window window
       (with-current-buffer buffer
-        (let ((target (point-max)))
+        (let ((target (point-max))
+              ;; Line mode's input region is user-owned; keep point instead of
+              ;; snapping it to the terminal cursor.
+              (orig (point)))
           (if-let* ((anchor (and (display-graphic-p (window-frame window))
                                  ghostel--pixel-anchor-supported-p
                                  (ghostel--pixel-anchor window target))))
@@ -4598,7 +4603,9 @@ Emacs mode keeps its position.  Semi-char/char/line always anchor."
               (forward-line (- (floor lines)))
               (set-window-start window (point))
               (ghostel--set-window-vscroll window 0 t t)))
-          (set-window-point window (or ghostel--cursor-char-pos target)))))))
+          (set-window-point window (if (eq ghostel--input-mode 'line)
+                                       orig
+                                     (or ghostel--cursor-char-pos target))))))))
 
 (defun ghostel--maybe-defer-redraw (buffer)
   "Defer BUFFER's redraw if a `ghostel-inhibit-redraw-functions' hook asks.

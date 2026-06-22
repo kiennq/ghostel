@@ -2046,5 +2046,68 @@ prompt and engages on the redraw that exposes one."
       (should (eq ghostel--input-mode 'char))
       (should-not ghostel--pending-initial-line-mode))))
 
+(ert-deftest ghostel-test-anchor-window-line-mode-keeps-point ()
+  "`ghostel--anchor-window' anchors the line-mode viewport but keeps point.
+In line mode the input region between `ghostel--line-input-start' and
+`ghostel--line-input-end' is user-owned, so an anchor (minibuffer grow, window
+resize, redisplay) must scroll the viewport to the bottom WITHOUT snapping point
+to the terminal cursor.  The semi-char control sub-case proves the
+snap-to-`ghostel--cursor-char-pos' behaviour is preserved for the other modes."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-line*"))
+        (previous-buffer (window-buffer (selected-window))))
+    (unwind-protect
+        ;; No native module: stub the alt-screen DEC-mode query so line-mode
+        ;; entry takes the primary-screen path.
+        (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil)))
+          (set-window-buffer (selected-window) buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq ghostel--term 'fake)
+            ;; Scrollback above the prompt so a bottom-anchor is observable.
+            (let ((rows (max 1 (window-body-height)))
+                  (inhibit-read-only t))
+              (dotimes (i (+ rows 20))
+                (insert (format "row-%02d\n" i))))
+            ;; A prompt carrying `ghostel-prompt' on the cursor's row, with the
+            ;; terminal cursor (= the input boundary) right after it.
+            (let ((inhibit-read-only t))
+              (insert (propertize "$ " 'ghostel-prompt t)))
+            (setq ghostel--cursor-char-pos (point))
+            (setq ghostel--cursor-pos (cons (current-column) 0))
+            ;; Enter line mode: markers now wrap the (empty) input region.
+            (ghostel-line-mode)
+            (should (eq ghostel--input-mode 'line))
+            (should (markerp ghostel--line-input-start))
+            ;; Type input locally; the end marker grows to include it.
+            (goto-char (marker-position ghostel--line-input-end))
+            (let ((inhibit-read-only t))
+              (insert "echo hello world"))
+            (should (equal (ghostel--line-mode-input-text) "echo hello world"))
+            (let* ((win (selected-window))
+                   (start (marker-position ghostel--line-input-start))
+                   ;; Point mid-input: distinct from `ghostel--cursor-char-pos'
+                   ;; (= input start) and from `point-max' (= input end).
+                   (mid (+ start 5)))
+              (should (= ghostel--cursor-char-pos start))
+              (should (< start mid))
+              (should (< mid (point-max)))
+              ;; Park point mid-input and scroll the window off the bottom.
+              (goto-char mid)
+              (set-window-point win mid)
+              (set-window-start win (point-min) t)
+              ;; Line mode anchors the viewport but leaves point put.
+              (ghostel--anchor-window win)
+              (should (= (window-point win) mid))
+              (should (> (window-start win) (point-min)))
+              ;; Control: semi-char mode still snaps point to the live cursor.
+              (setq ghostel--input-mode 'semi-char)
+              (set-window-start win (point-min) t)
+              (ghostel--anchor-window win)
+              (should (= (window-point win) ghostel--cursor-char-pos))
+              (should (> (window-start win) (point-min))))))
+      (set-window-buffer (selected-window) previous-buffer)
+      (kill-buffer buf))))
+
 (provide 'ghostel-line-mode-test)
 ;;; ghostel-line-mode-test.el ends here
