@@ -419,12 +419,15 @@ $ would walk into non-typed cells).  Off the cursor row, unchanged."
         (forward-line cursor-line)
         (move-to-column col)))))
 
-(defun evil-ghostel-goto-cursor ()
-  "Move point to the live terminal cursor."
-  (interactive)
-  (if (not (evil-ghostel--active-p))
-      (call-interactively #'evil-goto-line)
-    (evil-ghostel--reset-cursor-point)))
+(evil-define-motion evil-ghostel-goto-cursor (count)
+  "Move point to the live terminal cursor, or `evil-goto-line' when inactive."
+  ;; A motion, not a plain command: `:keep-visual t' stops evil's line-visual
+  ;; expand/contract from reverting the jumped point.
+  :type line
+  :jump t
+  (if (evil-ghostel--active-p)
+      (evil-ghostel--reset-cursor-point)
+    (evil-goto-line count)))
 
 
 ;; Insert / Append

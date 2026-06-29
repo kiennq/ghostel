@@ -386,6 +386,76 @@ point in the scrollback region instead of the visible viewport."
               (current-column)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: G (evil-ghostel-goto-cursor) is a linewise motion (#485)
+;; -----------------------------------------------------------------------
+;;
+;; The #485 defect lives in evil's *visual command-loop* handling, not in
+;; `evil-ghostel-goto-cursor''s body: a plain command makes evil expand the
+;; line-visual region before `G' and contract it after, snapping point back
+;; to the start line.  `evil-define-motion' supplies `:keep-visual t', which
+;; suppresses that expand/contract.  `execute-kbd-macro' does not dispatch
+;; commands under `--batch', so these drive `G' through the same hooks the
+;; real command loop runs (`evil-visual-pre-command' / `-post-command').
+
+(defun evil-ghostel-test--visual-goto-cursor (type)
+  "Select a TYPE visual region at point, then run `G' as the command loop would.
+TYPE is `line' or `char'.  Reproduces #485 without `execute-kbd-macro'."
+  (evil-visual-make-selection (point) (point) type)
+  (let ((this-command 'evil-ghostel-goto-cursor))
+    (evil-visual-pre-command 'evil-ghostel-goto-cursor)
+    (call-interactively 'evil-ghostel-goto-cursor)
+    (evil-visual-post-command 'evil-ghostel-goto-cursor)))
+
+(ert-deftest evil-ghostel-test-visual-line-goto-cursor-extends ()
+  "Regression for #485: `VG' extends the line-visual selection to the cursor.
+Pre-fix this reverted point to the start line; a linewise motion keeps it."
+  (evil-ghostel-test--with-buffer 8 40 "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6"
+    (should (evil-ghostel--active-p))
+    (let ((cursor-line (save-excursion
+                         (evil-ghostel--reset-cursor-point)
+                         (line-number-at-pos))))
+      (evil-normal-state)
+      (goto-char (point-min))
+      (evil-ghostel-test--visual-goto-cursor 'line)
+      (should (evil-visual-state-p))
+      (should (= cursor-line (line-number-at-pos (point))))
+      (should (= 1 (line-number-at-pos evil-visual-beginning)))
+      (should (>= (line-number-at-pos evil-visual-end) cursor-line)))))
+
+(ert-deftest evil-ghostel-test-visual-char-goto-cursor-extends ()
+  "Guard for #485: `vG' (char-visual) still extends to the cursor row.
+This case always worked; keep it working while fixing the line-visual one."
+  (evil-ghostel-test--with-buffer 8 40 "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6"
+    (let ((cursor-line (save-excursion
+                         (evil-ghostel--reset-cursor-point)
+                         (line-number-at-pos))))
+      (evil-normal-state)
+      (goto-char (point-min))
+      (evil-ghostel-test--visual-goto-cursor 'char)
+      (should (evil-visual-state-p))
+      (should (= cursor-line (line-number-at-pos (point))))
+      (should (= 1 (line-number-at-pos evil-visual-beginning))))))
+
+(ert-deftest evil-ghostel-test-goto-cursor-inactive-falls-back ()
+  "When evil-ghostel is inactive, `evil-ghostel-goto-cursor' acts like
+`evil-goto-line': honor a count, else go to the last line."
+  (evil-ghostel-test--with-buffer 8 40 "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6"
+    (setq-local ghostel--input-mode 'line)
+    (should-not (evil-ghostel--active-p))
+    ;; With a count: jump to that line.
+    (goto-char (point-min))
+    (evil-ghostel-goto-cursor 3)
+    (should (= 3 (line-number-at-pos)))
+    ;; Without a count: same landing spot as vanilla `evil-goto-line'.
+    (let ((expected (save-excursion
+                      (goto-char (point-min))
+                      (evil-goto-line nil)
+                      (point))))
+      (goto-char (point-min))
+      (evil-ghostel-goto-cursor nil)
+      (should (= expected (point))))))
+
+;; -----------------------------------------------------------------------
 ;; Test: evil-ghostel-goto-input-position end-to-end with the native module
 ;; -----------------------------------------------------------------------
 
