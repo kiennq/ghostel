@@ -207,6 +207,80 @@ newest-first list aligns with the buffer-order regions."
                                       (match-string 1 output))))
       (delete-directory fish-home t))))
 
+(ert-deftest ghostel-test-nu-auto-inject-loads-integration ()
+  "Nushell auto-inject shim chains to ghostel.nu and cleans XDG_DATA_DIRS.
+The shim is vendor-autoloaded via XDG_DATA_DIRS; it locates ghostel.nu
+with `path self' and sources it.  Driven with `nu --execute' because
+nushell only runs vendor autoload for interactive sessions (plain `-c'
+skips it), and `--execute' enters an interactive shell."
+  :tags '(:nu)
+  (skip-unless (executable-find "nu"))
+  (let* ((ghostel-dir (or (ghostel--resource-root)
+                          (file-name-directory
+                           (or (locate-library "ghostel")
+                               load-file-name
+                               buffer-file-name))))
+         (integ-dir (directory-file-name
+                     (expand-file-name "etc/shell/bootstrap" ghostel-dir)))
+         ;; Isolate from the dev's nushell config: point HOME and
+         ;; XDG_CONFIG_HOME at an empty temp dir so a user `config.nu'
+         ;; (which could pre-define ghostel_cmd/ssh) can't satisfy the
+         ;; assertions.  XDG_DATA_DIRS still carries our bootstrap dir so
+         ;; vendor autoload runs.
+         (nu-home (make-temp-file "ghostel-test-nu-home-" t)))
+    (unwind-protect
+        (let* ((probe (concat
+                       "let c = (scope commands | where name == \"ghostel_cmd\" | length)\n"
+                       "print (\"cmd=\" + (if $c > 0 { \"yes\" } else { \"no\" }))\n"
+                       "let s = (scope commands | where name == \"ssh\" | length)\n"
+                       "print (\"sshw=\" + (if $s > 0 { \"yes\" } else { \"no\" }))\n"
+                       "print (\"xdg=\" + ($env.XDG_DATA_DIRS? | default \"NONE\"))\n"
+                       "exit\n"))
+               (process-environment
+                (append (list (format "HOME=%s" nu-home)
+                              (format "XDG_CONFIG_HOME=%s" nu-home)
+                              (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)
+                              "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                              (format "XDG_DATA_DIRS=%s:/usr/local/share:/usr/share"
+                                      integ-dir)
+                              (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
+                                      integ-dir))
+                        process-environment))
+               (default-directory nu-home)
+               (output (with-temp-buffer
+                         (call-process "nu" nil (current-buffer) nil
+                                       "--execute" probe)
+                         (buffer-string))))
+          ;; Shim must chain (via `path self') to etc/shell/ghostel.nu so
+          ;; ghostel_cmd is defined.
+          (should (string-match-p "^cmd=yes$" output))
+          ;; ghostel.nu also defines the outbound `ssh' wrapper.
+          (should (string-match-p "^sshw=yes$" output))
+          ;; XDG cleanup must strip the injected bootstrap dir so
+          ;; subprocesses don't re-autoload the shim.
+          (should (string-match "^xdg=\\(.*\\)$" output))
+          (should-not (string-match-p (regexp-quote integ-dir)
+                                      (match-string 1 output))))
+      (delete-directory nu-home t))))
+
+(ert-deftest ghostel-test-nu-ghostel-cmd-emits-osc52 ()
+  "Nushell `ghostel_cmd' emits an OSC 52 ;e payload with quoted args."
+  :tags '(:nu)
+  (skip-unless (executable-find "nu"))
+  (let* ((ghostel-dir (or (ghostel--resource-root)
+                          (file-name-directory
+                           (or (locate-library "ghostel")
+                               load-file-name
+                               buffer-file-name))))
+         (script (expand-file-name "etc/shell/ghostel.nu" ghostel-dir))
+         (output (with-temp-buffer
+                   (call-process "nu" nil (current-buffer) nil "-n" "-c"
+                                 (format "source %s; ghostel_cmd \"a b\""
+                                         (shell-quote-argument script)))
+                   (buffer-string))))
+    ;; ESC ] 52 ; e ; "a b" <space> ... ESC \
+    (should (string-match-p "\e]52;e;\"a b\" " output))))
+
 (ert-deftest ghostel-test-update-directory ()
   "Test OSC 7 directory tracking helper."
   (let* ((ghostel--last-directory nil)

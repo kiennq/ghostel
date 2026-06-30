@@ -123,11 +123,24 @@ written by `ghostel-test--pty-winsize-script'."
 
 ;;; Remote shell spec resolution (issue #444)
 
+(ert-deftest ghostel-test-detect-shell ()
+  "`ghostel--detect-shell' maps binaries to shell-type symbols."
+  (should (eq 'bash (ghostel--detect-shell "/bin/bash")))
+  (should (eq 'zsh (ghostel--detect-shell "/usr/bin/zsh")))
+  (should (eq 'fish (ghostel--detect-shell "/usr/bin/fish")))
+  ;; Nushell's binary is `nu' (exact match, also accept `nushell').
+  (should (eq 'nu (ghostel--detect-shell "/opt/homebrew/bin/nu")))
+  (should (eq 'nu (ghostel--detect-shell "nushell")))
+  ;; "nu" must be exact: a path merely containing "nu" is not nushell.
+  (should-not (ghostel--detect-shell "/usr/bin/gnushell-wrapper"))
+  (should-not (ghostel--detect-shell "/bin/sh")))
+
 (ert-deftest ghostel-test-default-remote-shell-args-recognized ()
   "Recognized remote shells default to login+interactive args."
   (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/bin/zsh")))
   (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/bin/bash")))
   (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/usr/bin/fish")))
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/opt/homebrew/bin/nu")))
   ;; NixOS-style path: detection keys off the basename.
   (should (equal '("-l" "-i")
                  (ghostel--default-remote-shell-args
@@ -142,9 +155,10 @@ written by `ghostel-test--pty-winsize-script'."
   "With integration active, bash drops `-l'; zsh/fish keep login+interactive."
   ;; Bash: `-l' would make login bash ignore integration's `--rcfile'.
   (should (equal '("-i") (ghostel--default-remote-shell-args "/bin/bash" t)))
-  ;; Zsh and fish compose cleanly with `-l -i'.
+  ;; Zsh, fish, and nushell compose cleanly with `-l -i'.
   (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/usr/bin/zsh" t)))
   (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/usr/bin/fish" t)))
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/opt/homebrew/bin/nu" t)))
   ;; Unrecognized shells still get nothing.
   (should-not (ghostel--default-remote-shell-args "/bin/sh" t)))
 

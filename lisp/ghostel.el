@@ -240,9 +240,9 @@ FALLBACK, when present, is used when login-shell detection fails.
 
 Any elements after FALLBACK are extra arguments passed to the shell.
 When none are given, ghostel supplies a type-aware default: recognized shells
-\(bash, zsh, fish) are started as login+interactive shells (`-l -i') so they
-source the user's rc/profile files, mirroring an interactive `ssh host' login.
-Unrecognized shells (e.g. /bin/sh) get no args.
+\(bash, zsh, fish, nushell) are started as login+interactive shells (`-l -i')
+so they source the user's rc/profile files, mirroring an interactive `ssh host'
+login.  Unrecognized shells (e.g. /bin/sh) get no args.
 To override, list the arguments explicitly after FALLBACK,
 e.g. (\"ssh\" login-shell nil \"-i\").
 
@@ -639,7 +639,7 @@ reference opened at its start.")
   "Automatically inject shell integration on startup.
 When non-nil, ghostel modifies the shell invocation to automatically
 load shell integration scripts without requiring changes to the user's
-shell configuration files.  Supports bash, zsh, and fish."
+shell configuration files.  Supports bash, zsh, fish, and nushell."
   :type 'boolean)
 
 (defcustom ghostel-macos-login-shell (eq system-type 'darwin)
@@ -676,7 +676,10 @@ Set to t for all supported shells, or a list of symbols
   :type '(choice (const :tag "Disabled" nil)
                  (const :tag "All shells" t)
                  (repeat :tag "Specific shells"
-                         (choice (const bash) (const zsh) (const fish)))))
+                         (choice (const bash)
+                                 (const zsh)
+                                 (const fish)
+                                 (const nu)))))
 
 (defcustom ghostel-tramp-default-method nil
   "TRAMP method for constructing remote paths from OSC 7 directory reports.
@@ -3802,12 +3805,13 @@ EVENT is the state-change description passed by Emacs."
             (insert "\n[Process exited]\n")))))))
 
 (defun ghostel--detect-shell (shell)
-  "Return shell type symbol (bash, zsh, fish) from SHELL path, or nil."
+  "Return shell type symbol (bash, zsh, fish, nu) from SHELL path, or nil."
   (let ((base (file-name-nondirectory shell)))
     (cond
      ((string-match-p "bash" base) 'bash)
      ((string-match-p "zsh" base) 'zsh)
-     ((string-match-p "fish" base) 'fish))))
+     ((string-match-p "fish" base) 'fish)
+     ((member base '("nu" "nushell")) 'nu))))
 
 (defun ghostel--local-host-p (host)
   "Return non-nil if HOST refers to the local machine."
@@ -3860,13 +3864,13 @@ element is the program path and the remaining elements are arguments."
 
 (defun ghostel--default-remote-shell-args (program &optional integration)
   "Return default extra args for a remote shell PROGRAM.
-Recognized shells (bash, zsh, fish) start login+interactive (`-l -i') so
-remote sessions source the user's rc/profile files; unrecognized shells
-\(e.g. /bin/sh) get no args.  With INTEGRATION active, bash uses `-i'
-only (a login bash ignores the integration's `--rcfile')."
+Recognized shells (bash, zsh, fish, nushell) start login+interactive
+\(`-l -i') so remote sessions source the user's rc/profile files;
+unrecognized shells \(e.g. /bin/sh) get no args.  With INTEGRATION active,
+bash uses `-i' only (a login bash ignores the integration's `--rcfile')."
   (pcase (ghostel--detect-shell program)
     ('bash (if integration '("-i") '("-l" "-i")))
-    ((or 'zsh 'fish) '("-l" "-i"))
+    ((or 'zsh 'fish 'nu) '("-l" "-i"))
     (_ nil)))
 
 (defun ghostel--resolve-shell-spec ()
@@ -4102,6 +4106,18 @@ Returns nil on failure."
              (list :env nil
                    :args (list "-C" (format "source %s"
                                             (shell-quote-argument path)))
+                   :temp-files (list temp))))
+          ;; Nushell: --execute runs after config (like fish's -C).
+          ;; nushell `source' needs a parse-time-constant path, so the
+          ;; literal remote temp path is embedded in the --execute arg.
+          ('nu
+           (let* ((temp (make-temp-file
+                         (concat remote-prefix "ghostel-") nil ".nu"))
+                  (path (file-remote-p temp 'localname)))
+             (ghostel--write-remote-file temp integration)
+             (list :env nil
+                   :args (list "--execute" (format "source %s"
+                                                   (shell-quote-argument path)))
                    :temp-files (list temp)))))))
         (if tinfo
             (ghostel--merge-integration-plists base tinfo)
@@ -4429,7 +4445,8 @@ run the shell on the remote host."
                             (push (format "GHOSTEL_ZSH_ZDOTDIR=%s" old-zdotdir) env))
                           (push (format "ZDOTDIR=%s" zsh-dir) env)
                           env))))
-                   ('fish
+                   ;; Fish and nushell both auto-load from XDG_DATA_DIRS
+                   ((or 'fish 'nu)
                     (let ((integ-dir (expand-file-name
                                       "etc/shell/bootstrap" ghostel-dir)))
                       (when (file-directory-p integ-dir)

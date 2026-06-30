@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Shell integration now supports **nushell** alongside bash, zsh, and fish.
+  Directory tracking (OSC 7), prompt navigation (OSC 133), and title tracking
+  (OSC 2) come from nushell's built-in `$env.config.shell_integration`; ghostel
+  adds `ghostel_cmd` and the outbound `ssh` terminfo-install wrapper. Works with
+  auto-injection (`ghostel-shell-integration`), manual `source`, and remote
+  TRAMP sessions (`ghostel-tramp-shell-integration`).
+
 ### Fixed
 - `ghostel-keymap-exceptions` now honors `C-g`: adding `"C-g"` to the list leaves
   it unbound in ghostel so it falls through to your global binding (e.g.

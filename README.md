@@ -16,7 +16,7 @@ Ghostel's features include synchronized output, true color, the Kitty keyboard
 and graphics protocols, hyperlinks, desktop notifications, progress reports and a lot more.
 
 Shell integration (directory tracking, prompt navigation) all works out of the
-box for bash, zsh and fish.
+box for bash, zsh, fish and nushell.
 
 Check the [documentation](https://dakra.github.io/ghostel/#features) for a full list of features or how it [compares](https://dakra.github.io/ghostel/#ghostel-vs-vterm) to [vterm](https://github.com/akermu/emacs-libvterm) or [eat](https://codeberg.org/akib/emacs-eat).
 
@@ -120,7 +120,7 @@ If you're an evil user you can install the [evil-ghostel](https://melpa.org/#/ev
 
 ## Shell integration
 
-Directory tracking and prompt navigation are on by default for local bash, zsh or fish sessions.
+Directory tracking and prompt navigation are on by default for local bash, zsh, fish or nushell sessions.
 See [shell integration](https://dakra.github.io/ghostel/#shell-integration) for tramp support and more.
 
 To call Emacs functions from your shell you have to add them to the
