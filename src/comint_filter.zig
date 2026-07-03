@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 
 const gt = @import("ghostty-vt");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const style_face = @import("style_face.zig");
 const parseHexColor = @import("utils.zig").parseHexColor;
 
@@ -38,6 +38,11 @@ const Run = struct {
 
 const Handler = struct {
     alloc: Allocator,
+
+    /// Optional fg/bg defaults for callers that want explicit default-color
+    /// properties instead of inheriting the buffer's default face.
+    default_fg: ?gt.color.RGB = null,
+    default_bg: ?gt.color.RGB = null,
 
     /// 256-color palette (initialised to libghostty's default).
     palette: gt.color.Palette = gt.color.default,
@@ -92,9 +97,9 @@ const Handler = struct {
                 &self.style,
                 &self.palette,
                 self.bold_config,
-            ),
+            ) orelse self.default_fg,
             .bg = switch (self.style.bg_color) {
-                .none => null,
+                .none => self.default_bg,
                 .palette => |idx| self.palette[idx],
                 .rgb => |rgb| rgb,
             },
@@ -321,6 +326,12 @@ pub fn setPalette16(self: *Self, palette16: [16]gt.color.RGB) void {
     for (palette16, 0..) |col, i| self.stream.handler.palette[i] = col;
 }
 
+/// Set explicit default foreground/background colors.
+pub fn setDefaultColors(self: *Self, fg: gt.color.RGB, bg: gt.color.RGB) void {
+    self.stream.handler.default_fg = fg;
+    self.stream.handler.default_bg = bg;
+}
+
 /// Feed bytes; return a propertized Emacs string of everything emitted
 /// during this call.  Persistent style state survives across calls.
 pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
@@ -385,8 +396,12 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
 
 var module_alloc: Allocator = undefined;
 
-pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+pub fn setModuleAllocator(allocator: Allocator) void {
     module_alloc = allocator;
+}
+
+pub fn initModule(allocator: Allocator, env: emacs.Env) void {
+    setModuleAllocator(allocator);
     env.registerFunctions(&emacs_functions);
 }
 
@@ -468,6 +483,29 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                     palette16[idx] = try parseHexColor(colors_str[pos .. pos + 7]);
                 }
                 filter.setPalette16(palette16);
+                return env.t();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--comint-set-default-colors",
+        .arity = .{ 3, 3 },
+        .doc =
+        \\Set default foreground and background on a comint stream filter.
+        \\
+        \\(ghostel--comint-set-default-colors STATE FG-HEX BG-HEX)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const filter = env.getUserPtr(Self, args[0]) orelse return error.InvalidComintFilter;
+                var fg_buf: [16]u8 = undefined;
+                var bg_buf: [16]u8 = undefined;
+                const fg_str = try env.extractString(args[1], &fg_buf);
+                const bg_str = try env.extractString(args[2], &bg_buf);
+                filter.setDefaultColors(
+                    try parseHexColor(fg_str),
+                    try parseHexColor(bg_str),
+                );
                 return env.t();
             }
         },

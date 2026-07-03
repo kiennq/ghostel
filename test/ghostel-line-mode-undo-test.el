@@ -27,7 +27,9 @@ live PTY.  Leaves the buffer in line mode with point at the input."
   (ghostel-test--redraw term t)
   (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
             ((symbol-function 'ghostel--write-pty) #'ignore)
-            ((symbol-function 'ghostel--invalidate) #'ignore))
+            ((symbol-function 'ghostel--invalidate) #'ignore)
+            ((symbol-function 'ghostel--pty-password-input-p)
+             (lambda (&rest _) nil)))
     (ghostel-line-mode)))
 
 ;; 6.1 — typing then undo reverts the in-progress input.
@@ -69,7 +71,9 @@ live PTY.  Leaves the buffer in line mode with point at the input."
                        (lambda (&rest _) nil))
                       ((symbol-function 'ghostel--redraw) #'ignore)
                       ((symbol-function 'ghostel--invalidate) #'ignore)
-                      ((symbol-function 'ghostel--anchor-window) #'ignore))
+                      ((symbol-function 'ghostel--anchor-window) #'ignore)
+                      ((symbol-function 'ghostel--pty-password-input-p)
+                       (lambda (&rest _) nil)))
               (ghostel-line-mode)
               (should (eq ghostel--input-mode 'line))
               ;; Armed: a list, recording on.
@@ -94,7 +98,9 @@ start, so an undo can never delete the prompt or earlier output."
     (ghostel-test--redraw term t)
     (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
               ((symbol-function 'ghostel--write-pty) #'ignore)
-              ((symbol-function 'ghostel--invalidate) #'ignore))
+              ((symbol-function 'ghostel--invalidate) #'ignore)
+              ((symbol-function 'ghostel--pty-password-input-p)
+               (lambda (&rest _) nil)))
       (ghostel-line-mode)
       (should (eq ghostel--input-mode 'line))
       (let* ((input-start (marker-position ghostel--line-input-start))
@@ -142,7 +148,9 @@ correctly against the input's new position."
     ;; prompt is painted.  The renderer rewrites the whole viewport
     ;; (line mode forces full redraws).
     (ghostel--write-vt term "some output\r\n\e]133;A\e\\$ \e]133;B\e\\")
-    (ghostel--redraw-now buf)
+    (cl-letf (((symbol-function 'ghostel--pty-password-input-p)
+               (lambda (&rest _) nil)))
+      (ghostel--redraw-now buf))
     ;; The input survived snapshot/restore.
     (should (equal (ghostel--line-mode-input-text) "foo"))
     ;; Renderer rewrites did not pollute undo.

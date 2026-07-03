@@ -34,10 +34,10 @@ ifeq ($(UNAME),Darwin)
 else
   MODULE := ghostel-module.so
 endif
-ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon symbols.map) \
+ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon) \
                $(wildcard vendor/*.h)
 
-.PHONY: all build test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial html clean regen-terminfo
+.PHONY: all build check test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial html clean regen-terminfo
 
 # Recommended invocation: `make -j$(nproc) all' on Linux,
 # `make -j$(sysctl -n hw.ncpu) all' on macOS.  GNU make 4+ also accepts
@@ -48,6 +48,9 @@ build: $(MODULE)
 
 $(MODULE): $(ZIG_SOURCES)
 	zig build -Doptimize=ReleaseFast -Dcpu=baseline
+
+check:
+	zig build check
 
 test-zig:
 	zig build test
@@ -122,7 +125,7 @@ lint: byte-compile package-lint checkdoc docquotes
 # Provision both into an isolated `package-user-dir'
 # so `make package-lint' runs standalone.
 $(LINT_DEPS_STAMP): $(CORE_PACKAGE_FILE)
-	$(EMACS) --batch $(EMACSFLAGS) -Q \
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp \
 		--eval "(setq package-user-dir \"$(LINT_ELPA_DIR)\")" \
 		--eval "(package-initialize)" \
 		--eval "(package-refresh-contents)" \
@@ -181,7 +184,7 @@ melpazoid-ghostel:
 	@if [ ! -d "$(MELPAZOID_DIR)" ]; then \
 		git clone https://github.com/riscy/melpazoid.git "$(MELPAZOID_DIR)"; \
 	fi
-	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files (:defaults "etc" "src" "vendor" "build.zig" "build.zig.zon" "symbols.map"))' \
+	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files (:defaults "etc" "src" "vendor" "build.zig" "build.zig.zon"))' \
 		LOCAL_REPO=$(CURDIR) \
 		make -C "$(MELPAZOID_DIR)"
 
@@ -243,7 +246,7 @@ public/index.html: README.org $(DOC_DEPS_STAMP)
 		          (org-export-to-file 'html \"public/index.html\"))"
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache .build public
 
