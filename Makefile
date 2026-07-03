@@ -30,25 +30,38 @@ elisp-string-list = $(foreach f,$(1),\"$(f)\")
 # for `build', decide whether tests need to re-run.
 UNAME := $(shell uname)
 ifeq ($(UNAME),Darwin)
-  MODULE := ghostel-module.dylib
+  MODULE_SUFFIX := .dylib
+else ifneq (,$(findstring MINGW,$(UNAME)))
+  MODULE_SUFFIX := .dll
+else ifneq (,$(findstring MSYS,$(UNAME)))
+  MODULE_SUFFIX := .dll
+else ifneq (,$(findstring CYGWIN,$(UNAME)))
+  MODULE_SUFFIX := .dll
 else
-  MODULE := ghostel-module.so
+  MODULE_SUFFIX := .so
 endif
-ZIG_BUILD_FLAGS := --prefix . -Doptimize=ReleaseFast -Dcpu=baseline
-ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon symbols.map) \
+MODULE_DIR := zig-out/bin
+MODULE := $(MODULE_DIR)/ghostel-module$(MODULE_SUFFIX)
+LOADER_MODULE := $(MODULE_DIR)/dyn-loader-module$(MODULE_SUFFIX)
+MODULE_MANIFEST := $(MODULE_DIR)/ghostel-module.json
+NATIVE_MODULE_ARTIFACTS := $(LOADER_MODULE) $(MODULE) $(MODULE_MANIFEST)
+ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon) \
                $(wildcard vendor/*.h)
 
-.PHONY: all build test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial html clean regen-terminfo
+.PHONY: all build check test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial html clean regen-terminfo
 
 # Recommended invocation: `make -j$(nproc) all' on Linux,
 # `make -j$(sysctl -n hw.ncpu) all' on macOS.  GNU make 4+ also accepts
 # bare `-j' (unlimited); pair with `-l$(nproc)' to cap by load.
 all: build test-all test-evil lint
 
-build: $(MODULE)
+build: $(NATIVE_MODULE_ARTIFACTS)
 
-$(MODULE): $(ZIG_SOURCES)
-	zig build $(ZIG_BUILD_FLAGS)
+$(NATIVE_MODULE_ARTIFACTS): $(ZIG_SOURCES)
+	zig build -Doptimize=ReleaseFast -Dcpu=baseline
+
+check:
+	zig build check
 
 test-zig:
 	zig build test
@@ -101,9 +114,10 @@ $(TEST_STAMPS_DIR)/elisp-%.ok: test/%.el test/ghostel-test-helpers.el $(ELC) | $
 		--eval "(ert-run-tests-batch-and-exit '(not (tag native)))"
 	@touch $@
 
-$(TEST_STAMPS_DIR)/native-%.ok: test/%.el test/ghostel-test-helpers.el $(ELC) $(MODULE) | $(TEST_STAMPS_DIR)
+$(TEST_STAMPS_DIR)/native-%.ok: test/%.el test/ghostel-test-helpers.el $(ELC) $(NATIVE_MODULE_ARTIFACTS) | $(TEST_STAMPS_DIR)
 	@printf '  NATIVE  %s\n' $*
 	@$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp -L test \
+		--eval "(setq ghostel-module-directory (expand-file-name \"$(MODULE_DIR)\" default-directory))" \
 		-l ert -l test/ghostel-test-helpers.el -l $< \
 		--eval "(ert-run-tests-batch-and-exit '(tag native))"
 	@touch $@
@@ -123,7 +137,7 @@ lint: byte-compile package-lint checkdoc docquotes
 # Provision both into an isolated `package-user-dir'
 # so `make package-lint' runs standalone.
 $(LINT_DEPS_STAMP): $(CORE_PACKAGE_FILE)
-	$(EMACS) --batch $(EMACSFLAGS) -Q \
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp \
 		--eval "(setq package-user-dir \"$(LINT_ELPA_DIR)\")" \
 		--eval "(package-initialize)" \
 		--eval "(package-refresh-contents)" \
@@ -182,7 +196,7 @@ melpazoid-ghostel:
 	@if [ ! -d "$(MELPAZOID_DIR)" ]; then \
 		git clone https://github.com/riscy/melpazoid.git "$(MELPAZOID_DIR)"; \
 	fi
-	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files (:defaults "etc" "src" "vendor" "build.zig" "build.zig.zon" "symbols.map"))' \
+	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files (:defaults "etc" "src" "vendor" "build.zig" "build.zig.zon"))' \
 		LOCAL_REPO=$(CURDIR) \
 		make -C "$(MELPAZOID_DIR)"
 
@@ -244,7 +258,7 @@ public/index.html: README.org $(DOC_DEPS_STAMP)
 		          (org-export-to-file 'html \"public/index.html\"))"
 
 clean:
-	rm -f ghostel-module.dylib ghostel-module.so ghostel-module.version
+	rm -f ghostel-module.dll ghostel-module.dylib ghostel-module.so
 	rm -f $(ELC)
 	rm -rf zig-out .zig-cache .build public
 
