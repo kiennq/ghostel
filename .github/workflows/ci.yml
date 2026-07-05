@@ -164,6 +164,10 @@ jobs:
             platform: x86_64-windows
             suffix: .dll
             target: x86_64-windows-gnu
+          - os: windows-latest
+            platform: aarch64-windows
+            suffix: .dll
+            target: aarch64-windows-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -196,6 +200,7 @@ jobs:
           name: ghostel-module-${{ matrix.platform }}
           path: |
             zig-out/bin/*${{ matrix.suffix }}
+            zig-out/bin/*.pdb
             zig-out/bin/*.json
             zig-out/bin/*.version
 
@@ -288,9 +293,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ghostel-module-x86_64-linux
-
-      - name: Mark pre-built module as up-to-date
-        run: touch ghostel-module.so
+          path: zig-out/bin
 
       - name: Install compat
         run: git clone --depth 1 https://github.com/emacs-compat/compat.git /tmp/compat

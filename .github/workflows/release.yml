@@ -157,6 +157,7 @@ jobs:
           fi
 
       - name: Strip non-exported symbols
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           for f in zig-out/bin/*-module${{ matrix.suffix }}; do
@@ -170,11 +171,12 @@ jobs:
             dyn-loader-module${{ matrix.suffix }}
             ghostel-module${{ matrix.suffix }}
             ghostel-module.json
-            ghostel-module.version
           )
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            files+=(conpty-module${{ matrix.suffix }})
-            files+=(conpty-module.json)
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            files+=(
+              dyn-loader-module.pdb
+              ghostel-module.pdb
+            )
           fi
           tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
