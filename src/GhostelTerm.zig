@@ -68,7 +68,6 @@ pub fn init(alloc: Allocator, env: emacs.Env, cols: u16, rows: u16, max_scrollba
 pub fn deinit(self: *Self) void {
     if (self.process) |process| {
         process.deinit();
-        self.alloc.destroy(process);
     }
 
     self.renderer.deinit();
@@ -288,20 +287,19 @@ pub fn spawnNativeProcess(
         event_fd,
     );
     self.process = process;
-    return process.backend.pidValue();
+    return process.pidValue();
 }
 
 pub fn killNativeProcess(self: *Self) void {
     if (self.process) |process| {
         process.deinit();
-        self.alloc.destroy(process);
         self.process = null;
     }
 }
 
 pub fn isProcessLive(self: *Self) bool {
     if (self.process) |process| {
-        return process.isBackendAlive();
+        return process.isRunning();
     } else if (emacs.current_env) |env| {
         return self.emacsProcessMaybeLive() and
             env.isNotNil(env.symbolValue("ghostel--process"));

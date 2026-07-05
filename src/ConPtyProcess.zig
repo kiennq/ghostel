@@ -13,22 +13,16 @@ const ResizePseudoConsoleFn = *const fn (HPCON, c.COORD) callconv(.winapi) c.HRE
 const ClosePseudoConsoleFn = *const fn (HPCON) callconv(.winapi) void;
 
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
-const READ_BUFFER_SIZE = 64 * 1024;
+const READ_BUFFER_SIZE = 4096;
 
-// Kept separate from Self because NativeProcess hands this backend by value to
-// a detached reaper thread.
-const State = struct {
-    alloc: Allocator,
-    hpc: HPCON = null,
-    pty_input: c.HANDLE = c.INVALID_HANDLE_VALUE,
-    pty_output: c.HANDLE = c.INVALID_HANDLE_VALUE,
-    output_read_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
-    shell_process: c.HANDLE = c.INVALID_HANDLE_VALUE,
-    running: std.atomic.Value(bool) = .init(true),
-    pid: i64 = -1,
-};
-
-state: *State,
+hpc: HPCON = null,
+pty_input: c.HANDLE = c.INVALID_HANDLE_VALUE,
+pty_output: c.HANDLE = c.INVALID_HANDLE_VALUE,
+command_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
+output_read_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
+shell_process: c.HANDLE = c.INVALID_HANDLE_VALUE,
+running: std.atomic.Value(bool) = .init(true),
+pid: i64 = -1,
 
 var create_pseudo_console: ?CreatePseudoConsoleFn = null;
 var resize_pseudo_console: ?ResizePseudoConsoleFn = null;
@@ -181,131 +175,132 @@ pub const EventWriter = struct {
 pub fn init(alloc: Allocator, initial_cols: u16, initial_rows: u16, params: ProcessParams) !Self {
     try initApi();
 
-    const state = try alloc.create(State);
-    errdefer alloc.destroy(state);
-    state.* = .{ .alloc = alloc };
+    var self: Self = .{};
+    self.command_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
+    if (self.command_event == null) return error.CreateEventFailed;
+    errdefer self.closeConPtyHandles();
+    self.output_read_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
+    if (self.output_read_event == null) return error.CreateEventFailed;
+    try self.createConPty(initial_rows, initial_cols);
+    try self.spawnChild(alloc, params);
 
-    state.output_read_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
-    if (state.output_read_event == null) {
-        state.output_read_event = c.INVALID_HANDLE_VALUE;
-        return error.CreateEventFailed;
-    }
-    errdefer closeConPtyHandles(state);
-    try createConPty(state, initial_rows, initial_cols);
-    try spawnChild(state, params);
-
-    return .{ .state = state };
+    return self;
 }
 
 pub fn pidValue(self: *const Self) i64 {
-    return self.state.pid;
+    return self.pid;
 }
 
-pub fn drain(self: *Self, stream: anytype) !bool {
-    var drained = false;
+pub fn drain(
+    self: *Self,
+    stream: anytype,
+) !bool {
     var buf: [READ_BUFFER_SIZE]u8 = undefined;
 
-    while (self.state.running.load(.acquire)) {
-        switch (try readOutput(self.state, stream, buf[0..], !drained)) {
-            .output => drained = true,
-            .would_block => return true,
+    while (self.running.load(.acquire)) {
+        switch (try self.readOutput(stream, buf[0..])) {
+            .output, .command => return false,
             .eof => {
-                stopRunning(self.state);
-                return drained;
+                self.stopRunning();
+                return true;
             },
         }
     }
 
-    return drained;
+    return true;
 }
 
 const ReadOutputResult = enum {
     output,
     eof,
-    would_block,
+    command,
 };
 
 fn readOutput(
-    state: *State,
+    self: *Self,
     stream: anytype,
     buf: []u8,
-    wait: bool,
 ) !ReadOutputResult {
-    if (state.pty_output == c.INVALID_HANDLE_VALUE) return .eof;
-    if (state.output_read_event == c.INVALID_HANDLE_VALUE) return error.ReadFailed;
+    if (self.pty_output == c.INVALID_HANDLE_VALUE) return .eof;
+    if (self.output_read_event == c.INVALID_HANDLE_VALUE) return error.ReadFailed;
 
-    _ = c.ResetEvent(state.output_read_event);
+    _ = c.ResetEvent(self.output_read_event);
 
     var overlapped = std.mem.zeroes(c.OVERLAPPED);
-    overlapped.hEvent = state.output_read_event;
+    overlapped.hEvent = self.output_read_event;
 
     var bytes_read: c.DWORD = 0;
     if (c.ReadFile(
-        state.pty_output,
+        self.pty_output,
         buf.ptr,
         @intCast(buf.len),
         &bytes_read,
         &overlapped,
     ) != 0) {
-        return finishRead(stream, buf, bytes_read);
+        return self.finishRead(stream, buf, bytes_read);
     }
 
     switch (c.GetLastError()) {
         c.ERROR_IO_PENDING => {},
-        c.ERROR_OPERATION_ABORTED, c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .eof,
+        c.ERROR_OPERATION_ABORTED => return .command,
+        c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .eof,
         else => return error.ReadFailed,
     }
 
-    if (!wait) return cancelPendingRead(state, stream, buf, &overlapped);
-
     var include_process = true;
     while (true) {
-        switch (try waitForReadOrProcess(state, include_process)) {
-            .read => return finishOverlappedRead(state, stream, buf, &overlapped),
+        switch (try self.waitForReadOrCommand(include_process)) {
+            .read => return self.finishOverlappedRead(stream, buf, &overlapped),
+            .command => {
+                self.clearCommandEvent();
+                return self.cancelPendingRead(stream, buf, &overlapped);
+            },
             .process => {
-                closePseudoConsole(state);
+                self.closePseudoConsole();
                 include_process = false;
             },
         }
     }
 }
 
-fn finishRead(stream: anytype, buf: []u8, bytes_read: c.DWORD) ReadOutputResult {
+fn finishRead(self: *Self, stream: anytype, buf: []u8, bytes_read: c.DWORD) ReadOutputResult {
+    _ = self;
     if (bytes_read == 0) return .eof;
     stream.nextSlice(buf[0..@as(usize, @intCast(bytes_read))]);
     return .output;
 }
 
 fn finishOverlappedRead(
-    state: *State,
+    self: *Self,
     stream: anytype,
     buf: []u8,
     overlapped: *c.OVERLAPPED,
 ) !ReadOutputResult {
     var bytes_read: c.DWORD = 0;
     if (c.GetOverlappedResult(
-        state.pty_output,
+        self.pty_output,
         overlapped,
         &bytes_read,
         c.FALSE,
     ) == 0) {
         const err = c.GetLastError();
         switch (err) {
-            c.ERROR_OPERATION_ABORTED, c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .eof,
+            c.ERROR_OPERATION_ABORTED => return .command,
+            c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .eof,
             else => return error.ReadFailed,
         }
     }
 
-    return finishRead(stream, buf, bytes_read);
+    return self.finishRead(stream, buf, bytes_read);
 }
 
 fn cancelPendingRead(
-    state: *State,
+    self: *Self,
     stream: anytype,
     buf: []u8,
     overlapped: *c.OVERLAPPED,
 ) !ReadOutputResult {
-    if (c.CancelIoEx(state.pty_output, overlapped) == 0) {
+    if (c.CancelIoEx(self.pty_output, overlapped) == 0) {
         const err = c.GetLastError();
         switch (err) {
             c.ERROR_NOT_FOUND => {},
@@ -316,40 +311,47 @@ fn cancelPendingRead(
 
     var bytes_read: c.DWORD = 0;
     if (c.GetOverlappedResult(
-        state.pty_output,
+        self.pty_output,
         overlapped,
         &bytes_read,
         c.TRUE,
     ) == 0) {
         const err = c.GetLastError();
         switch (err) {
-            c.ERROR_OPERATION_ABORTED => return .would_block,
+            c.ERROR_OPERATION_ABORTED => return .command,
             c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .eof,
             else => return error.ReadFailed,
         }
     }
 
-    return finishRead(stream, buf, bytes_read);
+    return self.finishRead(stream, buf, bytes_read);
 }
 
 const WaitResult = enum {
     read,
     process,
+    command,
 };
 
-fn waitForReadOrProcess(state: *State, include_process: bool) !WaitResult {
-    var handles: [2]c.HANDLE = undefined;
+fn waitForReadOrCommand(self: *Self, include_process: bool) !WaitResult {
+    var handles: [3]c.HANDLE = undefined;
     var count: c.DWORD = 0;
     const read_index = count;
-    handles[count] = state.output_read_event;
+    handles[count] = self.output_read_event;
     count += 1;
 
     var process_index: ?c.DWORD = null;
-    if (include_process and state.shell_process != c.INVALID_HANDLE_VALUE) {
+    var command_index: c.DWORD = undefined;
+
+    if (include_process and self.shell_process != c.INVALID_HANDLE_VALUE) {
         process_index = count;
-        handles[count] = state.shell_process;
+        handles[count] = self.shell_process;
         count += 1;
     }
+
+    command_index = count;
+    handles[count] = self.command_event;
+    count += 1;
 
     const result = c.WaitForMultipleObjects(count, &handles, c.FALSE, c.INFINITE);
     if (result < c.WAIT_OBJECT_0 or result >= c.WAIT_OBJECT_0 + count) return error.WaitFailed;
@@ -357,18 +359,27 @@ fn waitForReadOrProcess(state: *State, include_process: bool) !WaitResult {
     const index = result - c.WAIT_OBJECT_0;
     if (index == read_index) return .read;
     if (process_index != null and index == process_index.?) return .process;
+    if (index == command_index) return .command;
     return error.WaitFailed;
 }
 
-pub fn write(self: *Self, data: []const u8) !void {
+pub fn write(
+    self: *Self,
+    data: []const u8,
+    quit: *std.atomic.Value(bool),
+) !void {
     if (data.len == 0) return;
-    if (self.state.pty_input == c.INVALID_HANDLE_VALUE) return error.WriteFailed;
+    if (self.pty_input == c.INVALID_HANDLE_VALUE) return error.WriteFailed;
 
     var offset: usize = 0;
     while (offset < data.len) {
         var wrote: c.DWORD = 0;
         const chunk_len: c.DWORD = @intCast(@min(data.len - offset, std.math.maxInt(c.DWORD)));
-        if (c.WriteFile(self.state.pty_input, data[offset..].ptr, chunk_len, &wrote, null) == 0) {
+        if (c.WriteFile(self.pty_input, data[offset..].ptr, chunk_len, &wrote, null) == 0) {
+            if (c.GetLastError() == c.ERROR_OPERATION_ABORTED) {
+                return error.CommandInterrupted;
+            }
+            if (quit.load(.monotonic)) return error.CommandInterrupted;
             return error.WriteFailed;
         }
         if (wrote == 0) return error.WriteFailed;
@@ -376,9 +387,36 @@ pub fn write(self: *Self, data: []const u8) !void {
     }
 }
 
+pub fn wake(self: *Self) void {
+    self.wakeRaw();
+}
+
+fn wakeRaw(self: *Self) void {
+    if (self.command_event == c.INVALID_HANDLE_VALUE) return;
+    _ = c.SetEvent(self.command_event);
+}
+
+pub fn interrupt(self: *Self, read_thread: std.Thread) void {
+    self.wake();
+    _ = c.CancelSynchronousIo(read_thread.getHandle());
+}
+
+pub fn takeForReaper(self: *Self) Self {
+    const backend = self.*;
+    self.hpc = null;
+    self.pty_input = c.INVALID_HANDLE_VALUE;
+    self.pty_output = c.INVALID_HANDLE_VALUE;
+    self.command_event = c.INVALID_HANDLE_VALUE;
+    self.output_read_event = c.INVALID_HANDLE_VALUE;
+    self.shell_process = c.INVALID_HANDLE_VALUE;
+    self.running.store(false, .release);
+    self.pid = -1;
+    return backend;
+}
+
 pub fn resize(self: *Self, cols: u16, rows: u16) !void {
-    if (!self.state.running.load(.acquire)) return error.PtyResizeFailed;
-    const hpc = self.state.hpc orelse return error.PtyResizeFailed;
+    if (!self.running.load(.acquire)) return error.PtyResizeFailed;
+    const hpc = self.hpc orelse return error.PtyResizeFailed;
     const size = c.COORD{
         .X = @intCast(cols),
         .Y = @intCast(rows),
@@ -386,38 +424,22 @@ pub fn resize(self: *Self, cols: u16, rows: u16) !void {
     if (resize_pseudo_console.?(hpc, size) < 0) return error.PtyResizeFailed;
 }
 
-pub fn requestStop(self: *Self, read_thread: std.Thread) void {
-    stopRunning(self.state);
-
-    if (self.state.pty_input != c.INVALID_HANDLE_VALUE) {
-        _ = c.CloseHandle(self.state.pty_input);
-        self.state.pty_input = c.INVALID_HANDLE_VALUE;
-    }
-
-    if (self.state.pty_output != c.INVALID_HANDLE_VALUE) {
-        _ = c.CancelIoEx(self.state.pty_output, null);
-    }
-    _ = c.CancelSynchronousIo(read_thread.getHandle());
-}
-
 pub fn replicaName(_: *Self) []const u8 {
     return "";
 }
 
 pub fn deinitAndWait(self: *Self) u8 {
-    const state = self.state;
-    stopRunning(state);
-    closeConPtyHandles(state);
+    self.stopRunning();
+    self.closeConPtyHandles();
 
     var exit_code: c.DWORD = 0;
-    if (state.shell_process != c.INVALID_HANDLE_VALUE) {
-        _ = c.WaitForSingleObject(state.shell_process, c.INFINITE);
-        _ = c.GetExitCodeProcess(state.shell_process, &exit_code);
-        _ = c.CloseHandle(state.shell_process);
+    if (self.shell_process != c.INVALID_HANDLE_VALUE) {
+        _ = c.WaitForSingleObject(self.shell_process, c.INFINITE);
+        _ = c.GetExitCodeProcess(self.shell_process, &exit_code);
+        _ = c.CloseHandle(self.shell_process);
+        self.shell_process = c.INVALID_HANDLE_VALUE;
     }
 
-    const alloc = state.alloc;
-    alloc.destroy(state);
     return @truncate(exit_code);
 }
 
@@ -430,13 +452,13 @@ fn initApi() !void {
     close_pseudo_console = @ptrCast(c.GetProcAddress(kernel32, "ClosePseudoConsole") orelse return error.MissingConPty);
 }
 
-fn createConPty(state: *State, rows: u16, cols: u16) !void {
+fn createConPty(self: *Self, rows: u16, cols: u16) !void {
     var in_read: c.HANDLE = c.INVALID_HANDLE_VALUE;
     var in_write: c.HANDLE = c.INVALID_HANDLE_VALUE;
     var out_read: c.HANDLE = c.INVALID_HANDLE_VALUE;
     var out_write: c.HANDLE = c.INVALID_HANDLE_VALUE;
     errdefer {
-        closeConPtyHandles(state);
+        self.closeConPtyHandles();
         if (in_read != c.INVALID_HANDLE_VALUE) _ = c.CloseHandle(in_read);
         if (in_write != c.INVALID_HANDLE_VALUE) _ = c.CloseHandle(in_write);
         if (out_read != c.INVALID_HANDLE_VALUE) _ = c.CloseHandle(out_read);
@@ -454,12 +476,12 @@ fn createConPty(state: *State, rows: u16, cols: u16) !void {
         .X = @intCast(cols),
         .Y = @intCast(rows),
     };
-    if (create_pseudo_console.?(size, in_read, out_write, 0, &state.hpc) < 0) {
+    if (create_pseudo_console.?(size, in_read, out_write, 0, &self.hpc) < 0) {
         return error.CreatePseudoConsoleFailed;
     }
 
-    state.pty_input = in_write;
-    state.pty_output = out_read;
+    self.pty_input = in_write;
+    self.pty_output = out_read;
     _ = c.CloseHandle(in_read);
     _ = c.CloseHandle(out_write);
     in_write = c.INVALID_HANDLE_VALUE;
@@ -468,31 +490,40 @@ fn createConPty(state: *State, rows: u16, cols: u16) !void {
     out_write = c.INVALID_HANDLE_VALUE;
 }
 
-fn closeConPtyHandles(state: *State) void {
-    if (state.pty_input != c.INVALID_HANDLE_VALUE) {
-        _ = c.CloseHandle(state.pty_input);
-        state.pty_input = c.INVALID_HANDLE_VALUE;
+fn closeConPtyHandles(self: *Self) void {
+    if (self.pty_input != c.INVALID_HANDLE_VALUE) {
+        _ = c.CloseHandle(self.pty_input);
+        self.pty_input = c.INVALID_HANDLE_VALUE;
     }
-    if (state.pty_output != c.INVALID_HANDLE_VALUE) {
-        _ = c.CloseHandle(state.pty_output);
-        state.pty_output = c.INVALID_HANDLE_VALUE;
+    if (self.pty_output != c.INVALID_HANDLE_VALUE) {
+        _ = c.CloseHandle(self.pty_output);
+        self.pty_output = c.INVALID_HANDLE_VALUE;
     }
-    if (state.hpc != null) {
+    if (self.hpc != null) {
         // ClosePseudoConsole owns the documented ConPTY teardown path.
-        close_pseudo_console.?(state.hpc);
-        state.hpc = null;
+        close_pseudo_console.?(self.hpc);
+        self.hpc = null;
     }
-    if (state.output_read_event != c.INVALID_HANDLE_VALUE and state.output_read_event != null) {
-        _ = c.CloseHandle(state.output_read_event);
-        state.output_read_event = c.INVALID_HANDLE_VALUE;
+    if (self.command_event != c.INVALID_HANDLE_VALUE) {
+        _ = c.CloseHandle(self.command_event);
+        self.command_event = c.INVALID_HANDLE_VALUE;
+    }
+    if (self.output_read_event != c.INVALID_HANDLE_VALUE) {
+        _ = c.CloseHandle(self.output_read_event);
+        self.output_read_event = c.INVALID_HANDLE_VALUE;
     }
 }
 
-fn closePseudoConsole(state: *State) void {
-    if (state.hpc != null) {
-        close_pseudo_console.?(state.hpc);
-        state.hpc = null;
+fn closePseudoConsole(self: *Self) void {
+    if (self.hpc != null) {
+        close_pseudo_console.?(self.hpc);
+        self.hpc = null;
     }
+}
+
+fn clearCommandEvent(self: *Self) void {
+    if (self.command_event == c.INVALID_HANDLE_VALUE) return;
+    _ = c.ResetEvent(self.command_event);
 }
 
 fn createOverlappedPipe(read_handle: *c.HANDLE, write_handle: *c.HANDLE) !void {
@@ -546,8 +577,8 @@ fn createOverlappedPipe(read_handle: *c.HANDLE, write_handle: *c.HANDLE) !void {
     if (write_handle.* == c.INVALID_HANDLE_VALUE) return error.CreatePipeFailed;
 }
 
-fn spawnChild(state: *State, params: ProcessParams) !void {
-    var arena_allocator = std.heap.ArenaAllocator.init(state.alloc);
+fn spawnChild(self: *Self, alloc: Allocator, params: ProcessParams) !void {
+    var arena_allocator = std.heap.ArenaAllocator.init(alloc);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
@@ -574,7 +605,7 @@ fn spawnChild(state: *State, params: ProcessParams) !void {
         si.lpAttributeList,
         0,
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        state.hpc,
+        self.hpc,
         @sizeOf(HPCON),
         null,
         null,
@@ -599,8 +630,8 @@ fn spawnChild(state: *State, params: ProcessParams) !void {
         return error.CreateProcessFailed;
     }
 
-    state.shell_process = pi.hProcess;
-    state.pid = @intCast(pi.dwProcessId);
+    self.shell_process = pi.hProcess;
+    self.pid = @intCast(pi.dwProcessId);
     _ = c.CloseHandle(pi.hThread);
 }
 
@@ -709,8 +740,8 @@ fn appendWtf8AsWtf16(builder: *std.ArrayList(u16), arena: Allocator, value: []co
     std.debug.assert(written == len);
 }
 
-fn stopRunning(state: *State) void {
-    state.running.store(false, .release);
+fn stopRunning(self: *Self) void {
+    self.running.store(false, .release);
 }
 
 test "notify CRT provider follows the CRT that owns Emacs dup" {
@@ -778,6 +809,57 @@ test "EnvMap keeps environment names unique on Windows" {
 
     try std.testing.expectEqual(@as(std.process.EnvMap.Size, 1), env.count());
     try std.testing.expectEqualStrings("second", env.get("path").?);
+}
+
+test "backend owns handles directly" {
+    try std.testing.expect(!@hasField(Self, "state"));
+    inline for (std.meta.fields(Self)) |field| {
+        try std.testing.expect(!std.mem.endsWith(u8, field.name, "mutex"));
+    }
+}
+
+test "backend uses interrupt without access guard" {
+    try std.testing.expect(@hasDecl(Self, "interrupt"));
+}
+
+test "backend hands handles to reaper once" {
+    const fake_hpc: HPCON = @ptrFromInt(0x1234);
+    const fake_handle: c.HANDLE = @ptrFromInt(0x5678);
+    var process = Self{
+        .hpc = fake_hpc,
+        .pty_input = fake_handle,
+        .pty_output = fake_handle,
+        .command_event = fake_handle,
+        .output_read_event = fake_handle,
+        .shell_process = fake_handle,
+        .pid = 42,
+    };
+
+    const backend = process.takeForReaper();
+    try std.testing.expect(process.hpc == null);
+    try std.testing.expect(process.pty_input == c.INVALID_HANDLE_VALUE);
+    try std.testing.expect(process.pty_output == c.INVALID_HANDLE_VALUE);
+    try std.testing.expect(process.command_event == c.INVALID_HANDLE_VALUE);
+    try std.testing.expect(process.output_read_event == c.INVALID_HANDLE_VALUE);
+    try std.testing.expect(process.shell_process == c.INVALID_HANDLE_VALUE);
+    try std.testing.expectEqual(@as(i64, -1), process.pid);
+    try std.testing.expect(backend.hpc == fake_hpc);
+    try std.testing.expect(backend.pty_input == fake_handle);
+    try std.testing.expect(backend.pty_output == fake_handle);
+    try std.testing.expect(backend.command_event == fake_handle);
+    try std.testing.expect(backend.output_read_event == fake_handle);
+    try std.testing.expect(backend.shell_process == fake_handle);
+    try std.testing.expectEqual(@as(i64, 42), backend.pid);
+}
+
+test "source backend wake is ignored after handle handoff" {
+    const fake_handle: c.HANDLE = @ptrFromInt(0x5678);
+    var process = Self{ .command_event = fake_handle };
+    const backend = process.takeForReaper();
+    process.wake();
+
+    try std.testing.expect(process.command_event == c.INVALID_HANDLE_VALUE);
+    try std.testing.expect(backend.command_event == fake_handle);
 }
 
 test "output pipe supports overlapped read completion" {
