@@ -8,5 +8,9 @@
             .url = "https://github.com/ghostty-org/ghostty/archive/c41c6b81a4642ccba18d47b375d9495664de72a0.tar.gz",
             .hash = "ghostty-1.3.2-dev-5UdBCyCeGgX3-erS43WT4wCWWnD-tw_VpVdir5iihnMk",
         },
+        .emacs_util_mods = .{
+            .url = "https://github.com/kiennq/emacs-util-mods/archive/85665639b2fb9971b8b627a7bd143665e21de037.tar.gz",
+            .hash = "N-V-__8AAP0KAwDYdw7tciftVDNXREAO-H-zoJ0kTt6yI9it",
+        },
     },
 }

@@ -18,6 +18,81 @@
   "Record ARGS for native process event-filter tests."
   (push args ghostel-test-native-process--events))
 
+(ert-deftest ghostel-test-spawn-process-suppresses-built-in-process-resize ()
+  "`ghostel--spawn-process' leaves resizing to `ghostel--adjust-size'."
+  (let ((pipe nil))
+    (unwind-protect
+        (ghostel-test--without-subr-trampolines
+          (cl-letf (((symbol-function 'ghostel--resolve-local-executable)
+                     #'identity)
+                    ((symbol-function 'ghostel--spawn-via-native)
+                     (lambda (&rest _)
+                       (setq pipe (make-pipe-process
+                                   :name "ghostel-native-process"
+                                   :buffer (current-buffer)
+                                   :noquery t))))
+                    ((symbol-function 'signal-process)
+                     #'ignore)
+                    ((symbol-function 'ghostel--kill-native-process)
+                     #'ignore))
+            (with-temp-buffer
+              (let ((ghostel-use-native-pty t)
+                    (system-type 'gnu/linux))
+                (let ((process (ghostel--spawn-process
+                                "sh" nil 24 80 "-ixon" nil)))
+                  (should (eq pipe process)))
+                (should (process-live-p pipe))
+                (should (eq (process-get pipe 'adjust-window-size-function)
+                            #'ignore))))))
+      (when (and pipe (process-live-p pipe))
+        (set-process-sentinel pipe #'ignore)
+        (delete-process pipe)))))
+
+(ert-deftest ghostel-test-spawn-via-native-marks-event-pipe ()
+  "`ghostel--spawn-via-native' marks its event pipe as native PTY transport."
+  (let ((pipe nil))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((ghostel--term 'fake-term)
+                (ghostel--pid nil))
+            (cl-letf (((symbol-function 'ghostel--spawn-native-process)
+                       (lambda (_term _command process)
+                         (setq pipe process)
+                         1234))
+                      ((symbol-function 'signal-process)
+                       #'ignore)
+                      ((symbol-function 'ghostel--kill-native-process)
+                       #'ignore))
+              (let ((process (ghostel--spawn-via-native '("cmd.exe"))))
+                (should (eq process pipe))
+                (should (process-get process 'ghostel-native-pty))
+                (should (equal ghostel--pid 1234))))))
+      (when (and pipe (process-live-p pipe))
+        (set-process-sentinel pipe #'ignore)
+        (delete-process pipe)))))
+
+(ert-deftest ghostel-test-process-set-window-size-skips-native-pipe ()
+  "`ghostel--process-set-window-size' does not resize native event pipes."
+  (let ((pipe nil)
+        (resize-args nil))
+    (unwind-protect
+        (progn
+          (setq pipe (make-pipe-process
+                      :name "ghostel-native-process"
+                      :buffer (current-buffer)
+                      :noquery t))
+          (cl-letf (((symbol-function 'set-process-window-size)
+                     (lambda (&rest args)
+                       (setq resize-args args))))
+            (process-put pipe 'ghostel-native-pty t)
+            (ghostel--process-set-window-size pipe 25 80)
+            (should-not resize-args)
+            (process-put pipe 'ghostel-native-pty nil)
+            (ghostel--process-set-window-size pipe 24 100)
+            (should (equal (list pipe 24 100) resize-args))))
+      (when (and pipe (process-live-p pipe))
+        (delete-process pipe)))))
+
 (defun ghostel-test-native-process--with-events-filter (fn)
   "Call FN in a buffer-local `ghostel--events-filter' unit-test context.
 FN receives a fake pipe process value and a zero-argument function
@@ -40,6 +115,8 @@ returning the number of redraw invalidations requested."
   "Spawn ENV-PROGRAM through the native primitive and return its output.
 SPAWN-WRAPPER, when non-nil, is called with the zero-argument spawn
 function and should call it under any dynamic bindings needed by the test."
+  (when (and (eq system-type 'windows-nt) noninteractive)
+    (ert-skip "Windows native PTY output tests require interactive Emacs"))
   (ghostel-test--with-terminal-buffer (buf _term 200 32767 2000000)
     (let ((pipe (make-pipe-process
                  :name "ghostel-native-env-test"
@@ -63,6 +140,21 @@ function and should call it under any dynamic bindings needed by the test."
         (ignore-errors (ghostel--kill-native-process ghostel--term))
         (when (process-live-p pipe)
           (delete-process pipe))))))
+
+(defun ghostel-test-native-process--env-test-directory ()
+  "Return an existing directory for native environment tests."
+  (if (eq system-type 'windows-nt)
+      temporary-file-directory
+    "/tmp/"))
+
+(defun ghostel-test-native-process--env-test-path (env-program)
+  "Return a PATH that lets ENV-PROGRAM and its runtime dependencies start."
+  (if (eq system-type 'windows-nt)
+      (mapconcat #'identity
+                 (delq nil (list (file-name-directory env-program)
+                                 (getenv "PATH")))
+                 path-separator)
+    "/usr/bin:/bin"))
 
 (ert-deftest ghostel-test-events-filter-multiple-events-per-chunk ()
   "Native process event filter evaluates multiple events in one chunk."
@@ -137,8 +229,13 @@ must not leave `ghostel--event-buf' in a poisoned state."
   :tags '(native)
   (let ((env-program (executable-find "env")))
     (skip-unless env-program)
-    (let* ((process-environment '("DISPLAY_FOO=1" "PATH=/usr/bin:/bin" "HOME=/tmp"))
-           (default-directory "/tmp/")
+    (let* ((test-dir (ghostel-test-native-process--env-test-directory))
+           (process-environment
+            (list "DISPLAY_FOO=1"
+                  (format "PATH=%s"
+                          (ghostel-test-native-process--env-test-path env-program))
+                  (format "HOME=%s" test-dir)))
+           (default-directory test-dir)
            (text (ghostel-test-native-process--env-output
                   env-program
                   (lambda (spawn)
@@ -156,8 +253,12 @@ must not leave `ghostel--event-buf' in a poisoned state."
   :tags '(native)
   (let ((env-program (executable-find "env")))
     (skip-unless env-program)
-    (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
-           (default-directory "/tmp/")
+    (let* ((test-dir (ghostel-test-native-process--env-test-directory))
+           (process-environment
+            (list (format "PATH=%s"
+                          (ghostel-test-native-process--env-test-path env-program))
+                  (format "HOME=%s" test-dir)))
+           (default-directory test-dir)
            (text (ghostel-test-native-process--env-output
                   env-program
                   (lambda (spawn)
@@ -174,13 +275,16 @@ must not leave `ghostel--event-buf' in a poisoned state."
   :tags '(native)
   (let ((env-program (executable-find "env")))
     (skip-unless env-program)
-    (let* ((process-environment '("GHOSTEL_ENV_TEST_UNSET"
-                                  "GHOSTEL_ENV_TEST_UNSET=later"
-                                  "GHOSTEL_ENV_TEST_DUP=first"
-                                  "GHOSTEL_ENV_TEST_DUP=later"
-                                  "PATH=/usr/bin:/bin"
-                                  "HOME=/tmp"))
-           (default-directory "/tmp/")
+    (let* ((test-dir (ghostel-test-native-process--env-test-directory))
+           (process-environment
+            (list "GHOSTEL_ENV_TEST_UNSET"
+                  "GHOSTEL_ENV_TEST_UNSET=later"
+                  "GHOSTEL_ENV_TEST_DUP=first"
+                  "GHOSTEL_ENV_TEST_DUP=later"
+                  (format "PATH=%s"
+                          (ghostel-test-native-process--env-test-path env-program))
+                  (format "HOME=%s" test-dir)))
+           (default-directory test-dir)
            (text (ghostel-test-native-process--env-output env-program)))
       (should-not (ghostel-test--terminal-text-line-prefix-p
                    "GHOSTEL_ENV_TEST_UNSET=" text))
@@ -194,8 +298,13 @@ must not leave `ghostel--event-buf' in a poisoned state."
   :tags '(native)
   (let ((env-program (executable-find "env")))
     (skip-unless env-program)
-    (let* ((process-environment '("DISPLAY" "PATH=/usr/bin:/bin" "HOME=/tmp"))
-           (default-directory "/tmp/")
+    (let* ((test-dir (ghostel-test-native-process--env-test-directory))
+           (process-environment
+            (list "DISPLAY"
+                  (format "PATH=%s"
+                          (ghostel-test-native-process--env-test-path env-program))
+                  (format "HOME=%s" test-dir)))
+           (default-directory test-dir)
            (text (ghostel-test-native-process--env-output
                   env-program
                   (lambda (spawn)
