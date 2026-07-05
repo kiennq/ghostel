@@ -8,7 +8,7 @@ const gt = @import("ghostty-vt");
 const GhostelTerm = @import("GhostelTerm.zig");
 const GlyphMetricsCache = @import("GlyphMetricsCache.zig");
 const SavedBufferMarkers = @import("saved_markers.zig").SavedBufferMarkers;
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const utils = @import("utils.zig");
 
 const style_face = @import("style_face.zig");
@@ -200,6 +200,15 @@ fn invalidate(self: *Self, env: emacs.Env) !void {
     }
 }
 
+pub fn redrawFullScrollback(self: *Self, env: emacs.Env) !i64 {
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const viewport_line = scrollbar.offset + 1;
+    self.term.scrollViewport(.top);
+    try self.redraw(env, true);
+    return @intCast(viewport_line);
+}
+
+/// Read the default font and rendering parameters from Emacs.
 fn updateFontInfo(self: *Self, env: emacs.Env) !void {
     const new_font = getDefaultFont(env);
     const current_font = env.symbolValue("ghostel--rendered-font");
@@ -272,6 +281,7 @@ fn probeCoverage(env: emacs.Env, font: emacs.Value) u32 {
     const max_probe: u32 = 0x300;
     for (start_probe..max_probe) |x| {
         const has_char = env.isNotNil(env.f("font-has-char-p", .{ font, x }));
+
         if (!has_char) return @intCast(x);
     }
 
@@ -403,6 +413,118 @@ fn getFace(
         )
     else
         null;
+}
+
+pub const CursorPosition = struct {
+    x: u16,
+    y: u16,
+};
+
+fn restoreViewport(term: *gt.Terminal, offset: usize) void {
+    term.scrollViewport(.top);
+    term.scrollViewport(.{ .delta = @intCast(offset) });
+}
+
+fn cursorPinAtBottom(self: *Self) ?gt.Pin {
+    self.term.scrollViewport(.bottom);
+    return self.term.screens.active.cursor.page_pin.*;
+}
+
+pub fn cursorPosition(self: *Self) ?CursorPosition {
+    const saved_offset = self.term.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(self.term, saved_offset);
+    const cursor = self.cursorPinAtBottom() orelse return null;
+    return .{ .x = cursor.x, .y = cursor.y };
+}
+
+pub fn cursorRowCharOffset(self: *Self) ?i64 {
+    const saved_offset = self.term.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(self.term, saved_offset);
+
+    const cursor = self.cursorPinAtBottom() orelse return null;
+    return @intCast(utils.rowCharOffset(cursor));
+}
+
+pub fn isRowEmptyAt(_: *Self, row_pin: gt.Pin) bool {
+    const page = &row_pin.node.data;
+    const row = row_pin.rowAndCell().row;
+    for (page.getCells(row)) |*cell| {
+        if (cell.wide == .spacer_head or cell.wide == .spacer_tail) continue;
+        if (cell.hasText() or cell.hasGrapheme()) return false;
+        if (CellPropKey.create(page, cell) != null) return false;
+    }
+    return true;
+}
+
+pub fn cursorOnEmptyRow(self: *Self) ?bool {
+    const saved_offset = self.term.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(self.term, saved_offset);
+
+    const cursor = self.cursorPinAtBottom() orelse return null;
+    return self.isRowEmptyAt(cursor);
+}
+
+pub fn debugState(self: *Self, buf: []u8) []const u8 {
+    const saved_offset = self.term.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(self.term, saved_offset);
+    self.term.scrollViewport(.bottom);
+
+    var pos: usize = 0;
+    const screen = self.term.screens.active;
+    pos += (std.fmt.bufPrint(buf[pos..], "rows={d}\n", .{screen.pages.rows}) catch return buf[0..pos]).len;
+
+    var row_idx: usize = 0;
+    var row_it = screen.pages.getTopLeft(.active).rowIterator(.right_down, null);
+    while (row_idx < 10) : (row_idx += 1) {
+        const row_pin = row_it.next() orelse break;
+        pos += (std.fmt.bufPrint(buf[pos..], "row{d}=\"", .{row_idx}) catch break).len;
+        pos = appendDebugRow(buf, pos, row_pin, 80);
+        pos += (std.fmt.bufPrint(buf[pos..], "\"\n", .{}) catch break).len;
+    }
+
+    return buf[0..pos];
+}
+
+pub fn debugFeed(self: *Self, term: *GhostelTerm, data: []const u8, buf: []u8) []const u8 {
+    const saved_offset = term.terminal.screens.active.pages.scrollbar().offset;
+    defer restoreViewport(&term.terminal, saved_offset);
+    term.terminal.scrollViewport(.bottom);
+
+    term.vtWrite(data);
+
+    var pos: usize = 0;
+    const cursor = self.term.screens.active.cursor.page_pin.*;
+    pos += (std.fmt.bufPrint(buf[pos..], "cur=({d},{d})\n", .{ cursor.x, cursor.y }) catch return "").len;
+    const row_pin = self.term.screens.active.pages.getTopLeft(.active);
+    pos += (std.fmt.bufPrint(buf[pos..], "row0=\"", .{}) catch return buf[0..pos]).len;
+    pos = appendDebugRow(buf, pos, row_pin, 60);
+    pos += (std.fmt.bufPrint(buf[pos..], "\"", .{}) catch return buf[0..pos]).len;
+    return buf[0..pos];
+}
+
+fn appendDebugRow(buf: []u8, start: usize, row_pin: gt.Pin, max_cols: usize) usize {
+    var pos = start;
+    const row = row_pin.rowAndCell().row;
+    const page = &row_pin.node.data;
+    for (page.getCells(row)[0..@min(page.getCells(row).len, max_cols)]) |*cell| {
+        if (cell.wide == .spacer_head or cell.wide == .spacer_tail) continue;
+        const cp: u21 = if (cell.hasText()) cell.codepoint() else ' ';
+        const rem = buf[pos..];
+        if (rem.len < 4) break;
+        const len = std.unicode.utf8Encode(cp, rem) catch continue;
+        pos += len;
+        if (cell.hasGrapheme()) {
+            if (page.lookupGrapheme(cell)) |cluster| {
+                for (cluster) |gcp| {
+                    const cluster_rem = buf[pos..];
+                    if (cluster_rem.len < 4) return pos;
+                    const cluster_len = std.unicode.utf8Encode(gcp, cluster_rem) catch continue;
+                    pos += cluster_len;
+                }
+            }
+        }
+    }
+    return pos;
 }
 
 // TODO: Style ID type is not exported from ghostty-vt for some reason.
