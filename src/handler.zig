@@ -2,7 +2,7 @@
 //! standard terminal handler but intercepts OSC-related actions so we can route
 //! them to Elisp callbacks instead of re-parsing the same bytes ourselves.
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const GhostelTerm = @import("GhostelTerm.zig");
 
