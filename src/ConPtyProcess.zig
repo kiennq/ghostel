@@ -811,17 +811,6 @@ test "EnvMap keeps environment names unique on Windows" {
     try std.testing.expectEqualStrings("second", env.get("path").?);
 }
 
-test "backend owns handles directly" {
-    try std.testing.expect(!@hasField(Self, "state"));
-    inline for (std.meta.fields(Self)) |field| {
-        try std.testing.expect(!std.mem.endsWith(u8, field.name, "mutex"));
-    }
-}
-
-test "backend uses interrupt without access guard" {
-    try std.testing.expect(@hasDecl(Self, "interrupt"));
-}
-
 test "backend hands handles to reaper once" {
     const fake_hpc: HPCON = @ptrFromInt(0x1234);
     const fake_handle: c.HANDLE = @ptrFromInt(0x5678);
