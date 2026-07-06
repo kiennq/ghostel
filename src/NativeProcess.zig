@@ -6,6 +6,7 @@ const gt = @import("ghostty-vt");
 
 const GhostelHandler = @import("handler.zig").GhostelHandler;
 const FixedArrayList = @import("fixed_array_list.zig").FixedArrayList;
+const RingQueue = @import("RingQueue.zig").RingQueue;
 
 const Backend = switch (builtin.os.tag) {
     .windows => @import("ConPtyProcess.zig"),
@@ -19,8 +20,37 @@ const log = std.log.scoped(.NativeProcessHandler);
 pub const ChannelFd = EventWriter.Fd;
 pub const ProcessParams = Backend.ProcessParams;
 
-backend_mutex: std.Thread.Mutex = .{},
-backend: ?Backend,
+const CommandQueueUsableCapacity = 16 * 1024;
+const CommandQueueReservedStopSlots = 1;
+const CommandQueueCapacity = CommandQueueUsableCapacity + CommandQueueReservedStopSlots + 1;
+
+const Size = struct {
+    cols: u16,
+    rows: u16,
+};
+
+const Command = union(enum) {
+    write: []u8,
+    resize: Size,
+    stop,
+
+    fn deinit(self: Command, alloc: Allocator) void {
+        switch (self) {
+            .write => |data| alloc.free(data),
+            .resize, .stop => {},
+        }
+    }
+
+    fn isStop(self: Command) bool {
+        return switch (self) {
+            .write, .resize => false,
+            .stop => true,
+        };
+    }
+};
+
+backend: Backend,
+commands: RingQueue(Command, CommandQueueCapacity) = .{},
 event_writer: EventWriter,
 alloc: Allocator,
 pid: i64,
@@ -32,8 +62,10 @@ event_buf: FixedArrayList(u8, 16 * 1024) = .{},
 term_mutex: std.Thread.Mutex.Recursive = .init,
 term: *gt.Terminal,
 stream: gt.Stream(GhostelHandler(*Self)),
+attached: bool = false,
 
-quit: bool = false,
+quit: std.atomic.Value(bool) = .init(false),
+detached: std.atomic.Value(bool) = .init(false),
 thread: std.Thread,
 
 const LockedStream = struct {
@@ -43,6 +75,7 @@ const LockedStream = struct {
     pub fn nextSlice(self: *LockedStream, data: []const u8) void {
         self.process.term_mutex.lock();
         defer self.process.term_mutex.unlock();
+        if (!self.process.attached) return;
         self.drained = true;
         self.process.stream.nextSlice(data);
     }
@@ -63,7 +96,7 @@ pub fn init(
     var event_writer = try EventWriter.init(event_fd);
     errdefer event_writer.close();
 
-    var stream: @TypeOf(self.stream) = .initAlloc(alloc, .init(self, term));
+    var stream = gt.Stream(GhostelHandler(*Self)).initAlloc(alloc, .init(self, term));
     errdefer stream.deinit();
 
     const replica_name = try alloc.dupe(u8, backend.replicaName());
@@ -77,6 +110,7 @@ pub fn init(
         .replica_name = replica_name,
         .term = term,
         .stream = stream,
+        .attached = true,
         .thread = undefined,
     };
     self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
@@ -91,25 +125,37 @@ pub fn unlockTerm(self: *Self) void {
 }
 
 pub fn ptyWrite(self: *Self, data: []const u8) !void {
-    self.backend_mutex.lock();
-    defer self.backend_mutex.unlock();
+    if (data.len == 0) return;
 
-    if (self.backend) |*backend| return backend.write(data);
-    return error.ProcessExited;
+    const owned = try self.alloc.dupe(u8, data);
+    errdefer self.alloc.free(owned);
+    try self.enqueue(.{ .write = owned });
 }
 
 pub fn resizePty(self: *Self, cols: u16, rows: u16) !void {
-    self.backend_mutex.lock();
-    defer self.backend_mutex.unlock();
-
-    if (self.backend) |*backend| try backend.resize(cols, rows);
+    self.enqueue(.{ .resize = .{ .cols = cols, .rows = rows } }) catch |err| switch (err) {
+        error.ProcessExited => return,
+        else => return err,
+    };
 }
 
-pub fn isBackendAlive(self: *Self) bool {
-    self.backend_mutex.lock();
-    defer self.backend_mutex.unlock();
-
-    return self.backend != null;
+fn enqueue(self: *Self, command: Command) !void {
+    switch (command) {
+        .stop => {
+            if (self.quit.load(.acquire)) return error.ProcessExited;
+            if (!self.commands.push(command)) {
+                return error.CommandQueueFull;
+            }
+            self.backend.interrupt(self.thread);
+        },
+        else => {
+            if (self.detached.load(.acquire) or self.quit.load(.acquire)) return error.ProcessExited;
+            if (!self.commands.pushReserved(command, CommandQueueReservedStopSlots)) {
+                return error.CommandQueueFull;
+            }
+            self.backend.wake();
+        },
+    }
 }
 
 pub fn effect(self: *Self, comptime func: []const u8, args: anytype) void {
@@ -173,14 +219,8 @@ fn run(self: *Self) void {
     self.loop() catch |err| {
         log.warn("ghostel: error in read loop: {any}", .{err});
     };
-    const backend = blk: {
-        self.backend_mutex.lock();
-        defer self.backend_mutex.unlock();
-
-        const backend = self.backend orelse return;
-        self.backend = null;
-        break :blk backend;
-    };
+    self.quit.store(true, .monotonic);
+    const backend = self.backend.takeForReaper();
 
     // The reader thread must not waitpid here: it may be joined from Emacs
     // during buffer teardown, and blocking that path would freeze Emacs.  Hand
@@ -203,12 +243,84 @@ fn loop(self: *Self) !void {
 }
 
 fn loopOnce(self: *Self) !bool {
-    if (@atomicLoad(bool, &self.quit, .monotonic)) return false;
+    if (self.quit.load(.monotonic)) {
+        self.discardCommands();
+        return false;
+    }
+    if (!try self.processCommands()) return false;
+    if (self.quit.load(.monotonic)) {
+        self.discardCommands();
+        return false;
+    }
 
     var stream = LockedStream{ .process = self };
-    const eof = try self.backend.?.drain(&stream);
+    const eof = try self.backend.drain(&stream);
+
     if (stream.drained) try self.notifyVtUpdate();
+    if (eof) {
+        self.quit.store(true, .monotonic);
+        self.discardCommands();
+    }
     return !eof;
+}
+
+fn processCommands(self: *Self) !bool {
+    while (self.commands.pop()) |command| {
+        switch (command) {
+            .write => |data| {
+                defer self.alloc.free(data);
+                if (self.quit.load(.monotonic)) {
+                    self.discardCommands();
+                    return false;
+                }
+                self.backend.write(data, &self.quit) catch |err| {
+                    if (err == error.CommandInterrupted) {
+                        if (!self.processPendingStop()) return false;
+                        continue;
+                    }
+                    if (self.quit.load(.monotonic)) return false;
+                    log.warn("Dropping queued native input after write failed: {any}", .{err});
+                    self.discardCommands();
+                    return true;
+                };
+            },
+            .resize => |size| {
+                if (self.quit.load(.monotonic)) {
+                    self.discardCommands();
+                    return false;
+                }
+                self.backend.resize(size.cols, size.rows) catch |err| {
+                    log.warn("Dropping queued native input after resize failed: {any}", .{err});
+                    self.discardCommands();
+                    return true;
+                };
+            },
+            .stop => {
+                self.quit.store(true, .monotonic);
+                self.discardCommands();
+                return false;
+            },
+        }
+    }
+    return true;
+}
+
+fn processPendingStop(self: *Self) bool {
+    while (self.commands.pop()) |command| {
+        if (command.isStop()) {
+            self.quit.store(true, .monotonic);
+            self.discardCommands();
+            return false;
+        }
+        command.deinit(self.alloc);
+    }
+    return true;
+}
+
+fn discardCommands(self: *Self) void {
+    while (self.commands.pop()) |command| {
+        command.deinit(self.alloc);
+    }
 }
 
 fn notifyVtUpdate(self: *Self) !void {
@@ -254,14 +366,41 @@ fn reapChild(backend: Backend, event_writer: EventWriter) void {
 }
 
 pub fn deinit(self: *Self) void {
-    @atomicStore(bool, &self.quit, true, .monotonic);
-    self.backend_mutex.lock();
-    if (self.backend) |*backend| {
-        backend.requestStop(self.thread);
-    }
-    self.backend_mutex.unlock();
-    self.thread.join();
+    if (self.detached.swap(true, .acq_rel)) return;
 
+    self.detachOutput();
+    self.enqueue(.stop) catch |err| switch (err) {
+        error.ProcessExited => {},
+        else => log.warn("Failed to queue native stop command: {any}", .{err}),
+    };
+
+    const cleanup_thread = std.Thread.spawn(
+        .{ .stack_size = 1024 * 1024 },
+        cleanupDetached,
+        .{self},
+    ) catch |err| {
+        log.err("Failed to spawn native cleanup thread: {any}", .{err});
+        return;
+    };
+    cleanup_thread.detach();
+}
+
+pub fn isRunning(self: *Self) bool {
+    return !self.quit.load(.acquire) and !self.detached.load(.acquire);
+}
+
+fn detachOutput(self: *Self) void {
+    self.term_mutex.lock();
+    defer self.term_mutex.unlock();
+
+    if (!self.attached) return;
+    self.attached = false;
     self.stream.deinit();
+}
+
+fn cleanupDetached(self: *Self) void {
+    self.thread.join();
+    self.discardCommands();
     self.alloc.free(self.replica_name);
+    self.alloc.destroy(self);
 }

@@ -366,7 +366,7 @@ fn waitForReadOrCommand(state: *State, include_process: bool) !WaitResult {
     return error.WaitFailed;
 }
 
-pub fn write(self: *Self, data: []const u8) !void {
+pub fn write(self: *Self, data: []const u8, quit: *std.atomic.Value(bool)) !void {
     if (data.len == 0) return;
     if (self.state.pty_input == c.INVALID_HANDLE_VALUE) return error.WriteFailed;
 
@@ -375,6 +375,10 @@ pub fn write(self: *Self, data: []const u8) !void {
         var wrote: c.DWORD = 0;
         const chunk_len: c.DWORD = @intCast(@min(data.len - offset, std.math.maxInt(c.DWORD)));
         if (c.WriteFile(self.state.pty_input, data[offset..].ptr, chunk_len, &wrote, null) == 0) {
+            if (c.GetLastError() == c.ERROR_OPERATION_ABORTED) {
+                return error.CommandInterrupted;
+            }
+            if (quit.load(.monotonic)) return error.CommandInterrupted;
             return error.WriteFailed;
         }
         if (wrote == 0) return error.WriteFailed;
@@ -392,16 +396,17 @@ pub fn resize(self: *Self, cols: u16, rows: u16) !void {
     if (resize_pseudo_console.?(hpc, size) < 0) return error.PtyResizeFailed;
 }
 
-pub fn requestStop(self: *Self, read_thread: std.Thread) void {
-    stopRunning(self.state);
-    wake(self.state);
+pub fn wake(self: *Self) void {
+    wakeState(self.state);
+}
 
-    if (self.state.pty_input != c.INVALID_HANDLE_VALUE) {
-        _ = c.CloseHandle(self.state.pty_input);
-        self.state.pty_input = c.INVALID_HANDLE_VALUE;
-    }
-
+pub fn interrupt(self: *Self, read_thread: std.Thread) void {
+    self.wake();
     _ = c.CancelSynchronousIo(read_thread.getHandle());
+}
+
+pub fn takeForReaper(self: *Self) Self {
+    return self.*;
 }
 
 pub fn replicaName(_: *Self) []const u8 {
@@ -499,7 +504,7 @@ fn closePseudoConsole(state: *State) void {
     state.hpc = null;
 }
 
-fn wake(state: *State) void {
+fn wakeState(state: *State) void {
     if (state.command_event == c.INVALID_HANDLE_VALUE) return;
     _ = c.SetEvent(state.command_event);
 }

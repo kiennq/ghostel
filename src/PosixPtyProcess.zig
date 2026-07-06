@@ -80,10 +80,15 @@ const Pty = struct {
         }
     }
 
-    pub fn write(self: *@This(), data: []const u8) !void {
+    pub fn write(
+        self: *@This(),
+        data: []const u8,
+        wake_fd: posix.fd_t,
+        quit: *std.atomic.Value(bool),
+    ) !void {
         var offset: usize = 0;
         while (offset < data.len) {
-            offset += posix.write(self.primary_fd, data[offset..data.len]) catch |err| switch (err) {
+            offset += posix.write(self.primary_fd, data[offset..]) catch |err| switch (err) {
                 // If the master fd is non-blocking, a write that would fill the
                 // replica's input buffer fails with WouldBlock; wait for the
                 // replica to drain rather than dropping the tail of a large
@@ -91,12 +96,22 @@ const Pty = struct {
                 // a blocking fd this branch never fires and the loop is an
                 // ordinary blocking write, so write() works in either mode.
                 error.WouldBlock => {
-                    var pollfds = [_]posix.pollfd{.{
-                        .fd = self.primary_fd,
-                        .events = posix.POLL.OUT,
-                        .revents = undefined,
-                    }};
+                    var pollfds = [_]posix.pollfd{
+                        .{
+                            .fd = self.primary_fd,
+                            .events = posix.POLL.OUT,
+                            .revents = undefined,
+                        },
+                        .{
+                            .fd = wake_fd,
+                            .events = posix.POLL.IN,
+                            .revents = undefined,
+                        },
+                    };
                     _ = try posix.poll(&pollfds, -1);
+                    if (pollfds[1].revents != 0) {
+                        if (clearWakeFd(wake_fd) or quit.load(.monotonic)) return error.CommandInterrupted;
+                    }
                     continue;
                 },
                 else => return err,
@@ -205,11 +220,8 @@ pub fn init(alloc: Allocator, initial_cols: u16, initial_rows: u16, params: Proc
     const args = try arena.allocSentinel(?[*:0]const u8, params.args.len, null);
     for (params.args, 0..) |arg, i| args[i] = arg;
 
-    self.wake_pipe = try posix.pipe2(.{ .CLOEXEC = true });
-    errdefer {
-        posix.close(self.wake_pipe[0]);
-        posix.close(self.wake_pipe[1]);
-    }
+    self.wake_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    errdefer self.closeWakePipe();
     const flags = try posix.fcntl(self.pty.primary_fd, posix.F.GETFL, 0);
     _ = try posix.fcntl(
         self.pty.primary_fd,
@@ -252,8 +264,8 @@ pub fn resize(self: *Self, cols: u16, rows: u16) !void {
     try self.pty.resize(cols, rows);
 }
 
-pub fn write(self: *Self, data: []const u8) !void {
-    try self.pty.write(data);
+pub fn write(self: *Self, data: []const u8, quit: *std.atomic.Value(bool)) !void {
+    try self.pty.write(data, self.wake_pipe[0], quit);
 }
 
 pub fn drain(self: *Self, stream: anytype) !bool {
@@ -272,7 +284,10 @@ pub fn drain(self: *Self, stream: anytype) !bool {
         },
     };
     _ = try posix.poll(&pollfds, -1);
-    if (pollfds[1].revents != 0) return false;
+    if (pollfds[1].revents != 0) {
+        _ = clearWakeFd(self.wake_pipe[0]);
+        return false;
+    }
 
     const len = posix.read(self.pty.primary_fd, buf[0..]) catch |err| switch (err) {
         error.WouldBlock => return false,
@@ -284,10 +299,26 @@ pub fn drain(self: *Self, stream: anytype) !bool {
     return false;
 }
 
-pub fn requestStop(self: *Self, _: std.Thread) void {
-    if (self.wake_pipe[1] != -1) {
-        _ = posix.write(self.wake_pipe[1], "X") catch 0;
-    }
+pub fn wake(self: *Self) void {
+    self.wakeRaw(false);
+}
+
+fn wakeRaw(self: *Self, interrupting: bool) void {
+    if (self.wake_pipe[1] == -1) return;
+    _ = posix.write(self.wake_pipe[1], if (interrupting) "S" else "W") catch 0;
+}
+
+pub fn interrupt(self: *Self, _: std.Thread) void {
+    self.wakeRaw(true);
+}
+
+pub fn takeForReaper(self: *Self) Self {
+    const backend = self.*;
+    self.pty.primary_fd = -1;
+    self.pty.replica_fd = -1;
+    self.pid = -1;
+    self.wake_pipe = .{ -1, -1 };
+    return backend;
 }
 
 pub fn replicaName(self: *Self) []const u8 {
@@ -296,8 +327,31 @@ pub fn replicaName(self: *Self) []const u8 {
 
 pub fn deinitAndWait(self: *Self) u8 {
     self.pty.deinit();
-    posix.close(self.wake_pipe[0]);
-    posix.close(self.wake_pipe[1]);
+    self.closeWakePipe();
     const result = posix.waitpid(self.pid, 0);
     return @intCast(c.WEXITSTATUS(@as(c_int, @bitCast(result.status))));
+}
+
+fn closeWakePipe(self: *Self) void {
+    if (self.wake_pipe[0] != -1) {
+        posix.close(self.wake_pipe[0]);
+        self.wake_pipe[0] = -1;
+    }
+    if (self.wake_pipe[1] != -1) {
+        posix.close(self.wake_pipe[1]);
+        self.wake_pipe[1] = -1;
+    }
+}
+
+fn clearWakeFd(fd: posix.fd_t) bool {
+    var buf: [64]u8 = undefined;
+    var interrupted = false;
+    while (true) {
+        const n = posix.read(fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return interrupted,
+            else => return interrupted,
+        };
+        interrupted = interrupted or std.mem.indexOfScalar(u8, buf[0..n], 'S') != null;
+        if (n == 0 or n < buf.len) return interrupted;
+    }
 }
