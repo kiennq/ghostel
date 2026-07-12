@@ -278,6 +278,11 @@ caller supplies a type-aware default; see
                 (cdr spec))))
     (ghostel--shell-program-and-args ghostel-shell)))
 
+(defun ghostel--posix-shell-quote-argument (argument)
+  "Quote ARGUMENT for a POSIX shell command, independent of host OS."
+  (let ((system-type 'gnu/linux))
+    (shell-quote-argument argument)))
+
 (defun ghostel--macos-login-wrap (program args)
   "Wrap PROGRAM/ARGS via `/usr/bin/login' to produce a macOS login shell.
 Returns (LOGIN-PROGRAM . LOGIN-ARGS).  Mirrors Ghostty's wrap:
@@ -291,7 +296,7 @@ of the final shell, which is what makes it a login shell.
 PROGRAM and ARGS are shell-quoted into the `-c' command."
   (let* ((user (user-login-name))
          (hush (file-exists-p (expand-file-name "~/.hushlogin")))
-         (quoted (mapconcat #'shell-quote-argument
+         (quoted (mapconcat #'ghostel--posix-shell-quote-argument
                             (cons program args) " "))
          (cmd (concat "exec -l " quoted))
          ;; Quote from Ghostty source:

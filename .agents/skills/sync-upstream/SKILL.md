@@ -88,7 +88,12 @@ Intermediate commits do not need to build individually. Supplementary changes (e
   behavior unless upstream supersedes it. Do not keep unrelated fork code just
   because it is on the fork side, and never resolve a whole file from the old
   fork.
-- **module.zig owns the dyn-loader ABI.** The fork replaces upstream's direct `env.bindFunction` registration with a loader export table (`ExportId` enum, export manifest array, loader dispatch switch). This is the entire point of the dyn-loader topic. Never resolve a module.zig conflict by keeping the upstream registration style.
+- **module.zig owns the dyn-loader ABI.** The fork derives the loader manifest
+  and dispatcher from the concatenated `FunctionEntry` arrays in
+  `GhostelTerm`, `module.zig`, and `ComintFilter`. Preserve that single-source
+  registry so new upstream `FunctionEntry` values are exported automatically.
+  Never restore the manual `ExportId`/manifest/switch tables or upstream's
+  direct `env.bindFunction` registration style.
 - **render.zig owns readonly-safe rendering.** The fork wraps buffer mutations in `(let ((inhibit-read-only t)) ...)` and adds `ghostel-full-redraw` support. These are the readonly and scrollback-viewport features. Never drop them during a conflict.
 - **NativeProcess.zig owns nonblocking backend delivery.** Preserve the MPSC
   `RingQueue`, producer enqueue-and-wake behavior, reader-only backend
