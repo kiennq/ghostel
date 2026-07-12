@@ -18,21 +18,103 @@
   "Record ARGS for native process event-filter tests."
   (push args ghostel-test-native-process--events))
 
-(defun ghostel-test-native-process--with-events-filter (fn)
-  "Call FN in a buffer-local `ghostel--events-filter' unit-test context.
-FN receives a fake pipe process value and a zero-argument function
-returning the number of redraw invalidations requested."
-  (let ((buffer (generate-new-buffer " *ghostel-test-events-filter*")))
+(ert-deftest ghostel-test-spawn-process-suppresses-built-in-process-resize ()
+  "`ghostel--spawn-process' leaves resizing to `ghostel--adjust-size'."
+  (let ((pipe nil))
     (unwind-protect
-        (with-current-buffer buffer
-          (setq-local ghostel--event-buf nil)
+        (ghostel-test--without-subr-trampolines
+          (cl-letf (((symbol-function 'ghostel--resolve-local-executable)
+                     #'identity)
+                    ((symbol-function 'ghostel--spawn-via-native)
+                     (lambda (&rest _)
+                       (setq pipe (make-pipe-process
+                                   :name "ghostel-native-process"
+                                   :buffer (current-buffer)
+                                   :noquery t))))
+                    ((symbol-function 'signal-process)
+                     #'ignore)
+                    ((symbol-function 'ghostel--kill-native-process)
+                     #'ignore))
+            (with-temp-buffer
+              (let ((ghostel-use-native-pty t)
+                    (system-type 'gnu/linux))
+                (let ((process (ghostel--spawn-process
+                                "sh" nil 24 80 "-ixon" nil)))
+                  (should (eq pipe process)))
+                (should (process-live-p pipe))
+                (should (eq (process-get pipe 'adjust-window-size-function)
+                            #'ignore))))))
+      (when (and pipe (process-live-p pipe))
+        (set-process-sentinel pipe #'ignore)
+        (delete-process pipe)))))
+
+(ert-deftest ghostel-test-spawn-via-native-marks-event-pipe ()
+  "`ghostel--spawn-via-native' marks its event pipe as native PTY transport."
+  (let ((pipe nil))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((ghostel--term 'fake-term)
+                (ghostel--pid nil))
+            (cl-letf (((symbol-function 'ghostel--spawn-native-process)
+                       (lambda (_term _command process)
+                         (setq pipe process)
+                         1234))
+                      ((symbol-function 'signal-process)
+                       #'ignore)
+                      ((symbol-function 'ghostel--kill-native-process)
+                       #'ignore))
+              (let ((process (ghostel--spawn-via-native '("cmd.exe"))))
+                (should (eq process pipe))
+                (should (process-get process 'ghostel-native-pty))
+                (should (equal ghostel--pid 1234))))))
+      (when (and pipe (process-live-p pipe))
+        (set-process-sentinel pipe #'ignore)
+        (delete-process pipe)))))
+
+(ert-deftest ghostel-test-process-set-window-size-skips-native-pipe ()
+  "`ghostel--process-set-window-size' does not resize native event pipes."
+  (let ((pipe nil)
+        (resize-args nil))
+    (unwind-protect
+        (progn
+          (setq pipe (make-pipe-process
+                      :name "ghostel-native-process"
+                      :buffer (current-buffer)
+                      :noquery t))
+          (cl-letf (((symbol-function 'set-process-window-size)
+                     (lambda (&rest args)
+                       (setq resize-args args))))
+            (process-put pipe 'ghostel-native-pty t)
+            (ghostel--process-set-window-size pipe 25 80)
+            (should-not resize-args)
+            (process-put pipe 'ghostel-native-pty nil)
+            (ghostel--process-set-window-size pipe 24 100)
+            (should (equal (list pipe 24 100) resize-args))))
+      (when (and pipe (process-live-p pipe))
+        (delete-process pipe)))))
+
+(defun ghostel-test-native-process--with-events-filter (fn)
+  "Call FN with a pipe whose process buffer differs from the current buffer."
+  (let ((buffer (generate-new-buffer " *ghostel-test-events-filter*"))
+        (caller (generate-new-buffer " *ghostel-test-events-caller*"))
+        pipe)
+    (unwind-protect
+        (progn
+          (setq pipe (make-pipe-process
+                      :name "ghostel-test-events"
+                      :buffer buffer
+                      :noquery t))
           (let ((ghostel-test-native-process--events nil)
                 (invalidations 0))
-            (cl-letf (((symbol-function 'process-buffer)
-                       (lambda (_process) buffer))
-                      ((symbol-function 'ghostel--invalidate)
+            (cl-letf (((symbol-function 'ghostel--invalidate)
                        (lambda () (cl-incf invalidations))))
-              (funcall fn 'ghostel-test-process (lambda () invalidations)))))
+              (with-current-buffer caller
+                (funcall fn pipe buffer
+                         (lambda () invalidations))))))
+      (when (and pipe (process-live-p pipe))
+        (delete-process pipe))
+      (when (buffer-live-p caller)
+        (kill-buffer caller))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
@@ -52,7 +134,8 @@ bindings needed by the test."
           (progn
             (let ((spawn (lambda ()
                            (setq pid (ghostel--spawn-native-process
-                                      ghostel--term command pipe)))))
+                                     ghostel--term command pipe))
+                           (process-put pipe 'ghostel--native-pid pid))))
               (if spawn-wrapper
                   (funcall spawn-wrapper spawn)
                 (funcall spawn)))
@@ -103,54 +186,208 @@ bindings needed by the test."
 (ert-deftest ghostel-test-events-filter-multiple-events-per-chunk ()
   "Native process event filter evaluates multiple events in one chunk."
   (ghostel-test-native-process--with-events-filter
-   (lambda (proc invalidations)
+   (lambda (proc buffer invalidations)
      (ghostel--events-filter
       proc
       "(ghostel-test-native-process--record \"one\")(ghostel-test-native-process--record \"two\" 2)")
      (should (equal '(("two" 2) ("one")) ghostel-test-native-process--events))
-     (should (null ghostel--event-buf))
+     (should (null (process-get proc 'ghostel--event-buf)))
      (should (= 1 (funcall invalidations))))))
+
+(ert-deftest ghostel-test-events-filter-uses-process-buffer-state ()
+  "Native event parsing stores partial state on the pipe."
+  (let ((buffer (generate-new-buffer " *ghostel-test-events-target*"))
+        (caller (generate-new-buffer " *ghostel-test-events-caller*"))
+        pipe)
+    (unwind-protect
+        (progn
+          (setq pipe (make-pipe-process
+                      :name "ghostel-test-events"
+                      :buffer buffer
+                      :noquery t))
+          (with-current-buffer caller
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+              (ghostel--events-filter
+               pipe "(ghostel-test-native-process--record \"partial")))
+          (should (equal (process-get pipe 'ghostel--event-buf)
+                         "(ghostel-test-native-process--record \"partial")))
+      (when (and pipe (process-live-p pipe))
+        (delete-process pipe))
+      (when (buffer-live-p caller)
+        (kill-buffer caller))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest ghostel-test-events-filter-detached-pipe-completes-itself ()
+  "Late completion from a detached pipe deletes only that pipe."
+  (let ((old-buffer (generate-new-buffer " *ghostel-test-old-events*"))
+        (new-buffer (generate-new-buffer " *ghostel-test-new-events*"))
+        old-pipe
+        new-pipe
+        (ghostel-test-native-process--events nil)
+        (invalidations 0))
+    (unwind-protect
+        (progn
+          (setq old-pipe (make-pipe-process
+                          :name "ghostel-test-old-events"
+                          :buffer old-buffer
+                          :noquery t)
+                new-pipe (make-pipe-process
+                          :name "ghostel-test-new-events"
+                          :buffer new-buffer
+                          :noquery t))
+          (set-process-buffer old-pipe nil)
+          (process-put old-pipe 'ghostel--native-pid 101)
+          (process-put new-pipe 'ghostel--event-buf
+                      "(ghostel-test-native-process--record \"new")
+          (cl-letf (((symbol-function 'ghostel--invalidate)
+                    (lambda () (cl-incf invalidations))))
+           (ghostel--events-filter
+            old-pipe
+            (concat ghostel--native-exit-marker-prefix "101 0\n"))
+           (should-not (process-live-p old-pipe)))
+          (should (equal (process-get new-pipe 'ghostel--event-buf)
+                        "(ghostel-test-native-process--record \"new"))
+          (should-not ghostel-test-native-process--events)
+          (should (= invalidations 0)))
+      (dolist (pipe (list old-pipe new-pipe))
+        (when (and pipe (process-live-p pipe))
+          (delete-process pipe)))
+      (dolist (buffer (list old-buffer new-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest ghostel-test-events-filter-ignores-stale-native-exit-marker ()
+  "A late reaper marker for an old pid cannot close a restarted pipe."
+  (ghostel-test-native-process--with-events-filter
+   (lambda (proc buffer invalidations)
+     (process-put proc 'ghostel--native-pid 202)
+     (ghostel--events-filter
+      proc
+      (concat ghostel--native-exit-marker-prefix "101 255\n"
+              "(ghostel-test-native-process--record \"new\")"))
+     (should (process-live-p proc))
+     (should (equal '(("new")) ghostel-test-native-process--events))
+     (should (null (process-get proc 'ghostel--event-buf)))
+     (should (= 1 (funcall invalidations))))))
+
+(ert-deftest ghostel-test-events-filter-buffers-partial-native-exit-marker ()
+  "Fragmented native exit markers wait for the newline delimiter."
+  (ghostel-test-native-process--with-events-filter
+   (lambda (proc buffer _invalidations)
+     (process-put proc 'ghostel--native-pid 202)
+     (ghostel--events-filter
+      proc
+      (concat ghostel--native-exit-marker-prefix "101"))
+     (should (process-live-p proc))
+     (should (equal (concat ghostel--native-exit-marker-prefix "101")
+                    (process-get proc 'ghostel--event-buf)))
+     (ghostel--events-filter
+      proc
+      " 255\n(ghostel-test-native-process--record \"new\")")
+     (should (process-live-p proc))
+     (should (equal '(("new")) ghostel-test-native-process--events))
+     (should (null (process-get proc 'ghostel--event-buf))))))
+
+(ert-deftest ghostel-test-events-filter-drops-stale-native-exit-prefix ()
+  "A lone stale native marker prefix cannot block later callbacks."
+  (ghostel-test-native-process--with-events-filter
+   (lambda (proc buffer _invalidations)
+     (process-put proc 'ghostel--native-pid 202)
+     (ghostel--events-filter proc ghostel--native-exit-marker-prefix)
+     (should (equal ghostel--native-exit-marker-prefix
+                    (process-get proc 'ghostel--event-buf)))
+     (ghostel--events-filter
+      proc
+      "(ghostel-test-native-process--record \"new\")")
+     (should (process-live-p proc))
+     (should (equal '(("new")) ghostel-test-native-process--events))
+     (should (null (process-get proc 'ghostel--event-buf))))))
+
+(ert-deftest ghostel-test-events-filter-drops-stale-callback-tail ()
+  "A stale marker and callback tail cannot poison later callbacks."
+  (ghostel-test-native-process--with-events-filter
+   (lambda (proc buffer _invalidations)
+     (process-put proc 'ghostel--native-pid 202)
+     (ghostel--events-filter
+      proc
+      (concat ghostel--native-exit-marker-prefix
+              ")(ghostel-test-native-process--record \"new\")"))
+     (should (process-live-p proc))
+     (should (equal '(("new")) ghostel-test-native-process--events))
+     (should (null (process-get proc 'ghostel--event-buf))))))
 
 (ert-deftest ghostel-test-events-filter-partial-writes-across-chunks ()
   "Native process event filter keeps incomplete events across chunks."
   (ghostel-test-native-process--with-events-filter
-   (lambda (proc _invalidations)
+   (lambda (proc buffer _invalidations)
      (ghostel--events-filter proc "(ghostel-test-native-process--record \"par")
      (should (equal nil ghostel-test-native-process--events))
-     (should (equal "(ghostel-test-native-process--record \"par" ghostel--event-buf))
+     (should (equal "(ghostel-test-native-process--record \"par"
+                    (process-get proc 'ghostel--event-buf)))
      (ghostel--events-filter proc "tial\" 42)")
      (should (equal '(("partial" 42)) ghostel-test-native-process--events))
-     (should (null ghostel--event-buf)))))
+     (should (null (process-get proc 'ghostel--event-buf))))))
 
 (ert-deftest ghostel-test-events-filter-complete-prefix-with-partial-tail ()
   "Native process event filter evaluates complete events before a partial tail."
   (ghostel-test-native-process--with-events-filter
-   (lambda (proc _invalidations)
+   (lambda (proc buffer _invalidations)
      (ghostel--events-filter
       proc
       "(ghostel-test-native-process--record \"first\")(ghostel-test-native-process--record \"sec")
      (should (equal '(("first")) ghostel-test-native-process--events))
-     (should (equal "(ghostel-test-native-process--record \"sec" ghostel--event-buf))
+     (should (equal "(ghostel-test-native-process--record \"sec"
+                    (process-get proc 'ghostel--event-buf)))
      (ghostel--events-filter proc "ond\")")
      (should (equal '(("second") ("first")) ghostel-test-native-process--events))
-     (should (null ghostel--event-buf)))))
+     (should (null (process-get proc 'ghostel--event-buf))))))
+
+(ert-deftest ghostel-test-events-filter-reselects-buffer-after-callback ()
+  "Callback buffer switches cannot redirect parser state or invalidation."
+  (let ((buffer (generate-new-buffer " *ghostel-test-events-target*"))
+       (caller (generate-new-buffer " *ghostel-test-events-caller*"))
+       (switched (generate-new-buffer " *ghostel-test-events-switched*"))
+       invalidated-buffer
+       pipe)
+    (unwind-protect
+       (progn
+         (setq pipe (make-pipe-process
+                     :name "ghostel-test-events"
+                     :buffer buffer
+                     :noquery t))
+         (cl-letf (((symbol-function 'ghostel--invalidate)
+                    (lambda () (setq invalidated-buffer (current-buffer)))))
+           (with-current-buffer caller
+             (ghostel--events-filter
+              pipe
+              (format "(set-buffer %S)(ghostel-test-native-process--record \"partial"
+                      (buffer-name switched)))))
+         (should (equal (process-get pipe 'ghostel--event-buf)
+                        "(ghostel-test-native-process--record \"partial"))
+         (should (eq invalidated-buffer buffer)))
+     (when (and pipe (process-live-p pipe))
+       (delete-process pipe))
+     (dolist (buf (list caller switched buffer))
+       (when (buffer-live-p buf)
+         (kill-buffer buf))))))
 
 (ert-deftest ghostel-test-events-filter-failing-event-does-not-poison-next-write ()
   "Native process event filter can process a good write after a failing one.
 A well-formed event whose evaluation signals is logged and discarded; it
 must not leave `ghostel--event-buf' in a poisoned state."
   (ghostel-test-native-process--with-events-filter
-   (lambda (proc _invalidations)
+   (lambda (proc buffer _invalidations)
      (ghostel--events-filter proc "(error \"boom\")")
-     (should (null ghostel--event-buf))
+     (should (null (process-get proc 'ghostel--event-buf)))
      (ghostel--events-filter proc "(ghostel-test-native-process--record \"good\")")
      (should (equal '(("good")) ghostel-test-native-process--events))
-     (should (null ghostel--event-buf)))))
+     (should (null (process-get proc 'ghostel--event-buf))))))
 
 (ert-deftest ghostel-test-events-filter-signalling-event-does-not-lose-tail ()
   "A signalling event is logged but does not abort the rest of the batch."
   (ghostel-test-native-process--with-events-filter
-   (lambda (proc invalidations)
+   (lambda (proc buffer invalidations)
      ;; Batch: a good event, an event whose evaluation signals, another good
      ;; event, then a partial tail.  The signal must not propagate out of the
      ;; filter, nor drop the events/tail that follow it.
@@ -161,12 +398,86 @@ must not leave `ghostel--event-buf' in a poisoned state."
               "(ghostel-test-native-process--record \"after\")"
               "(ghostel-test-native-process--record \"par"))
      (should (equal '(("after") ("before")) ghostel-test-native-process--events))
-     (should (equal "(ghostel-test-native-process--record \"par" ghostel--event-buf))
+     (should (equal "(ghostel-test-native-process--record \"par"
+                    (process-get proc 'ghostel--event-buf)))
      (should (= 1 (funcall invalidations)))
      (ghostel--events-filter proc "tial\")")
      (should (equal '(("partial") ("after") ("before"))
                     ghostel-test-native-process--events))
-     (should (null ghostel--event-buf)))))
+     (should (null (process-get proc 'ghostel--event-buf))))))
+
+(ert-deftest ghostel-test-native-pipe-sentinel-forces-final-redraw ()
+  "Pipe EOF redraws the fully drained native terminal before cleanup."
+  (let ((buffer (generate-new-buffer " *ghostel-test-native-sentinel*"))
+        redraw)
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq-local ghostel--term 'term
+                      ghostel-kill-buffer-on-exit nil
+                      ghostel-exit-functions nil
+                      ghostel--redraw-timer nil
+                      ghostel--plain-link-detection-timer nil)
+          (cl-letf (((symbol-function 'process-buffer)
+                     (lambda (_process) buffer))
+                    ((symbol-function 'ghostel--redraw-now)
+                     (lambda (buf force) (setq redraw (list buf force))))
+                    ((symbol-function 'ghostel--cancel-password-confirm-timer) #'ignore)
+                    ((symbol-function 'ghostel--spinner-stop) #'ignore)
+                    ((symbol-function 'ghostel--fake-cursor-clear) #'ignore))
+            (ghostel--sentinel 'pipe "finished\n")
+            (should (equal redraw (list buffer t)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest ghostel-test-native-pipe-sentinel-redraw-bypasses-inhibition ()
+  "Pipe EOF cannot defer its final redraw to a timer that cleanup cancels."
+  (let ((buffer (generate-new-buffer " *ghostel-test-native-sentinel-inhibit*"))
+        scheduled
+        cancelled
+        (rendered 0))
+    (unwind-protect
+        (save-window-excursion
+          (set-window-buffer (selected-window) buffer)
+          (with-current-buffer buffer
+            (setq-local ghostel--term 'term
+                        ghostel-kill-buffer-on-exit nil
+                        ghostel-exit-functions nil
+                        ghostel--redraw-timer nil
+                        ghostel--plain-link-detection-timer nil)
+            (add-hook 'ghostel-inhibit-redraw-functions
+                      (lambda (_buffer) t) nil t)
+            (cl-letf (((symbol-function 'process-buffer)
+                       (lambda (_process) buffer))
+                      ((symbol-function 'ghostel--terminal-live-p)
+                       (lambda () t))
+                      ((symbol-function 'ghostel--schedule-redraw)
+                       (lambda (&rest _args)
+                         (setq scheduled t
+                               ghostel--redraw-timer 'deferred)))
+                      ((symbol-function 'cancel-timer)
+                       (lambda (timer) (push timer cancelled)))
+                      ((symbol-function 'ghostel--defer-synchronized-output-redraw-p)
+                       (lambda (_buffer) nil))
+                      ((symbol-function 'ghostel--line-mode-pre-redraw) #'ignore)
+                      ((symbol-function 'ghostel--get-render-window)
+                       (lambda (_buffer) (selected-window)))
+                      ((symbol-function 'ghostel--anchored-windows)
+                       (lambda (&rest _args) nil))
+                      ((symbol-function 'ghostel--redraw)
+                       (lambda (&rest _args) (cl-incf rendered)))
+                      ((symbol-function 'ghostel--apply-cursor-style) #'ignore)
+                      ((symbol-function 'ghostel--schedule-link-detection) #'ignore)
+                      ((symbol-function 'ghostel--viewport-start) #'point-min)
+                      ((symbol-function 'ghostel--line-mode-post-redraw) #'ignore)
+                      ((symbol-function 'ghostel--detect-password-prompt) #'ignore)
+                      ((symbol-function 'ghostel--cancel-password-confirm-timer) #'ignore)
+                      ((symbol-function 'ghostel--spinner-stop) #'ignore)
+                      ((symbol-function 'ghostel--fake-cursor-clear) #'ignore))
+              (ghostel--sentinel 'pipe "finished\n")
+              (should (equal (list scheduled cancelled rendered)
+                             '(nil nil 1))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest ghostel-test-native-process-decodes-windows-unibyte-inputs ()
   "Native spawn decodes Windows unibyte process inputs with the ANSI code page."

@@ -537,6 +537,8 @@ E.g. `compilation-mode' error loci in `ghostel-compile-view-mode'."
                                timer-fn fn
                                timer-args args)
                          'ghostel-test-link-timer))
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
                       ((symbol-function 'ghostel--redraw)
                        (lambda (&rest _) t))
                       ((symbol-function 'ghostel--window-anchored-p) #'ignore)
@@ -586,6 +588,8 @@ E.g. `compilation-mode' error loci in `ghostel-compile-view-mode'."
                                timer-fn fn
                                timer-args args)
                          'ghostel-test-link-timer))
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
                       ((symbol-function 'ghostel--redraw)
                        (lambda (&rest _) t))
                       ((symbol-function 'ghostel--window-anchored-p) #'ignore)
@@ -1145,6 +1149,7 @@ The renderer rewrites only the rows that changed, so the rows of a
 wrapped link that did not change would otherwise keep pointing at
 text they no longer hold — here the line number shrinks from 912 to
 9 when the continuation row loses its digits."
+  :tags '(posix)
   (ghostel-test--with-link-fixture (dir file)
     (with-temp-buffer
       (insert "see " file ":9")
@@ -1168,6 +1173,7 @@ text they no longer hold — here the line number shrinks from 912 to
   "A link no match covers any more is removed, not left behind.
 Repainting the continuation row can leave the first row of a wrapped
 link pointing at a path that is no longer on screen."
+  :tags '(posix)
   (ghostel-test--with-link-fixture (dir file)
     (with-temp-buffer
       (insert "see " (substring file 0 (- (length file) 3)))
@@ -1218,6 +1224,7 @@ same-named file in the new directory must not silently take over."
   "A scan with one pattern switched off leaves the other's links alone.
 Clearing links no match covers must not mistake `not scanned for'
 for `no longer there'."
+  :tags '(posix)
   (ghostel-test--with-link-fixture (dir file)
     (with-temp-buffer
       (insert "go https://example.com/x end\n")
@@ -1244,7 +1251,7 @@ for `no longer there'."
 which may name a real file — the URL must not be replaced by it, and
 the file must not be stat'ed on every scan."
   (ghostel-test--with-link-fixture (dir _file)
-    (let* ((url (concat "http:/" dir "a.el")))
+    (let* ((url (concat "http://" (string-remove-prefix "/" dir) "a.el")))
       ;; The URL's path half is exactly the fixture file, which exists.
       (with-temp-buffer
         (insert "get " url " done\n")
@@ -1272,7 +1279,7 @@ The path inside this URL names a file that exists, so only the URL's
 claim on the span stops it becoming a local-file link."
   (ghostel-test--with-link-fixture (dir file)
     (with-temp-buffer
-      (insert " https:/" file ":9 end\n")
+      (insert " https://" (string-remove-prefix "/" file) ":9 end\n")
       (goto-char (point-max))
       (ghostel--detect-urls)
       (should-not (seq-find (lambda (run)
@@ -1284,6 +1291,7 @@ claim on the span stops it becoming a local-file link."
   "A leftover URL link over what is now a path becomes the path link.
 One scan is enough: the file pass must not treat a URL link no URL
 match covers as a URL that still owns the text."
+  :tags '(posix)
   (ghostel-test--with-link-fixture (dir file)
     (with-temp-buffer
       (insert "x " file ":9 end\n")
@@ -1313,6 +1321,7 @@ match covers as a URL that still owns the text."
 
 (ert-deftest ghostel-test-detect-keeps-link-across-repeated-scans ()
   "Rescanning unchanged output leaves its links exactly as they are."
+  :tags '(posix)
   (ghostel-test--with-link-fixture (dir file)
     (with-temp-buffer
       (insert "see " file ":9 end\n")
@@ -1357,6 +1366,7 @@ the first row, and on the continuation row."
   "Rows linkified live merge into one run once the rows are joined.
 `ghostel-compile' joins soft-wrapped rows when a run finishes; the
 link must not end up with a gap where the row break was."
+  :tags '(posix)
   (let* ((file (locate-library "ghostel"))
          (default-directory (file-name-directory file)))
     (with-temp-buffer
@@ -1449,6 +1459,7 @@ and `ghostel-test--wrap-split' work despite the read-only default."
   "`thing-at-point' returns the whole path from either fragment.
 `filename' drops the `:LINE' tail so `existing-filename' (which
 expands and stats it) works; both fragments answer alike."
+  :tags '(posix)
   (let* ((file (locate-library "ghostel"))
          (default-directory (file-name-directory file)))
     (ghostel-test--with-thingatpt-buffer
@@ -1464,6 +1475,7 @@ expands and stats it) works; both fragments answer alike."
 
 (ert-deftest ghostel-test-thingatpt-filename-unwrapped-link-drops-tail ()
   "On an unwrapped detected link, `filename' still drops the tail."
+  :tags '(posix)
   (let* ((file (locate-library "ghostel"))
          (default-directory (file-name-directory file)))
     (ghostel-test--with-thingatpt-buffer
@@ -1525,6 +1537,7 @@ disable `ghostel-enable-url-detection'."
 
 (ert-deftest ghostel-test-thingatpt-bounds-span-the-wrap ()
   "`bounds-of-thing-at-point' covers every fragment of a wrapped link."
+  :tags '(posix)
   (skip-unless (boundp 'bounds-of-thing-at-point-provider-alist))
   (let* ((file (locate-library "ghostel"))
          (default-directory (file-name-directory file)))
