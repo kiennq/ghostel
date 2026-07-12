@@ -4,15 +4,89 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest release
+        continue-on-error: true
+        id: cur_release
+        uses: pozetroninc/github-action-get-latest-release@master
+        with:
+          repository: ${{ github.repository }}
+          excludes: draft
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_ver="$(grep -Po '^;; Version: \K[\d.]+' lisp/ghostel.el)"
+          sha="${GITHUB_SHA::6}"
+          should_release=true
+
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            latest_tag=$([[ "${{ steps.cur_release.outcome }}" == "failure" ]] && echo "" || echo "${{ steps.cur_release.outputs.release }}")
+            if [[ -n "$latest_tag" ]] && git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null; then
+              if git diff --quiet "$latest_tag"...HEAD -- \
+                lisp/ghostel.el \
+                build.zig \
+                build.zig.zon \
+                .github/workflows/release.yml \
+                .github/workflows/ci.yml \
+                vendor \
+                src
+              then
+                should_release=false
+              fi
+            fi
+            version="${base_ver}.${GITHUB_RUN_NUMBER}.${sha}"
+            tag="v${version}"
+          fi
+
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.version.outputs.should_release == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             platform: x86_64-linux
+            target: x86_64-linux-gnu
             suffix: .so
           - os: macos-26
             platform: aarch64-macos
@@ -38,8 +112,25 @@ jobs:
             suffix: .dll
             target: aarch64-windows-gnu
     runs-on: ${{ matrix.os }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache Zig build state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+            ${{ env.ZIG_LOCAL_CACHE_DIR }}
+          key: release-${{ runner.os }}-${{ matrix.platform }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/**', '.github/workflows/release.yml') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ matrix.platform }}-
 
       - name: Select Xcode 26.3 for Zig 0.15.2
         if: runner.os == 'macOS'
@@ -64,57 +155,60 @@ jobs:
       - name: Build native module
         shell: bash
         run: |
+          set -euo pipefail
           conpty_args=()
           if [ "${{ runner.os }}" = "Windows" ]; then
             conpty_args=(-Dwindows-conpty-package-dir=conpty-package)
           fi
+          build_args=(-Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}")
           if [ -n "${{ matrix.target }}" ]; then
-            zig build --prefix . -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}"
-          else
-            zig build --prefix . -Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}"
+            build_args=(-Dtarget=${{ matrix.target }} "${build_args[@]}")
           fi
+          for attempt in 1 2 3; do
+            if zig build "${build_args[@]}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
-      - name: Strip non-exported symbols (macOS)
-        if: runner.os == 'macOS'
-        run: strip -x ghostel-module${{ matrix.suffix }}
-
-      - name: Rename artifact for release
+      - name: Strip non-exported symbols
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          mv ghostel-module${{ matrix.suffix }} \
-             ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            mv conpty.dll ghostel-conpty-${{ matrix.platform }}.dll
-            for host in x86 x64 arm64; do
-              if [ -f "$host/OpenConsole.exe" ]; then
-                mv "$host/OpenConsole.exe" \
-                   "ghostel-openconsole-${{ matrix.platform }}-$host.exe"
-              fi
-            done
+          for f in zig-out/bin/*-module${{ matrix.suffix }}; do
+            strip -x "$f" 2>/dev/null || strip "$f" 2>/dev/null || true
+          done
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          files=(
+            dyn-loader-module${{ matrix.suffix }}
+            ghostel-module${{ matrix.suffix }}
+            ghostel-module.json
+            ghostel-module.version
+          )
+          if [[ "${{ matrix.platform }}" == "x86_64-windows" ]]; then
+            files+=(conpty.dll x64/OpenConsole.exe)
+          elif [[ "${{ matrix.platform }}" == "aarch64-windows" ]]; then
+            files+=(conpty.dll arm64/OpenConsole.exe)
           fi
+          while IFS= read -r pdb; do
+            files+=("${pdb#zig-out/bin/}")
+          done < <(find zig-out/bin -type f -name '*.pdb' -print)
+          tar -C zig-out/bin -cJf ghostel-module-${{ matrix.platform }}.tar.xz "${files[@]}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload artifact to release
+        uses: ncipollo/release-action@v1
         with:
-          name: ghostel-module-${{ matrix.platform }}
-          path: |
-            ghostel-module-${{ matrix.platform }}${{ matrix.suffix }}
-            ghostel-conpty-${{ matrix.platform }}.dll
-            ghostel-openconsole-${{ matrix.platform }}-*.exe
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: artifacts/**/*
+          tag: ${{ needs.prepare-release.outputs.tag }}
+          allowUpdates: true
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          omitDraftDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
+          artifacts: ghostel-module-${{ matrix.platform }}.tar.xz
+          token: ${{ secrets.GITHUB_TOKEN }}
