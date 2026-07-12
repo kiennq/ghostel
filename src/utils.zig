@@ -1,6 +1,5 @@
 const gt = @import("ghostty-vt");
-
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 
 pub fn cellCharCount(page: *gt.Page, cell: *gt.Cell) usize {
     if (cell.wide == .spacer_head or cell.wide == .spacer_tail) {

@@ -27,7 +27,9 @@ live PTY.  Leaves the buffer in line mode with point at the input."
   (ghostel-test--redraw term t)
   (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
             ((symbol-function 'ghostel--write-pty) #'ignore)
-            ((symbol-function 'ghostel--invalidate) #'ignore))
+            ((symbol-function 'ghostel--invalidate) #'ignore)
+            ((symbol-function 'ghostel--pty-password-input-p)
+             (lambda (&rest _) nil)))
     (ghostel-line-mode)))
 
 ;; 6.1 — typing then undo reverts the in-progress input.
@@ -69,7 +71,9 @@ live PTY.  Leaves the buffer in line mode with point at the input."
                        (lambda (&rest _) nil))
                       ((symbol-function 'ghostel--redraw) #'ignore)
                       ((symbol-function 'ghostel--invalidate) #'ignore)
-                      ((symbol-function 'ghostel--anchor-window) #'ignore))
+                      ((symbol-function 'ghostel--anchor-window) #'ignore)
+                      ((symbol-function 'ghostel--pty-password-input-p)
+                       (lambda (&rest _) nil)))
               (ghostel-line-mode)
               (should (eq ghostel--input-mode 'line))
               ;; Armed: a list, recording on.
@@ -94,7 +98,9 @@ start, so an undo can never delete the prompt or earlier output."
     (ghostel-test--redraw term t)
     (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
               ((symbol-function 'ghostel--write-pty) #'ignore)
-              ((symbol-function 'ghostel--invalidate) #'ignore))
+              ((symbol-function 'ghostel--invalidate) #'ignore)
+              ((symbol-function 'ghostel--pty-password-input-p)
+               (lambda (&rest _) nil)))
       (ghostel-line-mode)
       (should (eq ghostel--input-mode 'line))
       (let* ((input-start (marker-position ghostel--line-input-start))
