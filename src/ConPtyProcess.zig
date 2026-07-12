@@ -26,10 +26,26 @@ hpc: HPCON = null,
 pty_input: c.HANDLE = c.INVALID_HANDLE_VALUE,
 pty_output: c.HANDLE = c.INVALID_HANDLE_VALUE,
 interrupt_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
+command_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
 output_read_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
 input_write_event: c.HANDLE = c.INVALID_HANDLE_VALUE,
+pseudo_console_close_thread: ?std.Thread = null,
 shell_process: c.HANDLE = c.INVALID_HANDLE_VALUE,
 pid: i64 = -1,
+
+const ReadOutputResult = enum {
+    output,
+    command,
+    finished,
+    stopped,
+};
+
+const WaitForReadResult = enum {
+    ready,
+    process,
+    command,
+    stopped,
+};
 
 var create_pseudo_console: ?CreatePseudoConsoleFn = null;
 var resize_pseudo_console: ?ResizePseudoConsoleFn = null;
@@ -178,6 +194,30 @@ pub const EventWriter = struct {
     }
 };
 
+pub const Reaper = struct {
+    hpc: HPCON,
+    pty_input: c.HANDLE,
+    pty_output: c.HANDLE,
+    output_read_event: c.HANDLE,
+    input_write_event: c.HANDLE,
+    shell_process: c.HANDLE,
+    pid: i64,
+
+    pub fn deinitAndWait(self: *@This()) u32 {
+        closeConPtyHandles(self);
+
+        var exit_code: c.DWORD = 0;
+        if (self.shell_process != c.INVALID_HANDLE_VALUE) {
+            _ = c.WaitForSingleObject(self.shell_process, c.INFINITE);
+            _ = c.GetExitCodeProcess(self.shell_process, &exit_code);
+            _ = c.CloseHandle(self.shell_process);
+            self.shell_process = c.INVALID_HANDLE_VALUE;
+        }
+
+        return exit_code;
+    }
+};
+
 pub fn init(alloc: Allocator, io: std.Io, initial_cols: u16, initial_rows: u16, params: backend_types.ProcessParams) !Self {
     try initApi();
 
@@ -185,7 +225,13 @@ pub fn init(alloc: Allocator, io: std.Io, initial_cols: u16, initial_rows: u16, 
 
     self.interrupt_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
     if (self.interrupt_event == null) return error.CreateEventFailed;
-    errdefer closeConPtyHandles(&self);
+    errdefer {
+        closeConPtyHandles(&self);
+        self.closeWakeEndpoints();
+    }
+
+    self.command_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
+    if (self.command_event == null) return error.CreateEventFailed;
 
     self.output_read_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
     if (self.output_read_event == null) return error.CreateEventFailed;
@@ -203,28 +249,32 @@ pub fn pidValue(self: *const Self) i64 {
     return self.pid;
 }
 
-pub fn drain(self: *Self, stream: anytype) !bool {
-    const interrupt_handles = [_]c.HANDLE{
-        self.shell_process,
-        self.interrupt_event,
+pub fn drain(self: *Self, stream: anytype) !backend_types.DrainResult {
+    return switch (try self.readOutput(stream, true)) {
+        .output => .output,
+        .command => blk: {
+            self.clearCommandWake();
+            break :blk .command;
+        },
+        .finished => .finished,
+        .stopped => .stopped,
     };
-
-    return try self.readOutput(stream, &interrupt_handles) == .ok;
 }
 
 pub fn finishDrain(self: *Self, stream: anytype) !void {
     self.clearInterruptEvent();
-    const close_thread = startPseudoConsoleClose(self) orelse return;
-    defer close_thread.join();
+    self.clearCommandWake();
+    self.startPseudoConsoleClose();
+    defer self.joinPseudoConsoleClose();
 
-    while (try self.readOutput(stream, &.{}) == .ok) {}
+    while (try self.readOutput(stream, false) == .output) {}
 }
 
 fn readOutput(
     self: *Self,
     stream: anytype,
-    interrupt_handles: []const c.HANDLE,
-) !union(enum) { ok, finished } {
+    include_wakeups: bool,
+) !ReadOutputResult {
     if (self.pty_output == c.INVALID_HANDLE_VALUE) return .finished;
     if (self.output_read_event == c.INVALID_HANDLE_VALUE) return error.IoFailed;
 
@@ -242,29 +292,44 @@ fn readOutput(
         &bytes_read,
         &overlapped,
     ) != 0) {
+        if (bytes_read == 0) return .finished;
         try stream.nextSlice(buf[0..bytes_read]);
-        return .ok;
+        return .output;
     }
 
     switch (c.GetLastError()) {
         c.ERROR_IO_PENDING => {},
-        c.ERROR_OPERATION_ABORTED, c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => {
-            return .finished;
-        },
+        c.ERROR_OPERATION_ABORTED => return self.pendingWakeResult(),
+        c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .finished,
         else => return error.IoFailed,
     }
     errdefer _ = completeOverlapped(self.pty_output, &overlapped, true) catch {};
 
-    const wait_result = try self.waitForRead(interrupt_handles);
-    const complete_result = try completeOverlapped(
-        self.pty_output,
-        &overlapped,
-        wait_result == .interrupted,
-    );
-    if (complete_result == .bytes) try stream.nextSlice(buf[0..complete_result.bytes]);
-
-    if (wait_result == .interrupted or complete_result != .bytes) return .finished;
-    return .ok;
+    var include_process = include_wakeups;
+    while (true) {
+        const wait_result = try self.waitForRead(include_process, include_wakeups);
+        switch (wait_result) {
+            .ready => switch (try completeOverlapped(self.pty_output, &overlapped, false)) {
+                .bytes => |n| {
+                    if (n == 0) return .finished;
+                    try stream.nextSlice(buf[0..n]);
+                    return .output;
+                },
+                .aborted, .closed => return .finished,
+            },
+            .process => {
+                self.startPseudoConsoleClose();
+                include_process = false;
+            },
+            .command, .stopped => {
+                switch (try completeOverlapped(self.pty_output, &overlapped, true)) {
+                    .bytes => |n| if (n > 0) try stream.nextSlice(buf[0..n]),
+                    .aborted, .closed => {},
+                }
+                return if (wait_result == .command) .command else .stopped;
+            },
+        }
+    }
 }
 
 fn completeOverlapped(
@@ -296,27 +361,68 @@ fn completeOverlapped(
     return .{ .bytes = @intCast(bytes_transferred) };
 }
 
-fn waitForRead(
-    self: *Self,
-    interrupt_handles: []const c.HANDLE,
-) !union(enum) { ready, interrupted } {
-    var handles: [3]c.HANDLE = undefined;
+fn waitForRead(self: *Self, include_process: bool, include_wakeups: bool) !WaitForReadResult {
+    var handles: [4]c.HANDLE = undefined;
     var count: c.DWORD = 0;
     const read_index = count;
     handles[count] = self.output_read_event;
     count += 1;
 
-    for (interrupt_handles) |handle| {
-        if (handle == c.INVALID_HANDLE_VALUE) continue;
-        handles[count] = handle;
+    var process_index: ?c.DWORD = null;
+    var stop_index: ?c.DWORD = null;
+    var command_index: ?c.DWORD = null;
+    if (include_process and self.shell_process != c.INVALID_HANDLE_VALUE) {
+        process_index = count;
+        handles[count] = self.shell_process;
         count += 1;
+    }
+    if (include_wakeups) {
+        if (self.interrupt_event != c.INVALID_HANDLE_VALUE) {
+            stop_index = count;
+            handles[count] = self.interrupt_event;
+            count += 1;
+        }
+        if (self.command_event != c.INVALID_HANDLE_VALUE) {
+            command_index = count;
+            handles[count] = self.command_event;
+            count += 1;
+        }
     }
 
     const result = c.WaitForMultipleObjects(count, &handles, c.FALSE, c.INFINITE);
     if (result < c.WAIT_OBJECT_0 or result >= c.WAIT_OBJECT_0 + count) return error.WaitFailed;
 
     const index = result - c.WAIT_OBJECT_0;
-    return if (index == read_index) .ready else .interrupted;
+    if (index == read_index) return .ready;
+    if (process_index != null and index == process_index.?) return .process;
+    if (stop_index != null and index == stop_index.?) return .stopped;
+    if (command_index != null and index == command_index.?) return .command;
+    return error.WaitFailed;
+}
+
+fn pendingWakeResult(self: *Self) ReadOutputResult {
+    if (self.interrupt_event != c.INVALID_HANDLE_VALUE and
+        c.WaitForSingleObject(self.interrupt_event, 0) == c.WAIT_OBJECT_0)
+    {
+        return .stopped;
+    }
+    if (self.command_event != c.INVALID_HANDLE_VALUE and
+        c.WaitForSingleObject(self.command_event, 0) == c.WAIT_OBJECT_0)
+    {
+        self.clearCommandWake();
+        return .command;
+    }
+    return .finished;
+}
+
+pub fn wakeCommands(self: *Self) void {
+    if (self.command_event == c.INVALID_HANDLE_VALUE) return;
+    _ = c.SetEvent(self.command_event);
+}
+
+pub fn clearCommandWake(self: *Self) void {
+    if (self.command_event == c.INVALID_HANDLE_VALUE) return;
+    _ = c.ResetEvent(self.command_event);
 }
 
 pub fn write(
@@ -349,7 +455,7 @@ pub fn write(
 
     switch (c.GetLastError()) {
         c.ERROR_IO_PENDING => {},
-        c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return .interrupted,
+        c.ERROR_BROKEN_PIPE, c.ERROR_INVALID_HANDLE => return error.ProcessExited,
         else => return error.IoFailed,
     }
     errdefer _ = completeOverlapped(self.pty_input, &overlapped, true) catch {};
@@ -388,7 +494,7 @@ pub fn write(
         return switch (complete_result) {
             .bytes => |n| if (n > 0) .{ .written = n } else error.IoFailed,
             .aborted => if (interrupted) .interrupted else error.IoFailed,
-            .closed => .interrupted,
+            .closed => error.ProcessExited,
         };
     }
 }
@@ -407,22 +513,40 @@ pub fn requestStop(self: *Self, _: std.Thread) void {
     _ = c.SetEvent(self.interrupt_event);
 }
 
+pub fn takeForReaper(self: *Self) Reaper {
+    const reaper = Reaper{
+        .hpc = self.hpc,
+        .pty_input = self.pty_input,
+        .pty_output = self.pty_output,
+        .output_read_event = self.output_read_event,
+        .input_write_event = self.input_write_event,
+        .shell_process = self.shell_process,
+        .pid = self.pid,
+    };
+    self.hpc = null;
+    self.pty_input = c.INVALID_HANDLE_VALUE;
+    self.pty_output = c.INVALID_HANDLE_VALUE;
+    self.output_read_event = c.INVALID_HANDLE_VALUE;
+    self.input_write_event = c.INVALID_HANDLE_VALUE;
+    self.shell_process = c.INVALID_HANDLE_VALUE;
+    self.pid = -1;
+    return reaper;
+}
+
 pub fn replicaName(_: *Self) []const u8 {
     return "";
 }
 
+pub fn closeWakeEndpoints(self: *Self) void {
+    closeHandle(&self.interrupt_event);
+    closeHandle(&self.command_event);
+}
+
 pub fn deinitAndWait(self: *Self) u32 {
-    self.closeConPtyHandles();
-
-    var exit_code: c.DWORD = 0;
-    if (self.shell_process != c.INVALID_HANDLE_VALUE) {
-        _ = c.WaitForSingleObject(self.shell_process, c.INFINITE);
-        _ = c.GetExitCodeProcess(self.shell_process, &exit_code);
-        _ = c.CloseHandle(self.shell_process);
-        self.shell_process = c.INVALID_HANDLE_VALUE;
-    }
-
-    return exit_code;
+    self.joinPseudoConsoleClose();
+    self.closeWakeEndpoints();
+    var reaper = self.takeForReaper();
+    return reaper.deinitAndWait();
 }
 
 fn initApi() !void {
@@ -502,7 +626,7 @@ fn createConPty(self: *Self, io: std.Io, rows: u16, cols: u16) !void {
     var out_read: c.HANDLE = c.INVALID_HANDLE_VALUE;
     var out_write: c.HANDLE = c.INVALID_HANDLE_VALUE;
     errdefer {
-        self.closeConPtyHandles();
+        closeConPtyHandles(self);
         if (in_read != c.INVALID_HANDLE_VALUE) _ = c.CloseHandle(in_read);
         if (in_write != c.INVALID_HANDLE_VALUE) _ = c.CloseHandle(in_write);
         if (out_read != c.INVALID_HANDLE_VALUE) _ = c.CloseHandle(out_read);
@@ -538,26 +662,27 @@ fn closeHandle(handle: *c.HANDLE) void {
     }
 }
 
-fn closeConPtyHandles(self: *Self) void {
+fn closeConPtyHandles(self: anytype) void {
     closeHandle(&self.pty_input);
     closeHandle(&self.pty_output);
-    self.closePseudoConsole();
-    closeHandle(&self.interrupt_event);
+    closePseudoConsole(&self.hpc);
     closeHandle(&self.output_read_event);
     closeHandle(&self.input_write_event);
 }
 
-fn closePseudoConsole(self: *Self) void {
-    if (self.hpc != null) {
+fn closePseudoConsole(hpc: *HPCON) void {
+    if (hpc.* != null) {
         // ClosePseudoConsole owns the documented ConPTY teardown path.
-        close_pseudo_console.?(self.hpc);
-        self.hpc = null;
+        close_pseudo_console.?(hpc.*);
+        hpc.* = null;
     }
 }
 
-fn startPseudoConsoleClose(self: *Self) ?std.Thread {
+fn startPseudoConsoleClose(self: *Self) void {
+    if (self.pseudo_console_close_thread != null) return;
+
     const hpc = self.hpc;
-    if (hpc == null) return null;
+    if (hpc == null) return;
     self.hpc = null;
 
     // Child exit only tells us when to initiate teardown; EOF on the output
@@ -565,7 +690,7 @@ fn startPseudoConsoleClose(self: *Self) ?std.Thread {
     // block inside ClosePseudoConsole until that drain completes, so the reader
     // thread must hand the handle to a helper, keep reading to EOF, and then
     // join the helper.
-    return std.Thread.spawn(
+    self.pseudo_console_close_thread = std.Thread.spawn(
         .{ .stack_size = 128 * 1024 },
         closePseudoConsoleHandle,
         .{hpc},
@@ -574,8 +699,15 @@ fn startPseudoConsoleClose(self: *Self) ?std.Thread {
             "Failed to spawn ConPTY closer thread; leaking pseudoconsole handle to avoid reader deadlock: {any}",
             .{err},
         );
-        return null;
+        return;
     };
+}
+
+fn joinPseudoConsoleClose(self: *Self) void {
+    if (self.pseudo_console_close_thread) |thread| {
+        thread.join();
+        self.pseudo_console_close_thread = null;
+    }
 }
 
 fn closePseudoConsoleHandle(hpc: HPCON) void {
@@ -790,6 +922,46 @@ test "notify CRT provider ignores non-dup CRT imports" {
     try std.testing.expectEqual(
         @as(?EventWriter.NotifyCrtProvider, null),
         EventWriter.notifyCrtProviderForImport("kernel32.dll", "_dup"),
+    );
+}
+
+test "wakeCommands signals command event after reaper handoff" {
+    const command_event = c.CreateEventW(null, c.TRUE, c.FALSE, null) orelse
+        return error.CreateEventFailed;
+    defer _ = c.CloseHandle(command_event);
+
+    var process = Self{
+        .alloc = std.testing.allocator,
+        .command_event = command_event,
+        .pid = 42,
+    };
+
+    _ = process.takeForReaper();
+    process.wakeCommands();
+
+    try std.testing.expectEqual(
+        @as(c.DWORD, c.WAIT_OBJECT_0),
+        c.WaitForSingleObject(command_event, 0),
+    );
+}
+
+test "requestStop signals interrupt event after reaper handoff" {
+    const interrupt_event = c.CreateEventW(null, c.TRUE, c.FALSE, null) orelse
+        return error.CreateEventFailed;
+    defer _ = c.CloseHandle(interrupt_event);
+
+    var process = Self{
+        .alloc = std.testing.allocator,
+        .interrupt_event = interrupt_event,
+        .pid = 42,
+    };
+
+    _ = process.takeForReaper();
+    process.requestStop(undefined);
+
+    try std.testing.expectEqual(
+        @as(c.DWORD, c.WAIT_OBJECT_0),
+        c.WaitForSingleObject(interrupt_event, 0),
     );
 }
 
