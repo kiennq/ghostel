@@ -537,6 +537,8 @@ E.g. `compilation-mode' error loci in `ghostel-compile-view-mode'."
                                timer-fn fn
                                timer-args args)
                          'ghostel-test-link-timer))
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
                       ((symbol-function 'ghostel--redraw)
                        (lambda (&rest _) t))
                       ((symbol-function 'ghostel--window-anchored-p) #'ignore)
@@ -586,6 +588,8 @@ E.g. `compilation-mode' error loci in `ghostel-compile-view-mode'."
                                timer-fn fn
                                timer-args args)
                          'ghostel-test-link-timer))
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
                       ((symbol-function 'ghostel--redraw)
                        (lambda (&rest _) t))
                       ((symbol-function 'ghostel--window-anchored-p) #'ignore)
@@ -1243,42 +1247,39 @@ for `no longer there'."
 `http://tmp/x' contains `//tmp/x', which the file pattern matches and
 which may name a real file — the URL must not be replaced by it, and
 the file must not be stat'ed on every scan."
-  (ghostel-test--with-link-fixture (dir _file)
-    (let* ((url (concat "http:/" dir "a.el")))
-      ;; The URL's path half is exactly the fixture file, which exists.
-      (with-temp-buffer
-        (insert "get " url " done\n")
-        (goto-char (point-max))
-        (let ((stats 0))
-          (cl-letf* ((real (symbol-function 'file-exists-p))
-                     ((symbol-function 'file-exists-p)
-                      (lambda (f) (setq stats (1+ stats)) (funcall real f))))
-            (dotimes (_ 3) (ghostel--detect-urls)))
-          (should (equal url (get-text-property 5 'help-echo)))
-          ;; One run, not a URL prefix followed by a fileref.
-          (should (= 1 (length (ghostel-test--link-runs))))
-          (should (zerop stats)))
-        ;; Still protected once URL detection is switched off, so toggling
-        ;; the option cannot turn an existing URL link into a file link.
-        ;; Assert past `http:', where a file match would start.
-        (let ((ghostel-enable-url-detection nil))
-          (ghostel--detect-urls))
-        (should (equal url (get-text-property 12 'help-echo)))
-        (should (= 1 (length (ghostel-test--link-runs))))))))
+  (let ((url "http://example.test/path/a.el"))
+    (with-temp-buffer
+      (insert "get " url " done\n")
+      (goto-char (point-max))
+      (let ((stats 0))
+        (cl-letf (((symbol-function 'file-exists-p)
+                   (lambda (_) (setq stats (1+ stats)) t)))
+          (dotimes (_ 3) (ghostel--detect-urls)))
+        (should (equal url (get-text-property 5 'help-echo)))
+        ;; One run, not a URL prefix followed by a fileref.
+        (should (= 1 (length (ghostel-test--link-runs))))
+        (should (zerop stats)))
+      ;; Still protected once URL detection is switched off, so toggling
+      ;; the option cannot turn an existing URL link into a file link.
+      ;; Assert past `http:', where a file match would start.
+      (let ((ghostel-enable-url-detection nil))
+        (ghostel--detect-urls))
+      (should (equal url (get-text-property 12 'help-echo)))
+      (should (= 1 (length (ghostel-test--link-runs)))))))
 
 (ert-deftest ghostel-test-detect-url-owns-the-path-inside-it ()
   "A URL keeps the file pass out of the `//host/path' half it contains.
 The path inside this URL names a file that exists, so only the URL's
 claim on the span stops it becoming a local-file link."
-  (ghostel-test--with-link-fixture (dir file)
+  (let ((url "https://example.test/path/a.el:9"))
     (with-temp-buffer
-      (insert " https:/" file ":9 end\n")
+      (insert " " url " end\n")
       (goto-char (point-max))
-      (ghostel--detect-urls)
+      (cl-letf (((symbol-function 'file-exists-p) (lambda (_) t)))
+        (ghostel--detect-urls))
       (should-not (seq-find (lambda (run)
                               (string-prefix-p "fileref:" (cadr run)))
-                            (ghostel-test--link-runs)))
-      (ignore dir))))
+                            (ghostel-test--link-runs))))))
 
 (ert-deftest ghostel-test-detect-replaces-stale-url-link-in-one-scan ()
   "A leftover URL link over what is now a path becomes the path link.

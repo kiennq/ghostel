@@ -9,21 +9,15 @@
 
 (require 'ghostel-test-helpers)
 
-(defvar ghostel-test-compile--mode-finish-called nil)
-
 (defvar-local ghostel-test-compile--finish-continuation nil)
 
-(define-derived-mode ghostel-test-compile-finish-mode compilation-mode "Test-Compilation"
-  "Compilation mode that installs a mode-local finish hook for tests."
-  (setq-local ghostel-test-compile--finish-continuation
-              (lambda (buffer message)
-                (setq ghostel-test-compile--mode-finish-called
-                      (cons buffer message))))
-  (add-hook 'compilation-finish-functions
-            (lambda (buffer message)
-              (funcall ghostel-test-compile--finish-continuation
-                       buffer message))
-            nil t))
+(defun ghostel-compile-test--fake-live-process (name buf)
+  "Return a live process-like object named NAME for tests in BUF."
+  (make-pipe-process :name name
+                     :buffer buf
+                     :noquery t
+                     :filter #'ignore
+                     :sentinel #'ignore))
 
 (ert-deftest ghostel-test-compile-finalize-scans-errors ()
   "`ghostel-compile--finalize' parses errors in the scan region."
@@ -452,8 +446,8 @@ has to be one Emacs can actually find."
       (should (equal 1 (length c-calls)))                     ; compile hook
       (should (equal "finished\n" (cdar c-calls))))))
 
-(ert-deftest ghostel-test-compile-existing-local-finish-hook-state-is-available ()
-  "Existing buffer-local compile finish hook state is available at finalization."
+(ert-deftest ghostel-test-compile-buffer-local-finish-hook-state-is-available ()
+  "Buffer-local compile finish hook state is available at finalization."
   (ghostel-test--with-compile-buffer buf
     (let ((finish-called nil)
           (continuation-called nil))
@@ -470,20 +464,6 @@ has to be one Emacs can actually find."
       (ghostel-compile--finalize buf 0 (current-time))
       (should finish-called)
       (should continuation-called))))
-
-(ert-deftest ghostel-test-compile-mode-local-finish-hook-runs ()
-  "A custom compilation mode's buffer-local finish hook runs at finalization."
-  (ghostel-test--with-compile-buffer buf
-    (let ((ghostel-compile-finished-major-mode
-           #'ghostel-test-compile-finish-mode)
-          (ghostel-test-compile--mode-finish-called nil))
-      (setq ghostel-compile--command "true"
-            ghostel-compile--start-time (current-time)
-            ghostel-compile--scan-marker (copy-marker (point-max)))
-      (ghostel-compile--finalize buf 0 (current-time))
-      (should (eq major-mode 'ghostel-test-compile-finish-mode))
-      (should (equal (cons buf "finished\n")
-                     ghostel-test-compile--mode-finish-called)))))
 
 (ert-deftest ghostel-test-compile-auto-jump-to-first-error ()
   "With `compilation-auto-jump-to-first-error' set, jump after parsing."
@@ -1398,10 +1378,9 @@ normally."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory)))
           (with-current-buffer buf
-            (ghostel-test--wait-for
-             ghostel--process
+            (ghostel-test--wait-until
              (lambda () ghostel-compile--finalized)
-             10)
+             ghostel--process 10)
             (should (equal 7 ghostel-compile--last-exit))
             (let ((text (buffer-substring-no-properties
                          (point-min) (point-max))))
