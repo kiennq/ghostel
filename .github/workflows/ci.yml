@@ -256,21 +256,16 @@ jobs:
             conpty_args=(-Dwindows-conpty-package-dir=conpty-package)
           fi
           if [ -n "${{ matrix.target }}" ]; then
-            zig build --prefix . -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}"
+            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}"
           else
-            zig build --prefix . -Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}"
+            zig build -Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}"
           fi
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-          path: |
-            ghostel-module${{ matrix.suffix }}
-            ghostel-module.version
-            conpty.dll
-            x64/OpenConsole.exe
-            arm64/OpenConsole.exe
+          path: zig-out/bin/
 
   test-native:
     needs: build-native
@@ -317,22 +312,24 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ghostel-module-${{ matrix.platform }}
-
-      - name: Mark pre-built module as up-to-date
-        # The module was built in a prior job and its mtime predates the
-        # checkout, so make would consider it stale w.r.t. src/*.zig and
-        # try to re-invoke `zig build' (Zig isn't installed in this job).
-        # Touching the artifact pins the Make dependency.
-        run: touch ghostel-module${{ matrix.suffix }}
+          path: zig-out/bin
 
       - name: Install compat
-        run: git clone --depth 1 https://github.com/emacs-compat/compat.git /tmp/compat
+        shell: bash
+        run: git clone --depth 1 https://github.com/emacs-compat/compat.git "$RUNNER_TEMP/compat"
 
       - name: Run native module tests
+        shell: bash
         run: |
-          make -j$(getconf _NPROCESSORS_ONLN) \
-            EMACSFLAGS="-L /tmp/compat" \
-            test-native
+          find test -maxdepth 1 -name 'ghostel-*-test.el' -print | sort | while IFS= read -r file; do
+            printf '  NATIVE  %s\n' "${file##*/}"
+            emacs --batch -Q -L "$RUNNER_TEMP/compat" -L lisp -L test \
+              --eval '(setq ghostel-module-directory (expand-file-name "zig-out/bin" default-directory))' \
+              -l ert \
+              -l test/ghostel-test-helpers.el \
+              -l "$file" \
+              --eval "(ert-run-tests-batch-and-exit '(tag native))"
+          done
 
   test-native-windows:
     needs: build-native
@@ -355,11 +352,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ghostel-module-x86_64-windows
+          path: zig-out/bin
 
       - name: Run Windows native module tests
         shell: msys2 {0}
         run: |
-          touch ghostel-module.dll
           git clone --depth 1 https://github.com/emacs-compat/compat.git /tmp/compat
           # Neither stream of this emacs reaches the job log, even
           # redirected to a file, so ERT results would be invisible.  Have
@@ -410,9 +407,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ghostel-module-x86_64-linux
-
-      - name: Mark pre-built module as up-to-date
-        run: touch ghostel-module.so
+          path: zig-out/bin
 
       - name: Install compat
         run: git clone --depth 1 https://github.com/emacs-compat/compat.git /tmp/compat
