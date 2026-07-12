@@ -8,7 +8,7 @@ const gt = @import("ghostty-vt");
 const GhostelTerm = @import("GhostelTerm.zig");
 const GlyphMetricsCache = @import("GlyphMetricsCache.zig");
 const SavedBufferMarkers = @import("saved_markers.zig").SavedBufferMarkers;
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const utils = @import("utils.zig");
 
 const style_face = @import("style_face.zig");

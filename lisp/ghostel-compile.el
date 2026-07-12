@@ -427,6 +427,21 @@ same as in any compilation buffer."
             ;; Must follow the teardown: a live renderer would rewrite the
             ;; joined rows on its next redraw.
             (ghostel-compile--unwrap-soft-wraps)
+            ;; A delayed first redraw may replace the whole buffer and collapse
+            ;; the live scan marker into the header.  Re-find the exact header
+            ;; after joining wraps; if scrollback evicted it, all remaining text
+            ;; is command output and parsing should start at `point-min'.
+            (when (and command start-time)
+              (setq start
+                    (save-excursion
+                      (goto-char (point-min))
+                      (let ((default-directory
+                             (or directory default-directory)))
+                        (if (search-forward
+                             (ghostel-compile--header-text command start-time)
+                             nil t)
+                            (copy-marker (point))
+                          (copy-marker (point-min)))))))
             ;; Switch major mode now that the process is dead.  Preserve state
             ;; that `kill-all-local-variables' would otherwise wipe.  A
             ;; per-buffer override (set by the `compilation-start' advice
@@ -583,7 +598,7 @@ destroys the grid, so commit it here or lose the output it holds."
                 (when ghostel--redraw-timer
                   (cancel-timer ghostel--redraw-timer)
                   (setq ghostel--redraw-timer nil))
-                (ghostel--redraw-now buffer)
+                (ghostel--redraw-now buffer t)
                 (ghostel-compile--commit-pending-frame buffer))
               (ghostel-compile--finalize buffer exit (current-time)))))
       (setq compilation-in-progress
@@ -769,11 +784,12 @@ the rendered buffer remains read-only in both cases."
       ;; `ghostel-mode'
       ;; so the renderer/timer/resize hooks (which all gate on `derived-mode-p
       ;; \\='ghostel-mode\\=') keep working; only input handling changes.
-      (unless interactive
+      (if interactive
+          (ghostel--sync-read-only)
         (use-local-map ghostel-compile-view-mode-map)
-        (setq buffer-read-only t)
         ;; Compilation-style buffers keep the plain read-only barrier.
-        (ghostel-compile--set-compilation-style-input t))
+        (ghostel-compile--set-compilation-style-input t)
+        (ghostel--sync-read-only))
       ;; Enable the live toggle (`C-c C-j' / `C-c C-e') in compile
       ;; buffers, regardless of which run mode they're in.  The
       ;; minor-mode keymap takes precedence over the major-mode map
@@ -1098,6 +1114,12 @@ Bound to \\[ghostel-compile-switch-to-interactive] in
     (use-local-map ghostel-semi-char-mode-map)
     (ghostel-compile--set-compilation-style-input nil)
     (ghostel--sync-read-only)
+    ;; The selected-only redraw policy may leave the prompt and cursor pending
+    ;; until this command runs.  Materialize them before password detection and
+    ;; cursor placement need the latest frame.
+    (when ghostel--term
+      (ghostel--redraw-now
+       (current-buffer) ghostel--redraw-force-selected-window))
     ;; Turn on PTY echo so input typed at a read prompt is visible.
     ;; Skipped when the cursor row looks like a password prompt: the
     ;; pty state cannot distinguish a program-set `-echo' from the
@@ -1107,11 +1129,10 @@ Bound to \\[ghostel-compile-switch-to-interactive] in
     ;; Place point at the VT cursor so the user's first keystroke
     ;; lands at the prompt, not at wherever they happened to be
     ;; navigating in the read-only buffer.
-    (when ghostel--term
-      (let ((rc ghostel--cursor-pos))
-        (goto-char (point-min))
-        (forward-line (cdr rc))
-        (move-to-column (car rc))))
+    (when-let* ((rc ghostel--cursor-pos))
+      (goto-char (point-min))
+      (forward-line (cdr rc))
+      (move-to-column (car rc)))
     ;; Bottom-align the window on the live output; a nil-scroll run
     ;; has it parked at the top of the buffer.
     (ghostel--anchor-window nil t)
