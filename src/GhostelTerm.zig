@@ -3,9 +3,10 @@
 /// Holds the resources for one Ghostel terminal, including rendering state
 /// and, for native PTY sessions, the process reader.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const GhostelHandler = @import("handler.zig").GhostelHandler;
 const Renderer = @import("Renderer.zig");
@@ -15,11 +16,12 @@ const kitty_graphics = @import("kitty_graphics.zig");
 const utils = @import("utils.zig");
 const parseHexColor = utils.parseHexColor;
 const platform = @import("platform.zig");
+const pty_utils = @import("pty_utils.zig");
+
 const NativeProcess = @import("NativeProcess.zig");
 const ChannelFd = NativeProcess.ChannelFd;
 const ProcessParams = NativeProcess.ProcessParams;
 const ProcessPid = i64;
-const pty_utils = @import("pty_utils.zig");
 
 const Self = @This();
 
@@ -33,6 +35,7 @@ renderer: Renderer,
 process: ?*NativeProcess = null,
 /// Light/dark as classified by Emacs for `ghostel-default`; reported via CSI 996/997.
 color_scheme: gt.device_status.ColorScheme = .dark,
+emacs_process_pid: ?i64 = null,
 
 /// Create a new terminal with the given dimensions and scrollback.
 pub fn init(
@@ -70,7 +73,6 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     if (self.process) |process| {
         process.deinit();
-        self.alloc.destroy(process);
     }
 
     self.renderer.deinit();
@@ -81,7 +83,7 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn redraw(self: *Self, force_full: bool, force_sync: bool) !bool {
-    try self.lock();
+    if (!self.mutex.tryLock()) return false;
     defer self.unlock();
 
     const env = emacs.current_env orelse return false;
@@ -89,7 +91,10 @@ pub fn redraw(self: *Self, force_full: bool, force_sync: bool) !bool {
     if (!try self.renderer.redraw(env, force_full, force_sync)) return false;
 
     _ = env.f("ghostel--kitty-clear", .{});
-    try kitty_graphics.emitPlacements(env, self);
+    kitty_graphics.emitPlacements(env, self) catch |err| {
+        env.logStackTrace(@errorReturnTrace());
+        env.logError("emitPlacements failed: %s", .{@errorName(err)});
+    };
     const post_size = .{ self.terminal.cols, self.terminal.rows };
 
     if (!std.meta.eql(pre_size, post_size)) {
@@ -135,7 +140,9 @@ pub fn ptyWrite(self: *Self, data: []const u8) !void {
 }
 
 pub fn ptyWriteFromTerminal(self: *Self, data: []const u8) void {
-    self.ptyWrite(data) catch {};
+    self.ptyWrite(data) catch |err| {
+        std.log.err("ghostel: Failed to write to PTY from terminal: {any}", .{err});
+    };
 }
 
 pub fn effect(_: *Self, comptime func: []const u8, args: anytype) void {
@@ -296,12 +303,37 @@ pub fn spawnNativeProcess(
 pub fn killNativeProcess(self: *Self) void {
     if (self.process) |process| {
         process.deinit();
-        self.alloc.destroy(process);
         self.process = null;
     }
 }
 
+pub fn isProcessLive(self: *Self) bool {
+    if (self.process) |process| {
+        return process.isRunning();
+    } else if (emacs.current_env) |env| {
+        return self.emacsProcessMaybeLive() and
+            env.isNotNil(env.symbolValue("ghostel--process"));
+    }
+
+    return false;
+}
+
+fn emacsProcessMaybeLive(self: *Self) bool {
+    const pid = self.emacs_process_pid orelse return true;
+    if (builtin.os.tag == .windows) return true;
+
+    const posix_pid = std.math.cast(std.posix.pid_t, pid) orelse return false;
+    std.posix.kill(posix_pid, 0) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
+        else => return false,
+    };
+    return true;
+}
+
 pub fn isPasswordMode(self: *Self) !bool {
+    if (builtin.os.tag == .windows) return false;
+
     if (self.process) |process| {
         return pty_utils.isPasswordMode(process.replicaName());
     } else if (emacs.current_env) |env| {
@@ -309,11 +341,15 @@ pub fn isPasswordMode(self: *Self) !bool {
         if (env.isNil(process)) return false;
         const tty_name_val = env.f("process-tty-name", .{process});
         if (env.isNil(tty_name_val)) return false;
-        const tty_name = try env.extractStringAlloc(
+
+        const tty_name = env.extractStringAlloc(
             self.alloc,
             tty_name_val,
             &self.string_buffer,
-        );
+        ) catch |err| switch (err) {
+            error.ExtractStringFailed => return false,
+            else => return err,
+        };
         return pty_utils.isPasswordMode(tty_name);
     }
 
@@ -325,10 +361,12 @@ var module_io: std.Io = undefined;
 var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 var temp_dir: []const u8 = undefined;
 
-pub fn initModule(allocator: Allocator, io: std.Io, env: emacs.Env) !void {
+pub fn setModuleRuntime(allocator: Allocator, io: std.Io) void {
     module_alloc = allocator;
     module_io = io;
-    env.registerFunctions(&emacs_functions);
+}
+
+pub fn setModuleEnvironment(env: emacs.Env) !void {
     temp_dir = try env.extractString(env.f("temporary-file-directory", .{}), &temp_dir_buf);
 }
 
@@ -453,6 +491,42 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         },
     },
     .{
+        .name = "ghostel--get-title",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Get the terminal title.
+        \\
+        \\(ghostel--get-title TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                try term.lock();
+                defer term.unlock();
+                const title = term.terminal.getTitle();
+                return if (title) |t| env.makeString(t) else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--get-pwd",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Get the terminal's working directory from OSC 7.
+        \\
+        \\(ghostel--get-pwd TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                try term.lock();
+                defer term.unlock();
+                const pwd = term.terminal.getPwd();
+                return if (pwd) |p| env.makeString(p) else env.nil();
+            }
+        },
+    },
+    .{
         .name = "ghostel--write-vt",
         .arity = .{ 2, 2 },
         .doc =
@@ -487,6 +561,22 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const raw = try env.extractStringAlloc(module_alloc, args[1], &term.string_buffer);
                 try term.ptyWrite(raw);
                 return env.t();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--set-process-pid",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Cache the local Emacs PTY child process id for TERM.
+        \\
+        \\(ghostel--set-process-pid TERM PID)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                term.emacs_process_pid = env.cast(i64, args[1]);
+                return env.nil();
             }
         },
     },
@@ -754,7 +844,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const mode: gt.modes.Mode = gt.modes.modeFromInt(mode_int, false) orelse {
                     return error.InvalidModeValue;
                 };
-                try term.lock();
+                if (!term.mutex.tryLock()) return env.nil();
                 defer term.unlock();
                 return if (term.terminal.modes.get(mode)) env.t() else env.nil();
             }
@@ -813,8 +903,8 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         \\
         \\COMMAND is a list of argv strings.  PIPE is an Emacs pipe process
         \\that acts as the Emacs-side process handle.  The native reader writes
-        \\Lisp event forms to it, and the native reaper writes a final numeric
-        \\exit status before closing it.
+        \\Lisp event forms to it, and the native reaper writes a final
+        \\pid-tagged exit marker before closing it.
         \\
         \\(ghostel--spawn-native-process TERM COMMAND PIPE)
         ,
@@ -850,7 +940,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                     cmd.items,
                     &process_env,
                     cwd,
-                    env.openChannel(pipe_val),
+                    @intCast(env.openChannel(pipe_val)),
                 );
                 return env.makeInteger(pid);
             }
@@ -893,6 +983,116 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 if (env.isNil(args[0])) return env.nil();
                 const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
                 return if (try term.isPasswordMode()) env.t() else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--native-uri-at",
+        .arity = .{ 3, 3 },
+        .doc =
+        \\Get URI at ROW-from-bottom and COL.
+        \\
+        \\(ghostel--native-uri-at TERM ROW COL)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                const row_from_bottom = env.extractInteger(args[1]);
+                const col = env.extractInteger(args[2]);
+                const total_rows = term.terminal.screens.active.pages.total_rows;
+                if (col < 0 or col >= term.terminal.cols) return env.nil();
+                // The Emacs buffer always carries a trailing newline, so the line
+                // immediately after the last content row produces row_from_bottom == 0.
+                if (row_from_bottom <= 0 or row_from_bottom > total_rows) return env.nil();
+                const row = total_rows - @as(usize, @intCast(row_from_bottom));
+                const point = gt.Point{ .screen = .{
+                    .x = @intCast(col),
+                    .y = @intCast(row),
+                } };
+                const pin = term.terminal.screens.active.pages.pin(point) orelse return env.nil();
+                const cell = pin.rowAndCell().cell;
+                if (!cell.hyperlink) {
+                    return env.nil();
+                }
+                const page = pin.node.page();
+                const link_id = page.lookupHyperlink(cell) orelse return env.nil();
+                const entry = page.hyperlink_set.get(page.memory, link_id);
+                const uri = entry.uri.slice(page.memory);
+                return env.makeString(uri);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Scroll the terminal viewport by DELTA lines.
+        \\
+        \\(ghostel--scroll TERM DELTA)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                const delta = env.extractInteger(args[1]);
+                term.terminal.scrollViewport(.{ .delta = @intCast(delta) });
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-top",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the top of scrollback.
+        \\
+        \\(ghostel--scroll-top TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                term.terminal.scrollViewport(.top);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-bottom",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the bottom.
+        \\
+        \\(ghostel--scroll-bottom TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                term.terminal.scrollViewport(.bottom);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-pending-wrap-p",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return t if the cursor is in pending-wrap state.
+        \\
+        \\(ghostel--cursor-pending-wrap-p TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                return if (term.terminal.screens.active.cursor.pending_wrap) env.t() else env.nil();
             }
         },
     },
