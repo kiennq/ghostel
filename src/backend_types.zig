@@ -22,22 +22,25 @@ pub const WriteResult = union(enum) {
     interrupted,
 };
 
+pub const DrainResult = enum {
+    output,
+    command,
+    finished,
+    stopped,
+};
+
 test "CancellationToken delegates cancellation checks" {
     const Context = struct {
-        checked: bool = false,
-
-        fn check(raw: *const anyopaque) !void {
-            const context: *@This() = @ptrCast(@alignCast(@constCast(raw)));
-            context.checked = true;
+        fn check(_: *const anyopaque) !void {
+            return error.Cancelled;
         }
     };
 
-    var context = Context{};
+    const context = Context{};
     const token = CancellationToken{
         .context = &context,
         .check_fn = Context.check,
         .poll_interval_ms = 20,
     };
-    try token.check();
-    try std.testing.expect(context.checked);
+    try std.testing.expectError(error.Cancelled, token.check());
 }
