@@ -119,6 +119,7 @@ const Pty = struct {
 pty: Pty,
 pid: posix.pid_t = -1,
 wake_pipe: [2]posix.fd_t = .{ -1, -1 },
+command_pipe: [2]posix.fd_t = .{ -1, -1 },
 
 pub const EventWriter = struct {
     pub const Fd = posix.fd_t;
@@ -170,6 +171,21 @@ pub const EventWriter = struct {
     }
 };
 
+pub const Reaper = struct {
+    pty: Pty,
+    pid: posix.pid_t,
+
+    pub fn deinitAndWait(self: *@This()) u32 {
+        std.debug.assert(self.pid > 0);
+        self.pty.deinit();
+        const result = posix.waitpid(self.pid, 0);
+        const status: c_int = @bitCast(result.status);
+        if (c.WIFEXITED(status)) return @intCast(c.WEXITSTATUS(status));
+        if (c.WIFSIGNALED(status)) return @intCast(128 + c.WTERMSIG(status));
+        return 255;
+    }
+};
+
 pub fn init(alloc: Allocator, initial_cols: u16, initial_rows: u16, params: backend_types.ProcessParams) !Self {
     var self = Self{ .pty = try .init() };
     errdefer self.pty.deinit();
@@ -183,11 +199,10 @@ pub fn init(alloc: Allocator, initial_cols: u16, initial_rows: u16, params: back
     const args = try arena.allocSentinel(?[*:0]const u8, params.args.len, null);
     for (params.args, 0..) |arg, i| args[i] = arg;
 
-    self.wake_pipe = try posix.pipe2(.{ .CLOEXEC = true });
-    errdefer {
-        posix.close(self.wake_pipe[0]);
-        posix.close(self.wake_pipe[1]);
-    }
+    self.wake_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    errdefer closePipe(&self.wake_pipe);
+    self.command_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    errdefer closePipe(&self.command_pipe);
     const flags = try posix.fcntl(self.pty.primary_fd, posix.F.GETFL, 0);
     _ = try posix.fcntl(
         self.pty.primary_fd,
@@ -245,7 +260,7 @@ pub fn write(
             error.InputOutput,
             error.ProcessNotFound,
             error.NoDevice,
-            => return .interrupted,
+            => return error.ProcessExited,
             error.WouldBlock => {
                 var pollfds = [_]posix.pollfd{
                     .{
@@ -278,7 +293,7 @@ pub fn write(
     }
 }
 
-pub fn drain(self: *Self, stream: anytype) !bool {
+pub fn drain(self: *Self, stream: anytype) !backend_types.DrainResult {
     var buf: [4096]u8 = undefined;
 
     var pollfds = [_]posix.pollfd{
@@ -292,42 +307,148 @@ pub fn drain(self: *Self, stream: anytype) !bool {
             .events = posix.POLL.IN,
             .revents = undefined,
         },
+        .{
+            .fd = self.command_pipe[0],
+            .events = posix.POLL.IN,
+            .revents = undefined,
+        },
     };
     _ = try posix.poll(&pollfds, -1);
-    if (pollfds[1].revents != 0) return false;
+    if (pollfds[1].revents != 0) return .stopped;
+    if (pollfds[2].revents != 0) {
+        self.clearCommandWake();
+        return .command;
+    }
 
     const eof = pollfds[0].revents & posix.POLL.HUP != 0;
+    var drained = false;
     while (true) {
         const len = posix.read(self.pty.primary_fd, buf[0..]) catch |err| switch (err) {
-            error.WouldBlock => return !eof,
-            error.NotOpenForReading, error.InputOutput => return false,
+            error.WouldBlock => return if (eof) .finished else .output,
+            error.NotOpenForReading, error.InputOutput => return .finished,
             else => return err,
         };
-        if (len == 0) return !eof;
+        if (len == 0) return if (eof) .finished else if (drained) .output else .finished;
+        drained = true;
         stream.nextSlice(buf[0..len]);
     }
 }
 
 pub fn finishDrain(_: *Self, _: anytype) !void {}
 
+pub fn wakeCommands(self: *Self) void {
+    if (self.command_pipe[1] == -1) return;
+    _ = posix.write(self.command_pipe[1], "W") catch 0;
+}
+
+pub fn clearCommandWake(self: *Self) void {
+    clearPipe(self.command_pipe[0]);
+}
+
 pub fn requestStop(self: *Self, _: std.Thread) void {
     if (self.wake_pipe[1] != -1) {
-        _ = posix.write(self.wake_pipe[1], "X") catch 0;
+        _ = posix.write(self.wake_pipe[1], "S") catch 0;
     }
+}
+
+pub fn takeForReaper(self: *Self) Reaper {
+    const reaper = Reaper{
+        .pty = self.pty,
+        .pid = self.pid,
+    };
+    self.pty.primary_fd = -1;
+    self.pty.replica_fd = -1;
+    self.pid = -1;
+    return reaper;
 }
 
 pub fn replicaName(self: *Self) []const u8 {
     return self.pty.replicaName();
 }
 
+pub fn closeWakeEndpoints(self: *Self) void {
+    closePipe(&self.wake_pipe);
+    closePipe(&self.command_pipe);
+}
+
 pub fn deinitAndWait(self: *Self) u32 {
-    std.debug.assert(self.pid > 0);
-    self.pty.deinit();
-    posix.close(self.wake_pipe[0]);
-    posix.close(self.wake_pipe[1]);
-    const result = posix.waitpid(self.pid, 0);
-    const status: c_int = @bitCast(result.status);
-    if (c.WIFEXITED(status)) return @intCast(c.WEXITSTATUS(status));
-    if (c.WIFSIGNALED(status)) return @intCast(128 + c.WTERMSIG(status));
-    return 255;
+    self.closeWakeEndpoints();
+    var reaper = self.takeForReaper();
+    return reaper.deinitAndWait();
+}
+
+fn clearPipe(fd: posix.fd_t) void {
+    if (fd == -1) return;
+
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = posix.read(fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return,
+        };
+        if (n == 0 or n < buf.len) return;
+    }
+}
+
+fn closePipe(pipe: *[2]posix.fd_t) void {
+    if (pipe[0] != -1) {
+        posix.close(pipe[0]);
+        pipe[0] = -1;
+    }
+    if (pipe[1] != -1) {
+        posix.close(pipe[1]);
+        pipe[1] = -1;
+    }
+}
+
+test "wakeCommands signals command pipe after reaper handoff" {
+    var command_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer closePipe(&command_pipe);
+
+    var process = Self{
+        .pty = .{},
+        .pid = 42,
+        .command_pipe = command_pipe,
+    };
+
+    _ = process.takeForReaper();
+    process.wakeCommands();
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = command_pipe[0],
+        .events = posix.POLL.IN,
+        .revents = undefined,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
+    try std.testing.expect(pollfds[0].revents & posix.POLL.IN != 0);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(command_pipe[0], &buf));
+    try std.testing.expectEqualStrings("W", &buf);
+}
+
+test "requestStop signals wake pipe after reaper handoff" {
+    var wake_pipe = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer closePipe(&wake_pipe);
+
+    var process = Self{
+        .pty = .{},
+        .pid = 42,
+        .wake_pipe = wake_pipe,
+    };
+
+    _ = process.takeForReaper();
+    process.requestStop(undefined);
+
+    var pollfds = [_]posix.pollfd{.{
+        .fd = wake_pipe[0],
+        .events = posix.POLL.IN,
+        .revents = undefined,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pollfds, 0));
+    try std.testing.expect(pollfds[0].revents & posix.POLL.IN != 0);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(wake_pipe[0], &buf));
+    try std.testing.expectEqualStrings("S", &buf);
 }
