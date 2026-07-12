@@ -708,11 +708,12 @@ the rendered buffer remains read-only in both cases."
       ;; `ghostel-mode'
       ;; so the renderer/timer/resize hooks (which all gate on `derived-mode-p
       ;; \\='ghostel-mode\\=') keep working; only input handling changes.
-      (unless interactive
+      (if interactive
+          (ghostel--sync-read-only)
         (use-local-map ghostel-compile-view-mode-map)
-        (setq buffer-read-only t)
         ;; Compilation-style buffers keep the plain read-only barrier.
-        (setq ghostel--inhibit-insert-forwarding t))
+        (setq ghostel--inhibit-insert-forwarding t)
+        (ghostel--sync-read-only))
       ;; Enable the live toggle (`C-c C-j' / `C-c C-e') in compile
       ;; buffers, regardless of which run mode they're in.  The
       ;; minor-mode keymap takes precedence over the major-mode map
