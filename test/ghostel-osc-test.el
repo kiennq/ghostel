@@ -85,6 +85,19 @@ Covers OSC 2 with ST and BEL terminators and the OSC 0 form."
               (should (equal expected (buffer-name)))
               (should (equal expected ghostel--managed-buffer-name)))))))))
 
+(ert-deftest ghostel-test-native-rapid-restart-preserves-osc-output ()
+  "Starting ConPTY during prior teardown must preserve OSC output."
+  :tags '(native)
+  (skip-unless (ghostel-test--windows-p))
+  (dotimes (iteration 2)
+    (ghostel-test--with-raw-echo-buffer (buf proc)
+      (let ((title (format "Rapid restart %d" iteration)))
+        (ghostel--write-pty ghostel--term (format "\e]2;%s\e\\" title))
+        (ghostel-test--wait-until
+         (lambda () (equal title ghostel--title))
+         proc 5)
+        (should (equal title ghostel--title))))))
+
 (ert-deftest ghostel-test-osc9-notification ()
   "OSC 9 iTerm2-style notifications reach `ghostel-notification-function'."
   :tags '(native)
