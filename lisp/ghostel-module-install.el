@@ -5,20 +5,24 @@
 
 ;;; Commentary:
 
-;; Provisioning for Ghostel's native module (`ghostel-module', the compiled
-;; libghostty .so/.dylib): downloading a pre-built binary from GitHub releases
-;; compiling from source via `zig build', maintaining the on-disk version sidecar,
-;; and loading the module — including the version checks that decide whether
-;; an on-disk module is fresh enough to map.
+;; Provisioning for Ghostel's native module runtime bundle: downloading a
+;; pre-built archive from GitHub releases, compiling from source via `zig build',
+;; and loading/reloading the dyn-loader-managed runtime.  The embedded
+;; `ghostel--module-version' exported by the loaded target module is the only
+;; version authority.
 ;;
 ;; `ghostel.el' requires this file and calls `ghostel--load-module' at load time.
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'compat)
 (require 'compile)
+(require 'seq)
 (require 'url-parse)
 
+(declare-function dyn-loader-load-manifest "dyn-loader-module" (manifest-path))
+(declare-function dyn-loader-reload "dyn-loader-module" (module-id))
 (declare-function ghostel--module-version "ghostel-module")
 
 
@@ -66,13 +70,101 @@ Customize this when downloading pre-built modules from a fork or mirror."
   :group 'ghostel)
 
 
-;;; Native module download, compilation, and loading
+;;; Automatic download and compilation of native module
 
-(defconst ghostel--minimum-module-version "0.49.0"
+(defconst ghostel--minimum-module-version "0.47.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
 
+(defun ghostel--package-dir ()
+  "Return the Ghostel resource root directory."
+  (or (ghostel--resource-root)
+      (file-name-directory (or load-file-name
+                               (locate-library "ghostel")
+                               buffer-file-name))))
+
+(defun ghostel--effective-module-dir (&optional dir)
+  "Return the directory Ghostel should use for native module lookup.
+DIR is the fallback when no custom directory is configured."
+  (file-name-as-directory
+   (expand-file-name
+    (or dir ghostel-module-directory (ghostel--package-dir)))))
+
+(defun ghostel--loader-module-file-path (&optional dir)
+  "Return the stable dyn-loader-module path in DIR."
+  (expand-file-name
+   (concat "dyn-loader-module" module-file-suffix)
+   (ghostel--effective-module-dir dir)))
+
+(defun ghostel--target-module-file-path (&optional dir)
+  "Return the stable ghostel target module path in DIR."
+  (expand-file-name
+   (concat "ghostel-module" module-file-suffix)
+   (ghostel--effective-module-dir dir)))
+
+(defconst ghostel--module-id "ghostel"
+  "Stable module id exported by the Ghostel target module.")
+
+(defconst ghostel--native-runtime-required-functions
+  '(ghostel--new
+    ghostel--write-vt
+    ghostel--set-size
+    ghostel--redraw
+    ghostel--scroll
+    ghostel--scroll-top
+    ghostel--scroll-bottom
+    ghostel--encode-key
+    ghostel--encode-paste
+    ghostel--mouse-event
+    ghostel--focus-event
+    ghostel--set-palette
+    ghostel--set-default-colors
+    ghostel--mode-enabled
+    ghostel--module-version
+    ghostel--copy-all-text
+    ghostel--enable-vt-log
+    ghostel--disable-vt-log
+    ghostel--get-title
+    ghostel--get-pwd
+    ghostel--cursor-pending-wrap-p
+    ghostel--alt-screen-p
+    ghostel--native-uri-at
+    ghostel--pty-password-input-p
+    ghostel--set-bold-config
+    ghostel--comint-make-state
+    ghostel--comint-filter
+    ghostel--comint-set-palette
+    ghostel--write-pty
+    ghostel--spawn-native-process
+    ghostel--kill-native-process
+    ghostel--set-process-pid)
+  "Ghostel dyn-loader exports required for a complete native runtime.")
+
+(defun ghostel--loader-metadata-path (manifest-file &optional dir)
+  "Return the path to MANIFEST-FILE in DIR."
+  (expand-file-name manifest-file
+                    (ghostel--effective-module-dir dir)))
+
+(defun ghostel--native-runtime-specs (&optional dir)
+  "Return loader-managed runtime specs for DIR."
+  (let ((dir (ghostel--effective-module-dir dir)))
+    (list (list :id ghostel--module-id
+                :manifest (ghostel--loader-metadata-path "ghostel-module.json" dir)
+                :file (ghostel--target-module-file-path dir)))))
+
+(defvar ghostel--term)
+(defvar ghostel--process)
+(defvar ghostel--last-send-time)
+(defvar ghostel--redraw-timer)
+
+(defun ghostel--live-buffers ()
+  "Return `ghostel-mode' buffers whose `ghostel--term' handle is non-nil."
+  (seq-filter
+   (lambda (buf)
+     (with-current-buffer buf
+       (and (derived-mode-p 'ghostel-mode) ghostel--term)))
+   (buffer-list)))
 (defun ghostel--module-platform-tag ()
   "Return platform tag for the current system, e.g. \"x86_64-linux\".
 Returns nil if the platform is not recognized."
@@ -100,7 +192,7 @@ Returns nil if the platform is not recognized."
   "Return the expected release asset file name for the current platform."
   (let ((tag (ghostel--module-platform-tag)))
     (when tag
-      (format "ghostel-module-%s%s" tag module-file-suffix))))
+      (format "ghostel-module-%s.tar.xz" tag))))
 
 (defun ghostel--release-asset-url (asset-name &optional version)
   "Return the GitHub release download URL for ASSET-NAME.
@@ -117,84 +209,218 @@ When VERSION is nil, use the latest release download URL."
   (when-let* ((asset-name (ghostel--module-asset-name)))
     (ghostel--release-asset-url asset-name version)))
 
-(defun ghostel--windows-support-assets ()
-  "Return side-by-side ConPTY release asset mappings for Windows, or nil.
-Each mapping is an (ASSET-NAME . RELATIVE-DESTINATION) pair."
-  (when (eq system-type 'windows-nt)
-    (when-let* ((tag (ghostel--module-platform-tag))
-                (arch (car (split-string tag "-"))))
-      (let ((hosts (pcase arch
-                     ("x86" '("x86" "x64" "arm64"))
-                     ("x86_64" '("x64" "arm64"))
-                     ("aarch64" '("arm64")))))
-        (when hosts
-          (cons (cons (format "ghostel-conpty-%s.dll" tag) "conpty.dll")
-                (mapcar (lambda (host)
-                          (cons (format "ghostel-openconsole-%s-%s.exe" tag host)
-                                (format "%s/OpenConsole.exe" host)))
-                        hosts)))))))
+(defun ghostel--loader-load-manifest (manifest-path)
+  "Ask dyn-loader-module to load MANIFEST-PATH."
+  (dyn-loader-load-manifest manifest-path))
 
-(defun ghostel--install-support-assets (dir &optional version)
-  "Install Windows support release assets into DIR.
-VERSION nil means the latest release.  Warn but continue on failure,
-since Ghostel can use the system ConPTY."
-  (dolist (asset (ghostel--windows-support-assets))
-    (let* ((asset-name (car asset))
-           (url (ghostel--release-asset-url asset-name version))
-           (dest (expand-file-name (cdr asset) dir)))
-      (unless (string-prefix-p "https://" url)
-        (error "Refusing non-HTTPS download URL: %s" url))
-      (make-directory (file-name-directory dest) t)
-      (message "ghostel: downloading support asset from %s..." url)
-      (unless (ghostel--download-file url dest)
-        (message "ghostel: warning: failed to download support asset %s"
-                 asset-name)))))
+(defun ghostel--loader-reload (module-id)
+  "Ask dyn-loader-module to reload MODULE-ID from its stored manifest."
+  (dyn-loader-reload module-id))
 
-(defun ghostel--release-version-from-url (url)
-  "Return the release version embedded in URL, or nil.
-GitHub's `/releases/latest/download/<asset>' redirect resolves to
-`/releases/download/v<X.Y.Z>/<asset>'; extract the X.Y.Z segment."
-  (when (and (stringp url)
-             (string-match "/releases/download/v\\([0-9]+\\.[0-9]+\\.[0-9]+\\)/"
-                           url))
-    (match-string 1 url)))
+(defun ghostel--loader-loaded-modules ()
+  "Return module IDs currently registered with dyn-loader."
+  (and (boundp 'dyn-loader-loaded-modules)
+       (symbol-value 'dyn-loader-loaded-modules)))
+
+(defun ghostel--native-runtime-missing-specs ()
+  "Return native runtime specs missing from dyn-loader's registry."
+  (let ((loaded-modules (ghostel--loader-loaded-modules)))
+    (cl-loop for spec in (ghostel--native-runtime-specs)
+             for module-id = (plist-get spec :id)
+             unless (member module-id loaded-modules)
+             collect spec)))
+
+(defun ghostel--native-runtime-missing-module-ids ()
+  "Return native runtime module IDs missing from dyn-loader's registry."
+  (mapcar (lambda (spec) (plist-get spec :id))
+          (ghostel--native-runtime-missing-specs)))
+
+(defun ghostel--native-runtime-reloadable-p ()
+  "Return non-nil when dyn-loader can reload every native runtime module."
+  (and (featurep 'dyn-loader-module)
+       (fboundp 'dyn-loader-reload)
+       (null (ghostel--native-runtime-missing-module-ids))))
+
+(defun ghostel--recover-native-runtime-registrations ()
+  "Load missing native runtime manifests through dyn-loader."
+  (when (and (featurep 'dyn-loader-module)
+             (fboundp 'dyn-loader-load-manifest))
+    (dolist (spec (ghostel--native-runtime-missing-specs))
+      (ghostel--loader-load-manifest (plist-get spec :manifest)))))
+
+(defun ghostel--native-runtime-reload-error-message ()
+  "Return a diagnostic explaining why the native runtime cannot reload."
+  (cond
+   ((not (featurep 'dyn-loader-module))
+    "Ghostel native runtime is loaded without dyn-loader; restart Emacs to load the downloaded version")
+   ((not (fboundp 'dyn-loader-reload))
+    "Ghostel dyn-loader runtime does not support reload; restart Emacs to load the downloaded version")
+   (t
+    (let ((missing (ghostel--native-runtime-missing-module-ids))
+          (loaded (ghostel--loader-loaded-modules)))
+      (if missing
+          (format "Ghostel native runtime is not registered with dyn-loader for: %s (registered: %s); restart Emacs to load the downloaded version"
+                  (mapconcat #'identity missing ", ")
+                  (if loaded
+                      (mapconcat (lambda (module-id)
+                                   (format "%s" module-id))
+                                 loaded ", ")
+                    "none"))
+        "Ghostel native runtime cannot be reloaded; restart Emacs to load the downloaded version")))))
+
+(defun ghostel--reload-native-runtime (&optional close-live)
+  "Reload every loader-managed native runtime module from disk.
+Terminate live Ghostel terminals first.  CLOSE-LIVE is accepted
+for compatibility with older callers and is otherwise ignored."
+  (ignore close-live)
+  (unless (ghostel--native-runtime-reloadable-p)
+    (ghostel--recover-native-runtime-registrations))
+  (unless (ghostel--native-runtime-reloadable-p)
+    (user-error "%s" (ghostel--native-runtime-reload-error-message)))
+  (let ((live-buffers (ghostel--live-buffers)))
+    (when live-buffers
+      (ghostel--close-live-buffers live-buffers)))
+  ;; Let already-dead terminal finalizers run before dyn-loader swaps DLLs.
+  ;; Old DLLs are retired, not unloaded, so any remaining finalizers stay safe.
+  (garbage-collect)
+  (dolist (spec (ghostel--native-runtime-specs))
+    (ghostel--loader-reload (plist-get spec :id))))
+
+(defun ghostel-reload-module (&optional close-live)
+  "Reload the loader-managed Ghostel runtime bundle from disk.
+
+Live Ghostel terminals are terminated first.  CLOSE-LIVE is
+accepted for compatibility with older callers and is otherwise
+ignored."
+  (interactive "P")
+  (ghostel--reload-native-runtime close-live)
+  (message "ghostel: native runtime reloaded successfully"))
+
+(defun ghostel--extract-module-archive (archive dest-dir)
+  "Extract Ghostel ARCHIVE into DEST-DIR."
+  (let ((archive (expand-file-name archive))
+        (default-directory (file-name-as-directory
+                            (expand-file-name dest-dir))))
+    (make-directory default-directory t)
+    (with-temp-buffer
+      (let ((status (call-process "tar" nil t nil "xf" archive)))
+        (unless (eq status 0)
+          (error "Tar failed to extract %s (exit %s): %s"
+                 archive status (buffer-string)))))))
+
+(defun ghostel--publish-downloaded-module-archive (archive dir)
+  "Extract ARCHIVE and publish loader and target modules into DIR."
+  (setq dir (ghostel--effective-module-dir dir))
+  (make-directory dir t)
+  (let ((staging (make-temp-file
+                  (expand-file-name ".ghostel-download-" dir) t)))
+    (unwind-protect
+        (progn
+          (ghostel--extract-module-archive archive staging)
+          (ghostel--publish-built-module-artifacts staging dir))
+      (when (file-directory-p staging)
+        (delete-directory staging t)))))
+
+(defun ghostel--make-module-build-dir (dest-dir)
+  "Return the temporary Zig install prefix inside DEST-DIR."
+  (make-directory dest-dir t)
+  (let ((dir (expand-file-name ".ghostel-build/" dest-dir)))
+    (when (file-directory-p dir)
+      (delete-directory dir t))
+    (make-directory dir t)
+    (file-name-as-directory dir)))
+
+(defun ghostel--build-artifact-dir (build-dir)
+  "Return the directory holding modules installed under BUILD-DIR."
+  (expand-file-name "bin" build-dir))
+
+(defun ghostel--publish-built-module-artifacts (source-dir &optional dest-dir)
+  "Publish the native runtime bundle from SOURCE-DIR.
+When DEST-DIR is non-nil, publish the artifacts there."
+  (let* ((source-dir (ghostel--effective-module-dir source-dir))
+         (dest-dir (ghostel--effective-module-dir dest-dir))
+         (loader-src (ghostel--loader-module-file-path source-dir))
+         (target-src (ghostel--target-module-file-path source-dir))
+         (target-dest (ghostel--target-module-file-path dest-dir))
+         (manifest-src (ghostel--loader-metadata-path "ghostel-module.json" source-dir))
+         (files (seq-filter #'file-regular-p
+                            (directory-files-recursively source-dir ".*"))))
+    (unless (file-exists-p loader-src)
+      (error "Built Ghostel loader is missing: %s" loader-src))
+    (unless (file-exists-p target-src)
+      (error "Built Ghostel target module is missing: %s" target-src))
+    (unless (file-exists-p manifest-src)
+      (error "Built Ghostel loader manifest is missing: %s" manifest-src))
+    (unless (file-directory-p dest-dir)
+      (make-directory dest-dir t))
+    (dolist (src files)
+      (let* ((dest (expand-file-name (file-relative-name src source-dir)
+                                     dest-dir))
+             (parent (file-name-directory dest)))
+        (when (and parent (not (file-directory-p parent)))
+          (make-directory parent t))
+        (when (file-exists-p dest)
+          (let ((backup (concat dest ".bak"))
+                (index 1))
+            (while (file-exists-p backup)
+              (setq backup (format "%s.%d.bak" dest index)
+                    index (1+ index)))
+            (condition-case err
+                (rename-file dest backup t)
+              (file-error
+               (display-warning
+                'ghostel
+                (format "Failed to move %s to %s: %s"
+                        dest backup (error-message-string err)))))))
+        (condition-case err
+            (rename-file src dest t)
+          (file-error
+           (display-warning
+            'ghostel
+            (format "Failed to move %s to %s: %s"
+                    src dest (error-message-string err)))))))
+    (dolist (backup (directory-files-recursively dest-dir "\\.bak\\'"))
+      (ignore-errors (delete-file backup)))
+    (file-name-nondirectory target-dest)))
+
+(defun ghostel--ensure-loader-loaded (loader-path)
+  "Load the stable loader module from LOADER-PATH when needed."
+  (unless (featurep 'dyn-loader-module)
+    (module-load loader-path)))
+
+(defun ghostel--bootstrap-native-runtime (&optional dir)
+  "Load every manifest in the native runtime bundle for DIR."
+  (dolist (spec (ghostel--native-runtime-specs dir))
+    (ghostel--loader-load-manifest (plist-get spec :manifest))))
+
+(defun ghostel--close-live-buffers (buffers)
+  "Terminate Ghostel BUFFERS and kill them."
+  (dolist (buf buffers)
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (process-live-p ghostel--process)
+          (delete-process ghostel--process)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 (defun ghostel--download-module (dir &optional version latest-release)
   "Download a pre-built module into DIR.
 When VERSION is non-nil, download that release tag.
 When LATEST-RELEASE is non-nil, use the latest release asset URL.
-On success, also writes the sidecar version file alongside the module.
 Returns non-nil on success."
   (condition-case err
-      (let* ((requested-version (unless latest-release
-                                  (or version ghostel--minimum-module-version)))
+      (let* ((dir (ghostel--effective-module-dir dir))
+             (requested-version (unless latest-release version))
              (url (ghostel--module-download-url requested-version)))
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
           (make-directory dir t)
-          (let ((dest (expand-file-name
-                       (concat "ghostel-module" module-file-suffix) dir))
-                (sidecar (ghostel--module-sidecar-path dir)))
-            ;; Drop any pre-existing sidecar so that, if the download or the
-            ;; subsequent sidecar write fails partway, the loader sees `absent'
-            ;; rather than `stale' (refuse to map a fresh module).
-            (when (file-exists-p sidecar)
-              (delete-file sidecar))
+          (let ((dest (expand-file-name (file-name-nondirectory url) dir)))
             (message "ghostel: downloading native module from %s..." url)
-            (when-let* ((final-url (ghostel--download-file url dest)))
-              ;; Resolve the version that was actually fetched.  For an
-              ;; explicit version we trust the request; for `latest' we
-              ;; parse the URL the server redirected us to.  If parsing
-              ;; fails we fall back to the minimum so the sidecar still
-              ;; reflects a safe lower bound.
-              (let* ((downloaded-version (ghostel--release-version-from-url final-url))
-                     (resolved (or requested-version
-                                   downloaded-version
-                                   ghostel--minimum-module-version)))
-                (ghostel--install-support-assets
-                 dir (or requested-version downloaded-version))
-                (ghostel--write-module-sidecar-version dir resolved))
+            (when (ghostel--download-file url dest)
+              (ghostel--publish-downloaded-module-archive dest dir)
+              (ignore-errors (delete-file dest))
               (message "ghostel: native module downloaded successfully")
               t))))
     (error
@@ -204,41 +430,39 @@ Returns non-nil on success."
 (defun ghostel--compile-module (dest-dir)
   "Compile the native module from source and install it in DEST-DIR.
 The build runs in `ghostel--resource-root' (which holds build.zig);
-on success the produced module and its sidecar are moved into DEST-DIR."
+on success the produced module bundle is moved into DEST-DIR."
   (let* ((source-dir (ghostel--resource-root))
          (build-dir nil)
          (default-directory source-dir))
-    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (message "ghostel: compiling native module with zig build (will copy to %s)..."
+             dest-dir)
     (condition-case err
         (unwind-protect
             (progn
               (setq build-dir (ghostel--make-module-build-dir dest-dir))
               (let ((ret (process-file "zig" nil "*ghostel-build*" nil
                                        "build" "--prefix" build-dir
-                                       "-Doptimize=ReleaseFast" "-Dcpu=baseline")))
-                (if (not (eq ret 0))
-                    (display-warning 'ghostel
-                                     "Module compilation failed.  See *ghostel-build* buffer for details.")
-                  (let* ((file-name (concat "ghostel-module" module-file-suffix))
-                         (built (expand-file-name file-name build-dir))
-                         (final (expand-file-name file-name dest-dir)))
-                    (if (not (file-exists-p built))
-                        (display-warning 'ghostel
-                                         (format "Build succeeded but module not produced at %s"
-                                                 built))
-                      (ghostel--install-module-pair
-                       built final
-                       (expand-file-name "ghostel-module.version" build-dir)
-                       (expand-file-name "ghostel-module.version" dest-dir))
-                      (ghostel--install-support-assets dest-dir)
-                      (message "ghostel: native module compiled successfully"))))))
+                                       "-Doptimize=ReleaseFast" "-Dcpu=baseline"))
+                    (build-output-dir (ghostel--build-artifact-dir build-dir)))
+                (if (eq ret 0)
+                    (progn
+                      (ghostel--publish-built-module-artifacts
+                       build-output-dir
+                       dest-dir)
+                      (message "ghostel: native module compiled successfully")
+                      t)
+                  (display-warning 'ghostel
+                                   "Module compilation failed.  See *ghostel-build* buffer for details.")
+                  nil)))
           (when (and build-dir (file-directory-p build-dir))
             (ignore-errors (delete-directory build-dir t))))
       (file-missing
        (display-warning 'ghostel
                         (format "zig executable not found while compiling in %s" source-dir)))
       (error
-       (display-warning 'ghostel (error-message-string err))))))
+       (display-warning 'ghostel
+                         (error-message-string err))
+       nil))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -265,7 +489,7 @@ Behavior is controlled by `ghostel-module-auto-install'."
 (defun ghostel--ask-install-action (_dir)
   "Prompt the user to choose how to install the missing native module.
 Returns \\='download, \\='compile, or nil."
-  (let* ((url (or (ghostel--module-download-url ghostel--minimum-module-version)
+  (let* ((url (or (ghostel--module-download-url)
                   "GitHub releases"))
          (choice (read-char-choice
                   (format "Ghostel native module not found.
@@ -352,82 +576,55 @@ shipped resources), so callers always get a sensible
 
 (defun ghostel--module-directory ()
   "Return the absolute directory where the native module lives.
-Honours `ghostel-module-directory' when set, otherwise falls back to
-the shipped resource root."
-  (when-let* ((dir (or ghostel-module-directory
-                       (ghostel--resource-root))))
-    (file-name-as-directory (expand-file-name dir))))
+Honours `ghostel-module-directory' before falling back to the
+shipped resource root."
+  (ghostel--effective-module-dir))
 
-(defun ghostel--module-sidecar-path (dir)
-  "Return the path of the module version sidecar inside DIR.
-The sidecar is a one-line file holding the version string of the
-neighbouring native module.  It is written by `build.zig' at compile
-time and by `ghostel--download-module' after a successful download,
-so the loader can check the on-disk version without `module-load'."
-  (expand-file-name "ghostel-module.version" dir))
+(defun ghostel--load-module-if-available (&optional dir prompt-user)
+  "Load the native module from DIR when it exists.
+When PROMPT-USER is non-nil, stale modules may trigger installation."
+  (let* ((module-dir (ghostel--effective-module-dir dir))
+         (loader-path (ghostel--loader-module-file-path module-dir))
+         (runtime-specs (ghostel--native-runtime-specs module-dir))
+         (runtime-bundle-files
+          (append (mapcar (lambda (spec) (plist-get spec :manifest))
+                          runtime-specs)
+                  (delq nil (mapcar (lambda (spec) (plist-get spec :file))
+                                    runtime-specs)))))
+    (when (and (file-exists-p loader-path)
+               (cl-every #'file-exists-p runtime-bundle-files))
+      (ghostel--ensure-loader-loaded loader-path)
+      (ghostel--bootstrap-native-runtime module-dir)
+      (unless prompt-user
+        (ghostel--check-module-version module-dir nil))
+      t)))
 
-(defun ghostel--read-module-sidecar-version (dir)
-  "Return the version string recorded in DIR's sidecar, or nil.
-A missing or empty file returns nil; the result is otherwise trimmed."
-  (let ((path (ghostel--module-sidecar-path dir)))
-    (when (file-readable-p path)
-      (let ((s (with-temp-buffer
-                 (insert-file-contents path)
-                 (string-trim (buffer-string)))))
-        (and (not (string-empty-p s)) s)))))
-
-(defun ghostel--write-module-sidecar-version (dir version)
-  "Write VERSION to DIR's sidecar atomically."
-  (make-directory dir t)
-  (let* ((dest (ghostel--module-sidecar-path dir))
-         (tmp (make-temp-name (concat dest ".tmp."))))
-    (unwind-protect
-        (let ((coding-system-for-write 'utf-8-unix))
-          (write-region (concat version "\n") nil tmp nil 'silent)
-          (rename-file tmp dest t)
-          (setq tmp nil))
-      (when (and tmp (file-exists-p tmp))
-        (ignore-errors (delete-file tmp))))))
-
-(defun ghostel--make-module-build-dir (dest-dir)
-  "Return the temporary Zig install prefix inside DEST-DIR."
-  (make-directory dest-dir t)
-  (let ((dir (expand-file-name ".ghostel-build/" dest-dir)))
-    (when (file-directory-p dir)
-      (delete-directory dir t))
-    (make-directory dir t)
-    (file-name-as-directory dir)))
-
-(defun ghostel--install-module-pair (built-mod final-mod
-                                               built-sidecar final-sidecar)
-  "Move BUILT-MOD and BUILT-SIDECAR into FINAL-MOD and FINAL-SIDECAR.
-The destination sidecar is removed before the module is moved, so every
-failure path ends in `sidecar absent' rather than `sidecar stale'."
-  (make-directory (file-name-directory final-mod) t)
-  (when (file-exists-p final-sidecar)
-    (delete-file final-sidecar))
-  (rename-file built-mod final-mod t)
-  (when (file-exists-p built-sidecar)
-    (rename-file built-sidecar final-sidecar t)))
-
-(defun ghostel-download-module (&optional prompt-for-version)
+;;;###autoload
+(defun ghostel-download-module (&optional latest-release)
   "Interactively download the pre-built native module for this platform.
-With PROMPT-FOR-VERSION, prompt for a release tag to download.
-Leaving the prompt empty downloads the latest release."
+By default, prompt for a release tag; an empty response selects the latest.
+With prefix argument LATEST-RELEASE, download the latest without prompting.
+Live Ghostel sessions remain active during download and are terminated only
+before reloading a successfully downloaded runtime."
   (interactive "P")
-  (let* ((dir (ghostel--module-directory))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir))
-         (version (when prompt-for-version
-                    (ghostel--read-module-download-version)))
-         (latest-release (and prompt-for-version (null version))))
+  (let* ((dir (ghostel--effective-module-dir))
+         (mod (ghostel--loader-module-file-path dir))
+         (version (unless latest-release
+                     (ghostel--read-module-download-version)))
+         (use-latest-release (or (not (null latest-release))
+                                  (null version))))
     (when (and (file-exists-p mod)
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
-    (if (ghostel--download-module dir version latest-release)
-        (if (featurep 'ghostel-module)
-            (message "ghostel: module downloaded.  Restart Emacs to load the new version")
-          (module-load mod)
+    (if (ghostel--download-module dir version use-latest-release)
+        (if (ghostel--native-runtime-ready-p)
+            (progn
+              (ghostel--reload-native-runtime)
+              (ghostel--check-module-version dir)
+              (message "ghostel: module loaded successfully"))
+          (ghostel--ensure-loader-loaded mod)
+          (ghostel--bootstrap-native-runtime dir)
+          (ghostel--check-module-version dir)
           (message "ghostel: module loaded successfully"))
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
@@ -441,34 +638,27 @@ Leaving the prompt empty downloads the latest release."
 (put 'ghostel--module-compile-dest-dir 'permanent-local t)
 
 (defun ghostel--install-built-module-after-compilation (buf status)
-  "Move the module built by an interactive compile in BUF on successful STATUS."
+  "Publish the native runtime bundle built by BUF when STATUS is successful."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (let ((build-dir ghostel--module-compile-build-dir)
             (dest-dir ghostel--module-compile-dest-dir))
         (when (and build-dir dest-dir)
-          (let ((file-name (concat "ghostel-module" module-file-suffix))
-                (sidecar "ghostel-module.version"))
-            (unwind-protect
-                (when (string-match-p "finished" status)
-                  (let ((built (expand-file-name file-name build-dir))
-                        (final (expand-file-name file-name dest-dir))
-                        (built-sidecar (expand-file-name sidecar build-dir))
-                        (final-sidecar (expand-file-name sidecar dest-dir)))
-                    (when (file-exists-p built)
-                      (condition-case err
-                          (progn
-                            (ghostel--install-module-pair
-                             built final built-sidecar final-sidecar)
-                            (ghostel--install-support-assets dest-dir)
-                            (message "ghostel: module installed at %s" final))
-                        (error
-                         (display-warning
-                          'ghostel
-                          (format "Build succeeded but installing into %s failed: %s"
-                                  dest-dir (error-message-string err))))))))
-              (when (file-directory-p build-dir)
-                (ignore-errors (delete-directory build-dir t))))))))))
+          (unwind-protect
+              (when (string-match-p "finished" status)
+                (condition-case err
+                     (progn
+                       (ghostel--publish-built-module-artifacts
+                        (ghostel--build-artifact-dir build-dir)
+                        dest-dir)
+                       (message "ghostel: module installed at %s" dest-dir))
+                  (error
+                   (display-warning
+                     'ghostel
+                     (format "Build succeeded but publishing native runtime to %s failed: %s"
+                             dest-dir (error-message-string err))))))
+            (when (file-directory-p build-dir)
+              (ignore-errors (delete-directory build-dir t)))))))))
 
 (define-derived-mode ghostel-module-compilation-mode compilation-mode "Compilation"
   "Compilation mode for `ghostel-module-compile'."
@@ -488,22 +678,24 @@ Leaving the prompt empty downloads the latest release."
 
 (defun ghostel-module-compile ()
   "Compile the ghostel native module by running zig build.
-The output is shown in a `*compilation*' buffer.
-The produced module is moved into `ghostel-module-directory' once
-the build finishes."
+The output is shown in a `*compilation*' buffer.  The produced
+runtime bundle is moved into `ghostel-module-directory' once the
+build finishes."
   (interactive)
   (save-some-buffers (not compilation-ask-about-save)
                      compilation-save-buffers-predicate)
   (let* ((source-dir (ghostel--resource-root))
-         (dest-dir (ghostel--module-directory))
+         (dest-dir (ghostel--effective-module-dir))
          (build-dir (ghostel--make-module-build-dir dest-dir))
          (default-directory source-dir)
-         (compile-buf (compilation-start
-                       (format ghostel-module-compile-command
-                               (shell-quote-argument (expand-file-name build-dir)))
-                       #'ghostel-module-compilation-mode
-                       #'ghostel--module-compilation-buffer-name)))
+         (compile-buf
+          (compilation-start
+           (format ghostel-module-compile-command
+                   (shell-quote-argument (expand-file-name build-dir)))
+           #'ghostel-module-compilation-mode
+           #'ghostel--module-compilation-buffer-name)))
     (ghostel--install-built-module-on-finish compile-buf build-dir dest-dir)))
+
 
 (defun ghostel--check-module-version (dir &optional prompt-user)
   "Check if the loaded module is older than required.
@@ -523,6 +715,56 @@ triggers an interactive prompt."
       (when prompt-user
         (ghostel--ensure-module dir)))))
 
+(defun ghostel--initialize-native-modules (&optional prompt-user)
+  "Load or refresh the native modules for the current Ghostel install.
+When PROMPT-USER is non-nil, failures signal `user-error'."
+  (let* ((dir (ghostel--effective-module-dir))
+         (mod (ghostel--loader-module-file-path dir))
+         (runtime-specs (ghostel--native-runtime-specs dir))
+         (runtime-manifests (mapcar (lambda (spec) (plist-get spec :manifest))
+                                    runtime-specs))
+         (runtime-files (delq nil (mapcar (lambda (spec) (plist-get spec :file))
+                                          runtime-specs)))
+         (runtime-bundle-files (append runtime-manifests runtime-files)))
+    (unless (or (and (file-exists-p mod)
+                     (cl-every #'file-exists-p runtime-bundle-files))
+                (not prompt-user)
+                noninteractive)
+      (ghostel--ensure-module dir))
+    (if (and (file-exists-p mod)
+             (cl-every #'file-exists-p runtime-bundle-files))
+        (condition-case err
+            (if (featurep 'dyn-loader-module)
+                (if (ghostel--live-buffers)
+                    (display-warning
+                     'ghostel
+                     "Ghostel native module is already loaded with live buffers; restart Emacs or reload the native module after closing Ghostel terminals")
+                  (ghostel-reload-module))
+              (ghostel--load-module-if-available dir prompt-user))
+          (error
+           (let ((msg
+                  (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
+                          (error-message-string err))))
+             (if prompt-user
+                 (user-error "%s" msg)
+               (display-warning 'ghostel msg)))))
+      (let* ((missing-bundle-file
+              (cl-find-if (lambda (path)
+                            (not (file-exists-p path)))
+                          runtime-bundle-files))
+             (msg
+              (if (file-exists-p mod)
+                  (if (member missing-bundle-file runtime-manifests)
+                      (concat "Native module metadata not found: " missing-bundle-file
+                              "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")
+                    (concat "Native runtime file not found: " missing-bundle-file
+                            "\nRun M-x ghostel-download-module or M-x ghostel-module-compile"))
+                (concat "Native module not found: " mod
+                        "\nRun M-x ghostel-download-module or M-x ghostel-module-compile"))))
+        (if prompt-user
+            (user-error "%s" msg)
+          (display-warning 'ghostel msg))))))
+
 (defun ghostel--load-module (&optional prompt-user)
   "Ensure the ghostel native module is loaded.
 When PROMPT-USER is non-nil (called from an interactive command like
@@ -535,86 +777,30 @@ existing module file and warns if one is missing or stale.  Module
 installation only happens on an explicit user action: `M-x ghostel',
 `M-x ghostel-download-module', or `M-x ghostel-module-compile'.
 
-Before calling `module-load' the sidecar file
-`ghostel-module.version' (written by `build.zig' and the downloader)
-is consulted.  When the sidecar reports a version older than
-`ghostel--minimum-module-version' the .so is NOT mapped into this
-process — that lets the freshly installed module be loaded in
-place after a subsequent `ghostel--ensure-module' call, avoiding an
-extra restart.
-
 The guard also honours `ghostel--new' being already `fboundp', which
 covers the pure-Elisp test path where `cl-letf' stubs the native
 entry points so tests run without the module present."
-  (let* ((dir (ghostel--module-directory))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir))
-         (sidecar-ver (ghostel--read-module-sidecar-version dir)))
-    (unless (or (featurep 'ghostel-module)
-                (fboundp 'ghostel--new))
-      (cond
-       ;; Sidecar tells us the on-disk module is too old.  Refuse to map
-       ;; it so a subsequent install can `module-load' the fresh file in
-       ;; this same Emacs process.
-       ((and sidecar-ver
-             (version< sidecar-ver ghostel--minimum-module-version))
-        (display-warning
-         'ghostel
-         (format "Module version %s on disk is older than required %s"
-                 sidecar-ver ghostel--minimum-module-version))
-        (when prompt-user
-          (ghostel--ensure-module dir)
-          (let ((new-ver (ghostel--read-module-sidecar-version dir)))
-            (when (and (file-exists-p mod)
-                       new-ver
-                       (not (version< new-ver
-                                      ghostel--minimum-module-version)))
-              (condition-case err
-                  (module-load mod)
-                (error
-                 (user-error "Failed to load ghostel native module: %s"
-                             (error-message-string err))))))))
-       ;; Module file missing.
-       ((not (file-exists-p mod))
-        (cond
-         (prompt-user
-          (ghostel--ensure-module dir)
-          (when (file-exists-p mod)
-            (condition-case err
-                (module-load mod)
-              (error
-               (user-error "Failed to load ghostel native module: %s"
-                           (error-message-string err))))))
-         (t
-          (display-warning
-           'ghostel
-           (concat "Native module not found: " mod
-                   "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
-       ;; File exists and the sidecar (when present) is fresh.  Load it.
-       ;; When the sidecar is absent (existing installs predating it),
-       ;; fall back to a live version check post-load.  We skip the live
-       ;; check here when PROMPT-USER is non-nil; the tail below runs it
-       ;; instead, avoiding a double prompt.
-       (t
-        (condition-case err
-            (progn
-              (module-load mod)
-              (unless prompt-user
-                (ghostel--check-module-version dir nil)))
-          (error
-           (if prompt-user
-               (user-error "Failed to load ghostel native module: %s"
-                           (error-message-string err))
-             (display-warning
-              'ghostel
-              (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
-                      (error-message-string err)))))))))
-    ;; Surface the version check at every interactive entry point — not
-    ;; just when this call loaded the module.  Otherwise a stale .so
-    ;; mapped in by an earlier load (e.g. sidecar absent at startup) is
-    ;; silently kept and the user only ever sees the bare warning.
-    (when (and prompt-user (featurep 'ghostel-module))
-      (ghostel--check-module-version dir t))))
+  (let ((dir (ghostel--effective-module-dir))
+        (stubbed-runtime
+         (and (fboundp 'ghostel--new)
+              (not (or (featurep 'ghostel-module)
+                       (featurep 'dyn-loader-module))))))
+    (unless (or (ghostel--native-runtime-ready-p) stubbed-runtime)
+      (ghostel--initialize-native-modules prompt-user))
+    ;; Surface stale live runtimes at interactive entry.
+    (when (and prompt-user
+               (ghostel--native-runtime-ready-p)
+               (not stubbed-runtime))
+      (ghostel--check-module-version dir t))
+    (when (and prompt-user
+               (not (or (ghostel--native-runtime-ready-p) stubbed-runtime)))
+      (user-error "Ghostel native module not available"))))
+
+
+(defun ghostel--native-runtime-ready-p ()
+  "Return non-nil when Ghostel's dyn-loader-managed runtime is ready."
+  (and (cl-every #'fboundp ghostel--native-runtime-required-functions)
+       (ghostel--native-runtime-reloadable-p)))
 
 (provide 'ghostel-module-install)
 ;;; ghostel-module-install.el ends here
