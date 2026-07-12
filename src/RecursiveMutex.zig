@@ -25,6 +25,18 @@ pub fn lockUncancelable(self: *Self, io: std.Io) void {
     self.lock_count += 1;
 }
 
+pub fn tryLock(self: *Self) bool {
+    const current = std.Thread.getCurrentId();
+    if (@atomicLoad(std.Thread.Id, &self.thread_id, .unordered) == current) {
+        self.lock_count += 1;
+        return true;
+    }
+    if (!self.mutex.tryLock()) return false;
+    @atomicStore(std.Thread.Id, &self.thread_id, current, .unordered);
+    self.lock_count = 1;
+    return true;
+}
+
 pub fn unlock(self: *Self, io: std.Io) void {
     self.lock_count -= 1;
     if (self.lock_count == 0) {
