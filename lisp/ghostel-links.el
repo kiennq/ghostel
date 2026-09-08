@@ -65,7 +65,7 @@ redraw.  Native OSC-8 hyperlinks remain applied during redraw."
   :group 'ghostel)
 
 (defcustom ghostel-file-detection-path-regex
-  "[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']*[^] \t\n\r:\"<>(){}[`'.,;!?]"
+  "\\(?:[[:alpha:]]:\\)?[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']*[^] \t\n\r:\"<>(){}[`'.,;!?]"
   "Regex matching the PATH portion of a file:line[:col] reference.
 Ghostel adds the leading path-boundary anchor and the optional
 `:LINE[:COL]' tail itself, so the value must contain neither.
@@ -74,7 +74,8 @@ path ending a sentence links without the trailing mark.
 
 The match is resolved against `default-directory' and linkified only
 when that file exists.  The default matches any path with at least one
-char after a `/': absolute, `./', `~/', or bare relative like `src/main.rs'.
+char after a `/': absolute, Windows drive-letter, `./', `~/', or bare
+relative like `src/main.rs'.
 
 Every distinct match costs a `file-exists-p' per scan, so broadening
 the pattern (e.g. to bare `file.go' without a `/') is expensive on
