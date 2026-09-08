@@ -53,9 +53,9 @@
 (ert-deftest ghostel-test-write-input-preserves-bare-lf-on-primary ()
   "On the primary screen, a bare LF preserves the column.
 The emulator never synthesizes a CR: cooked-mode \\n is turned into
-CRLF by the PTY's ONLCR (on by default in the line discipline), and
-raw-mode apps that emit bare LF mean a column-preserving linefeed.
-Synthesizing a CR collapsed inline TUIs that position with
+CRLF by the PTY's ONLCR (enabled via `stty sane' in the spawn
+wrapper), and raw-mode apps that emit bare LF mean a column-preserving
+linefeed.  Synthesizing a CR collapsed inline TUIs that position with
 column-preserving LF + relative CUB to the left margin (issue #388,
 the Antigravity CLI logo)."
   :tags '(native)
@@ -94,7 +94,6 @@ modes (47 / 1047 / 1049) are handled uniformly."
     (ghostel--write-vt term "abc\ndef")
     (should (equal '(6 . 1) (ghostel-test--cursor term)))))
 
-
 (ert-deftest ghostel-test-backspace ()
   "Test backspace (BS) processing by the terminal."
   :tags '(native)
@@ -109,7 +108,7 @@ modes (47 / 1047 / 1049) are handled uniformly."
 
     ;; Multiple backspaces
     (ghostel--write-vt term "\b \b\b \b")
-    (should (equal "he" (ghostel-test--row0 term)))))         ; after 3 BS total
+    (should (equal "he" (ghostel-test--row0 term)))))            ; after 3 BS total
 
 (ert-deftest ghostel-test-cursor-movement ()
   "Test CSI cursor movement sequences."
@@ -127,7 +126,7 @@ modes (47 / 1047 / 1049) are handled uniformly."
 
     ;; Cursor to specific position (row 3, col 5 — 1-based in CSI)
     (ghostel--write-vt term "\e[4;6H")
-    (should (equal '(5 . 3) (ghostel-test--cursor term)))))   ; cursor to (5,3)
+    (should (equal '(5 . 3) (ghostel-test--cursor term)))))      ; cursor to (5,3)
 
 (ert-deftest ghostel-test-cursor-position ()
   "Test `ghostel--cursor-pos' set to correct (COL . ROW)."
@@ -221,8 +220,8 @@ has been rendered."
       (should (equal "\e[6;23;9t\e[4;575;720t\e[8;25;80t"
                      (apply #'concat (nreverse replies)))))))
 
-(defmacro ghostel-test--with-resize-stubs (size &rest body)
-  "Run BODY with resize stubs returning SIZE for process window size."
+(defmacro ghostel-test--with-adjust-size-stubs (size &rest body)
+  "Run BODY with resize stubs returning SIZE."
   (declare (indent 1))
   `(let ((cur-buf (current-buffer)))
      (cl-letf (((symbol-function 'ghostel--window-anchored-p)
@@ -240,71 +239,28 @@ has been rendered."
        ,@body)))
 
 (ert-deftest ghostel-test-resize-window-adjust ()
-  "Window adjust resizes the VT and marks redraw state."
+  "`ghostel--adjust-size' resizes the VT and active process transport."
   (with-temp-buffer
     (let ((ghostel--term 'fake)
           (ghostel--process 'fake-proc)
           (ghostel--force-next-redraw nil)
           (set-size-args nil)
-          (redraw-called nil))
+          (process-size-args nil)
+          (redraw-args nil))
       (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
                  (lambda (_term h w) (setq set-size-args (list h w))))
+                ((symbol-function 'ghostel--process-live-p)
+                 (lambda (_proc) t))
+                ((symbol-function 'ghostel--process-set-window-size)
+                 (lambda (proc h w) (setq process-size-args (list proc h w))))
                 ((symbol-function 'ghostel--redraw-now)
-                 (lambda (_buf) (setq redraw-called t))))
-        (ghostel-test--with-resize-stubs '(120 . 40)
-		  (ghostel--adjust-size 'fake-window))
-        (should (equal '(40 120) set-size-args))
-        (should ghostel--force-next-redraw)
-        (should redraw-called)))))
-
-(ert-deftest ghostel-test-resize-nil-size ()
-  "When the default function returns nil, no resize happens."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (set-size-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (_term _h _w) (setq set-size-called t))))
-        (ghostel-test--with-resize-stubs nil
-		  (ghostel--adjust-size 'fake-window))
-        (should-not set-size-called)))))
-
-(ert-deftest ghostel-test-resize-noop-same-dims ()
-  "Resize to identical dims skips set-size."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (ghostel--term-rows 40)
-          (ghostel--term-cols 120)
-          (set-size-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (_term _h _w) (setq set-size-called t)))
-                ((symbol-function 'ghostel--redraw-now) #'ignore))
-        (ghostel-test--with-resize-stubs '(120 . 40)
-		  (ghostel--adjust-size 'fake-window))
-        (should-not set-size-called)))))
-
-(ert-deftest ghostel-test-resize-force-same-dims-still-runs ()
-  "Forced resize runs even when rows and cols are unchanged."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (ghostel--term-rows 40)
-          (ghostel--term-cols 120)
-          (ghostel--force-next-redraw nil)
-          (set-size-args nil)
-          (redraw-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (term h w) (setq set-size-args (list term h w))))
-                ((symbol-function 'ghostel--redraw-now)
-                 (lambda (buffer)
-                   (should (eq buffer (current-buffer)))
-                   (setq redraw-called ghostel--force-next-redraw))))
-        (ghostel-test--with-resize-stubs '(120 . 40)
-		  (ghostel--adjust-size 'fake-window t))
-        (should (equal '(fake 40 120) set-size-args))
-        (should ghostel--force-next-redraw)
-        (should redraw-called)))))
+                 (lambda (&rest args) (setq redraw-args args))))
+        (ghostel-test--with-adjust-size-stubs '(120 . 40)
+          (ghostel--adjust-size 'fake-window)
+          (should (equal '(fake-proc 40 120) process-size-args))
+          (should (equal '(40 120) set-size-args))
+          (should ghostel--force-next-redraw)
+          (should (equal (list (current-buffer)) redraw-args)))))))
 
 (ert-deftest ghostel-test-resize-window-buffer-not-current ()
   "Resize works when WINDOW's buffer is not the current buffer.
@@ -322,7 +278,7 @@ its old size."
       (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
                  (lambda (_term h w) (setq set-size-args (list h w))))
                 ((symbol-function 'ghostel--redraw-now) #'ignore))
-        (ghostel-test--with-resize-stubs '(120 . 40)
+        (ghostel-test--with-adjust-size-stubs '(120 . 40)
           (with-temp-buffer            ; unrelated buffer is current
             (ghostel--adjust-size 'fake-window))))
       (should (equal '(40 120) set-size-args))
@@ -363,8 +319,8 @@ Killing a buffer can substitute a ghostel buffer into that invisible
             (let ((ghostel--term 'fake)
                   (ghostel--input-mode 'semi-char)
                   (phase 'before)
-                  (adjust-args nil)
-                  (anchor-args nil))
+                  (adjust-calls nil)
+                  (anchor-calls nil))
               (cl-letf (((symbol-function 'ghostel--window-anchored-p)
                          (lambda (window &optional _body-pixel-height)
                            (and (eq window (selected-window))
@@ -372,122 +328,23 @@ Killing a buffer can substitute a ghostel buffer into that invisible
                         ((symbol-function 'ghostel--terminal-live-p)
                          (lambda () t))
                         ((symbol-function 'ghostel--adjust-size)
-                         (lambda (&rest args) (setq adjust-args args)))
+                         (lambda (&rest args) (push args adjust-calls)))
                         ((symbol-function 'ghostel--anchor-window)
-                         (lambda (&rest args) (setq anchor-args args))))
+                         (lambda (&rest args) (push args anchor-calls))))
                 (should (eq 'scaled
                             (ghostel--around-local-font-scale
                              (lambda ()
-                               (setq phase 'after)
-                               'scaled))))
-                (should (equal (list (selected-window) t) adjust-args))
-                (should (equal (list (selected-window)) anchor-args))))))
+                               (ghostel--around-local-font-scale
+                                (lambda ()
+                                  (setq phase 'after)
+                                  'scaled))))))
+                (should (equal (list (list (selected-window) t))
+                               adjust-calls))
+                (should (equal (list (list (selected-window)))
+                               anchor-calls))))))
       (when (buffer-live-p orig-buf)
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
-
-(ert-deftest ghostel-test-resize-rows-only-during-minibuffer-suppressed ()
-  "Rows-only resize while a minibuffer is active is deferred (#268).
-fish (and other shells with `fish_handle_reflow' on) clears and
-re-emits its prompt on every SIGWINCH.  A `consult-buffer'/`M-x'
-cycle shrinks then re-grows the body and would otherwise produce
-two prompt repaints in quick succession — visible as flicker."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (ghostel--term-rows 40)
-          (ghostel--term-cols 120)
-          (set-size-called nil)
-          (redraw-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (_term _h _w) (setq set-size-called t)))
-                ((symbol-function 'ghostel--redraw-now)
-                 (lambda (_buf) (setq redraw-called t)))
-                ((symbol-function 'active-minibuffer-window)
-                 (lambda () 'fake-mini-win))
-                ((symbol-function 'ghostel--alt-screen-p)
-                 (lambda (_term) nil)))
-        (ghostel-test--with-resize-stubs '(120 . 32)
-		  (ghostel--adjust-size 'fake-window))
-        (should-not set-size-called)
-        (should-not redraw-called)
-        (should (= 40 ghostel--term-rows))
-        (should (= 120 ghostel--term-cols))))))
-
-(ert-deftest ghostel-test-resize-rows-only-during-minibuffer-on-alt-screen-still-resizes ()
-  "Alt-screen TUIs bypass the minibuffer deferral and resize normally.
-vim/htop/less re-render against $LINES and would draw with stale
-dimensions otherwise."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (ghostel--term-rows 40)
-          (ghostel--term-cols 120)
-          (ghostel--force-next-redraw nil)
-          (set-size-args nil)
-          (redraw-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (_term h w) (setq set-size-args (list h w))))
-                ((symbol-function 'ghostel--redraw-now)
-                 (lambda (_buf) (setq redraw-called t)))
-                ((symbol-function 'active-minibuffer-window)
-                 (lambda () 'fake-mini-win))
-                ((symbol-function 'ghostel--alt-screen-p)
-                 (lambda (_term) t)))
-        (ghostel-test--with-resize-stubs '(120 . 32)
-		  (ghostel--adjust-size 'fake-window))
-        (should (equal '(32 120) set-size-args))
-        (should ghostel--force-next-redraw)
-        (should redraw-called)))))
-
-(ert-deftest ghostel-test-resize-rows-only-outside-minibuffer-still-resizes ()
-  "Rows-only resize with no minibuffer active goes through the normal path.
-Genuine vertical resizes like `C-x 2' must still propagate to the
-shell so $LINES stays accurate."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (ghostel--term-rows 40)
-          (ghostel--term-cols 120)
-          (ghostel--force-next-redraw nil)
-          (set-size-args nil)
-          (redraw-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (_term h w) (setq set-size-args (list h w))))
-                ((symbol-function 'ghostel--redraw-now)
-                 (lambda (_buf) (setq redraw-called t)))
-                ((symbol-function 'active-minibuffer-window)
-                 (lambda () nil)))
-        (ghostel-test--with-resize-stubs '(120 . 32)
-		  (ghostel--adjust-size 'fake-window))
-        (should (equal '(32 120) set-size-args))
-        (should ghostel--force-next-redraw)
-        (should redraw-called)))))
-
-(ert-deftest ghostel-test-resize-cols-change-during-minibuffer-still-resizes ()
-  "Cols change during a minibuffer still goes through the normal path.
-The deferral only applies to rows-only deltas; a column change means
-real reflow that the shell needs to know about regardless of
-minibuffer state."
-  (with-temp-buffer
-    (let ((ghostel--term 'fake)
-          (ghostel--process 'fake-proc)
-          (ghostel--term-rows 40)
-          (ghostel--term-cols 120)
-          (ghostel--force-next-redraw nil)
-          (set-size-args nil)
-          (redraw-called nil))
-      (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
-                 (lambda (_term h w) (setq set-size-args (list h w))))
-                ((symbol-function 'ghostel--redraw-now)
-                 (lambda (_buf) (setq redraw-called t)))
-                ((symbol-function 'active-minibuffer-window)
-                 (lambda () 'fake-mini-win)))
-        (ghostel-test--with-resize-stubs '(100 . 40)
-		  (ghostel--adjust-size 'fake-window))
-        (should (equal '(40 100) set-size-args))
-        (should ghostel--force-next-redraw)
-        (should redraw-called)))))
 
 (ert-deftest ghostel-test-cleanup-temp-paths-handles-files-and-dirs ()
   "`ghostel--cleanup-temp-paths' deletes files and recursively deletes dirs.
@@ -540,22 +397,25 @@ state from the wrong buffer after feeding output to the native module."
   "Native event callbacks do not leak buffer switches into invalidation."
   (let ((ghostel-buf (generate-new-buffer " *ghostel-test-events-buf*"))
         (other-buf (generate-new-buffer " *ghostel-test-events-other*"))
+        pipe
         invalidate-called)
     (unwind-protect
-        (with-current-buffer ghostel-buf
-          (setq-local ghostel--event-buf nil)
-          (cl-letf (((symbol-function 'process-buffer) (lambda (_) ghostel-buf))
-                    ((symbol-function 'ghostel--invalidate)
-                     (lambda () (setq invalidate-called (current-buffer)))))
-            (ghostel--events-filter
-             'fake-proc
-             (format "(set-buffer %S)(setq-local ghostel-test--event-buffer-ok t)"
-                     (buffer-name other-buf))))
-          (should (eq (current-buffer) ghostel-buf))
-          (should (eq invalidate-called ghostel-buf))
-          (should (bound-and-true-p ghostel-test--event-buffer-ok))
-          (should-not (local-variable-p 'ghostel-test--event-buffer-ok
-                                        other-buf)))
+        (progn
+          (setq pipe (make-pipe-process
+                     :name "ghostel-test-events"
+                     :buffer ghostel-buf
+                     :noquery t))
+          (with-current-buffer ghostel-buf
+            (cl-letf (((symbol-function 'ghostel--invalidate)
+                      (lambda () (setq invalidate-called (current-buffer)))))
+              (ghostel--events-filter
+               pipe
+               (format "(set-buffer %S)" (buffer-name other-buf))))
+            (should (eq (current-buffer) ghostel-buf))
+            (should (eq invalidate-called ghostel-buf))
+            (should (null (process-get pipe 'ghostel--event-buf)))))
+      (when (and pipe (process-live-p pipe))
+        (delete-process pipe))
       (kill-buffer ghostel-buf)
       (kill-buffer other-buf))))
 
@@ -638,6 +498,72 @@ state from the wrong buffer after feeding output to the native module."
       ;; `kill-buffer' runs the buffer-local `kill-buffer-hook' that
       ;; `ghostel--cursor-blink-start' installs, cancelling any timer.
       (kill-buffer buf))))
+
+(ert-deftest ghostel-test-resize-skips-dead-native-process ()
+  "`ghostel--adjust-size' must not resize a dead native PTY backend."
+  (let ((pipe (make-pipe-process
+               :name "ghostel-native-process"
+               :buffer (current-buffer)
+               :noquery t))
+        (set-size-called nil)
+        (redraw-called nil))
+    (unwind-protect
+        (with-temp-buffer
+          (process-put pipe 'ghostel-native-pty t)
+          (delete-process pipe)
+          (let ((ghostel--term 'fake)
+                (ghostel--process pipe)
+                (ghostel--term-rows 24)
+                (ghostel--term-cols 80)
+                (ghostel--force-next-redraw nil))
+            (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
+                       (lambda (&rest _)
+                         (setq set-size-called t)))
+                      ((symbol-function 'ghostel--redraw-now)
+                       (lambda (&rest _)
+                         (setq redraw-called t))))
+              (ghostel-test--with-adjust-size-stubs '(120 . 40)
+                (ghostel--adjust-size 'fake-window)
+                (should-not set-size-called)
+                (should-not redraw-called)
+                (should-not ghostel--force-next-redraw)))))
+      (when (and pipe (process-live-p pipe))
+        (delete-process pipe)))))
+
+(ert-deftest ghostel-test-resize-window-adjust-branches ()
+  "`ghostel--adjust-size' covers nil, noop, force, and minibuffer branches."
+  (with-temp-buffer
+    (dolist (case '((:size nil :rows 40 :cols 120 :force nil
+                      :minibuffer 0 :alt nil :expect nil)
+                    (:size (120 . 40) :rows 40 :cols 120 :force nil
+                      :minibuffer 0 :alt nil :expect nil)
+                    (:size (120 . 40) :rows 40 :cols 120 :force t
+                      :minibuffer 0 :alt nil :expect (40 120))
+                    (:size (120 . 32) :rows 40 :cols 120 :force nil
+                      :minibuffer 1 :alt nil :expect nil)
+                    (:size (120 . 32) :rows 40 :cols 120 :force nil
+                      :minibuffer 1 :alt t :expect (32 120))
+                    (:size (100 . 40) :rows 40 :cols 120 :force nil
+                      :minibuffer 1 :alt nil :expect (40 100))))
+      (let ((ghostel--term 'fake)
+            (ghostel--process 'fake-proc)
+            (ghostel--term-rows (plist-get case :rows))
+            (ghostel--term-cols (plist-get case :cols))
+            (set-size-args nil))
+        (cl-letf (((symbol-function 'ghostel--set-size-with-cell-dims)
+                   (lambda (_term h w) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--process-live-p)
+                   (lambda (_proc) t))
+                  ((symbol-function 'ghostel--process-set-window-size)
+                   #'ignore)
+                  ((symbol-function 'ghostel--redraw-now) #'ignore)
+                  ((symbol-function 'minibuffer-depth)
+                   (lambda () (plist-get case :minibuffer)))
+                  ((symbol-function 'ghostel--alt-screen-p)
+                   (lambda (_term) (plist-get case :alt))))
+          (ghostel-test--with-adjust-size-stubs (plist-get case :size)
+            (ghostel--adjust-size 'fake-window (plist-get case :force))
+            (should (equal (plist-get case :expect) set-size-args))))))))
 
 (provide 'ghostel-terminal-test)
 ;;; ghostel-terminal-test.el ends here

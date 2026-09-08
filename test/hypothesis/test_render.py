@@ -39,6 +39,7 @@ FAILURE_ARTIFACTS_DIR = Path(
         "GHOSTEL_HYPOTHESIS_FAILURE_DIR", "/private/tmp/ghostel-hypothesis-failure"
     )
 )
+MODULE_DIRECTORY = os.environ.get("GHOSTEL_MODULE_DIRECTORY")
 
 TEXT_ALPHABET = (
     "abcdefghijklmnopqrstuvwxyz"
@@ -1035,6 +1036,16 @@ class EmacsGhostelRunner:
     """Long-lived Emacs process that runs generated render cases."""
 
     def __init__(self) -> None:
+        module_flags: list[str] = []
+        if MODULE_DIRECTORY:
+            module_dir = Path(MODULE_DIRECTORY)
+            if not module_dir.is_absolute():
+                module_dir = REPO_ROOT / module_dir
+            module_flags = [
+                "--eval",
+                "(setq ghostel-module-directory "
+                f"{json.dumps(str(module_dir))})",
+            ]
         cmd = [
             EMACS,
             "--batch",
@@ -1044,6 +1055,7 @@ class EmacsGhostelRunner:
             "lisp",
             "-L",
             "test",
+            *module_flags,
             "-l",
             "test/ghostel-test-helpers.el",
             "-l",

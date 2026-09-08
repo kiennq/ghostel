@@ -132,11 +132,11 @@ interactive shell."
     (nu   . "nu -c 'history | get command | reverse | to text'"))
   "Command printing a shell's history, keyed by shell type.
 Keys are shell type symbols (`bash', `zsh', `fish', `nu').  A string
-value is run with \"/bin/sh -c\" through `process-file', so a remote
-buffer queries the remote host; it must print one history entry per
-line, newest first.  Output containing a NUL byte is split on NUL
-instead, letting multi-line entries survive (e.g. fish's `history -z').
-Entries are trimmed of surrounding whitespace.
+value is run with \"sh -c\" through `process-file', so a remote buffer
+queries the remote host; it must print one history entry per line,
+newest first.  Output containing a NUL byte is split on NUL instead,
+letting multi-line entries survive (e.g. fish's `history -z').  Entries
+are trimmed of surrounding whitespace.
 
 A function value is called with no arguments in the terminal's buffer
 and must return the list of entries itself, newest first.  History
@@ -278,6 +278,11 @@ caller supplies a type-aware default; see
                 (cdr spec))))
     (ghostel--shell-program-and-args ghostel-shell)))
 
+(defun ghostel--posix-shell-quote-argument (argument)
+  "Quote ARGUMENT for a POSIX shell command, independent of host OS."
+  (let ((system-type 'gnu/linux))
+    (shell-quote-argument argument)))
+
 (defun ghostel--macos-login-wrap (program args)
   "Wrap PROGRAM/ARGS via `/usr/bin/login' to produce a macOS login shell.
 Returns (LOGIN-PROGRAM . LOGIN-ARGS).  Mirrors Ghostty's wrap:
@@ -291,7 +296,7 @@ of the final shell, which is what makes it a login shell.
 PROGRAM and ARGS are shell-quoted into the `-c' command."
   (let* ((user (user-login-name))
          (hush (file-exists-p (expand-file-name "~/.hushlogin")))
-         (quoted (mapconcat #'shell-quote-argument
+         (quoted (mapconcat #'ghostel--posix-shell-quote-argument
                             (cons program args) " "))
          (cmd (concat "exec -l " quoted))
          ;; Quote from Ghostty source:
@@ -770,10 +775,14 @@ working directory."
 Splits the output on NUL when present, else on newline; trims each
 entry and drops blanks.  Signals `user-error' on a non-zero exit,
 including the command's first stderr line."
-  (let ((stderr-file (make-temp-file "ghostel-history")))
+  (let ((stderr-file (make-temp-file "ghostel-history"))
+        (shell (if (and (eq system-type 'windows-nt)
+                        (not (file-remote-p default-directory)))
+                   (or (executable-find "sh") "/bin/sh")
+                 "/bin/sh")))
     (unwind-protect
         (with-temp-buffer
-          (let ((status (process-file "/bin/sh" nil (list t stderr-file) nil
+          (let ((status (process-file shell nil (list t stderr-file) nil
                                       "-c" command)))
             (unless (eql status 0)
               (user-error "Shell history command failed (%s): %s" status

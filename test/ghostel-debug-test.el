@@ -112,6 +112,27 @@ send."
       (when (get-buffer "*ghostel-debug-glyph*")
         (kill-buffer "*ghostel-debug-glyph*")))))
 
+(ert-deftest ghostel-test-debug-info-accepts-release-module-version ()
+  "`ghostel-debug-info' accepts a compatible full release module version."
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t)
+        (ghostel--terminfo-warned t)
+        (ghostel--minimum-module-version "0.56.0"))
+    (unwind-protect
+        (save-window-excursion
+          (with-temp-buffer
+            (cl-letf (((symbol-function 'ghostel--module-version)
+                       (lambda () "0.56.0.162.ec928f")))
+              (ghostel-debug-info))
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                (should (string-match-p
+                         "Module version:      0.56.0.162.ec928f"
+                         content))
+                (should-not (string-match-p "VERSION MISMATCH" content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
 (ert-deftest ghostel-test-debug-info-environment-section ()
   "`ghostel-debug-info' renders the Environment section.
 The section shows the spawn env ghostel hands the shell (TERM,
@@ -689,16 +710,19 @@ that feeds the offending sequence and asserts its stderr is clean."
   :tags '(native)
   (let* ((emacs (expand-file-name invocation-name invocation-directory))
          (lisp (file-name-directory (locate-library "ghostel")))
+         (module-dir (ghostel--effective-module-dir ghostel-module-directory))
          (stderr-file (make-temp-file "ghostel-stderr"))
          ;; Replicate the parent's `load-path' so the bare `-Q' child can load
          ;; ghostel and its deps (e.g. compat on Emacs < 30, which CI supplies
          ;; via -L); `\e' is a real ESC byte parsed as the VT set/reset of 9001.
          (code (format
-                (concat "(progn (setq load-path '%S) (require 'ghostel)"
+                (concat "(progn (setq load-path '%S"
+                        " ghostel-module-directory %S)"
+                        " (require 'ghostel)"
                         " (let ((tm (ghostel--new 25 80 1000)))"
                         " (ghostel--write-vt tm \"\e[?9001h\")"
                         " (ghostel--write-vt tm \"\e[?9001l\")))")
-                load-path)))
+                load-path module-dir)))
     (unwind-protect
         (with-temp-buffer
           (let ((status (call-process emacs nil (list t stderr-file) nil
