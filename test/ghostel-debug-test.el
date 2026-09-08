@@ -689,16 +689,19 @@ that feeds the offending sequence and asserts its stderr is clean."
   :tags '(native)
   (let* ((emacs (expand-file-name invocation-name invocation-directory))
          (lisp (file-name-directory (locate-library "ghostel")))
+         (module-dir (ghostel--effective-module-dir ghostel-module-directory))
          (stderr-file (make-temp-file "ghostel-stderr"))
          ;; Replicate the parent's `load-path' so the bare `-Q' child can load
          ;; ghostel and its deps (e.g. compat on Emacs < 30, which CI supplies
          ;; via -L); `\e' is a real ESC byte parsed as the VT set/reset of 9001.
          (code (format
-                (concat "(progn (setq load-path '%S) (require 'ghostel)"
+                (concat "(progn (setq load-path '%S"
+                        " ghostel-module-directory %S)"
+                        " (require 'ghostel)"
                         " (let ((tm (ghostel--new 25 80 1000)))"
                         " (ghostel--write-vt tm \"\e[?9001h\")"
                         " (ghostel--write-vt tm \"\e[?9001l\")))")
-                load-path)))
+                load-path module-dir)))
     (unwind-protect
         (with-temp-buffer
           (let ((status (call-process emacs nil (list t stderr-file) nil

@@ -377,8 +377,7 @@ its optional force-past-synchronized-output argument (forwarded)."
 
 (defun ghostel-debug--log-resize (orig-fn window &optional force)
   "Log resize events with old/new dimensions and timing.
-ORIG-FN is `ghostel--adjust-size'.  WINDOW and its optional FORCE
-argument are passed through."
+ORIG-FN is `ghostel--adjust-size'.  WINDOW and FORCE are passed through."
   (let* ((buffer (and (window-live-p window) (window-buffer window)))
          (old-rows (and (buffer-live-p buffer)
                         (buffer-local-value 'ghostel--term-rows buffer)))
