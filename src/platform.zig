@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 
 const windows = if (builtin.os.tag == .windows) struct {
     const w32 = std.os.windows;

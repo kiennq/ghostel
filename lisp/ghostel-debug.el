@@ -377,8 +377,7 @@ its optional force-past-synchronized-output argument (forwarded)."
 
 (defun ghostel-debug--log-resize (orig-fn window &optional force)
   "Log resize events with old/new dimensions and timing.
-ORIG-FN is `ghostel--adjust-size'.  WINDOW and its optional FORCE
-argument are passed through."
+ORIG-FN is `ghostel--adjust-size'.  WINDOW and FORCE are passed through."
   (let* ((buffer (and (window-live-p window) (window-buffer window)))
          (old-rows (and (buffer-live-p buffer)
                         (buffer-local-value 'ghostel--term-rows buffer)))
@@ -805,7 +804,9 @@ omit it when the connection itself is the suspected fault."
             (when mod-loaded
               (let ((mod-ver (ghostel--module-version)))
                 (insert (format "Module version:      %s\n" mod-ver))
-                (unless (string= mod-ver ghostel--minimum-module-version)
+                (when (version<
+                       (ghostel--module-version-for-comparison mod-ver)
+                       ghostel--minimum-module-version)
                   (insert (format "  *** VERSION MISMATCH: elisp expects >= %s, module is %s ***\n"
                                   ghostel--minimum-module-version mod-ver)))))
             (when root
