@@ -15,6 +15,7 @@ TERMINFO and TERM_PROGRAM must not leak through when the user opts
 out — otherwise outbound `ssh' (or any consumer of those vars) would
 falsely conclude that ghostty is the controlling terminal."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (ghostel-test--with-pty-matrix backend
     (let* ((process-environment (ghostel-test--base-process-environment))
            (ghostel-shell (ghostel-test--env-done-command))
@@ -42,6 +43,7 @@ The `auto' default follows `ghostel-tramp-shell-integration': enabled
 when that's non-nil, off otherwise.  Setting it to t forces on,
 setting it to nil forces off."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (ghostel-test--with-pty-matrix backend
     (let* ((process-environment (ghostel-test--base-process-environment))
            (ghostel-shell (ghostel-test--env-done-command))
@@ -112,6 +114,7 @@ When a user sets TERM via `ghostel-environment', it must win over the
 internal `TERM=xterm-ghostty' so a `process-environment' lookup (which
 returns the first match) resolves to the user's value."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (ghostel-test--with-pty-matrix backend
     (let* ((process-environment (ghostel-test--base-process-environment))
            (ghostel-shell (ghostel-test--env-done-command))
@@ -211,6 +214,7 @@ env; printf GHOSTEL_ENV_DONE"))
 
 (ert-deftest ghostel-test-compile-spawn-env-injects-logical-pwd ()
   "`ghostel-compile--spawn' children also get the logical PWD entry."
+  :tags '(posix)
   (let ((captured 'unset)
         (buf (generate-new-buffer " *ghostel-compile-pwd*")))
     (unwind-protect
