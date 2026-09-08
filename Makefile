@@ -14,6 +14,7 @@ LINT_ELPA_DIR  ?= $(XDG_CACHE_HOME)/ghostel-lint-elpa
 LINT_DEPS_STAMP := $(LINT_ELPA_DIR)/.deps-installed
 DOC_ELPA_DIR   ?= $(XDG_CACHE_HOME)/ghostel-doc-elpa
 DOC_DEPS_STAMP := $(DOC_ELPA_DIR)/.deps-installed
+HYPOTHESIS_FAILURE_DIR ?= $(abspath .build/hypothesis-failure)
 
 ELISP_FILES := $(filter-out %-autoloads.el,$(wildcard lisp/ghostel*.el) \
                                       $(wildcard extensions/evil-ghostel/*.el) \
@@ -34,7 +35,7 @@ DOCQUOTE_FILES = $(ELISP) $(TOOLS_ELISP)
 # for `build', decide whether tests need to re-run.
 UNAME := $(shell uname 2>/dev/null)
 ifeq ($(OS),Windows_NT)
-  MODULE := ghostel-module.dll
+  MODULE_SUFFIX := .dll
   # Use MinGW rather than Zig's MSVC-flavoured native Windows target so local
   # builds match release artifacts and do not require a Windows SDK.  The DLL
   # architecture must match Emacs, not necessarily the OS (e.g. x64 Emacs under
@@ -49,34 +50,52 @@ ifeq ($(OS),Windows_NT)
   endif
   ZIG_TARGET_FLAG ?= -Dtarget=$(ZIG_WINDOWS_TARGET)
 else ifeq ($(UNAME),Darwin)
-  MODULE := ghostel-module.dylib
+  MODULE_SUFFIX := .dylib
+else ifneq (,$(findstring MINGW,$(UNAME)))
+  MODULE_SUFFIX := .dll
+else ifneq (,$(findstring MSYS,$(UNAME)))
+  MODULE_SUFFIX := .dll
+else ifneq (,$(findstring CYGWIN,$(UNAME)))
+  MODULE_SUFFIX := .dll
 else
-  MODULE := ghostel-module.so
+  MODULE_SUFFIX := .so
 endif
-ZIG_BUILD_FLAGS := --prefix . -Doptimize=ReleaseFast -Dcpu=baseline $(ZIG_TARGET_FLAG)
-ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon symbols.map) \
+MODULE_DIR := zig-out/bin
+MODULE := $(MODULE_DIR)/ghostel-module$(MODULE_SUFFIX)
+LOADER_MODULE := $(MODULE_DIR)/dyn-loader-module$(MODULE_SUFFIX)
+MODULE_MANIFEST := $(MODULE_DIR)/ghostel-module.json
+NATIVE_MODULE_ARTIFACTS := $(LOADER_MODULE) $(MODULE) $(MODULE_MANIFEST)
+ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon) \
                $(wildcard vendor/*.h)
 
-.PHONY: all build test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil test-consult lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel melpazoid-consult-ghostel byte-compile checkdoc docquotes package-lint bench bench-quick bench-e2e bench-tui-partial html clean regen-terminfo
+.PHONY: all build check test test-native test-zig test-hypothesis test-hypothesis-cases test-all test-evil test-consult lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel melpazoid-consult-ghostel byte-compile checkdoc docquotes package-lint bench bench-quick bench-e2e bench-tui-partial html clean regen-terminfo
 
 # Recommended invocation: `make -j$(nproc) all' on Linux,
 # `make -j$(sysctl -n hw.ncpu) all' on macOS.  GNU make 4+ also accepts
 # bare `-j' (unlimited); pair with `-l$(nproc)' to cap by load.
 all: build test-all test-evil test-consult lint
 
-build: $(MODULE)
+build: $(NATIVE_MODULE_ARTIFACTS)
 
-$(MODULE): $(ZIG_SOURCES)
-	zig build $(ZIG_BUILD_FLAGS)
+$(NATIVE_MODULE_ARTIFACTS): $(ZIG_SOURCES)
+	zig build -Doptimize=ReleaseFast -Dcpu=baseline $(ZIG_TARGET_FLAG)
+
+check:
+	zig build check
 
 test-zig:
 	zig build $(ZIG_TARGET_FLAG) test
 
 test-hypothesis: build
+	GHOSTEL_MODULE_DIRECTORY="$(abspath $(MODULE_DIR))" \
+	GHOSTEL_HYPOTHESIS_FAILURE_DIR="$(HYPOTHESIS_FAILURE_DIR)" \
 	$(PYTHON) -m unittest test/hypothesis/test_render.py
 
 test-hypothesis-cases: build
-	cd test/hypothesis && $(PYTHON) -m unittest test_render.RenderSavedCaseRegressionTest
+	cd test/hypothesis && \
+	GHOSTEL_MODULE_DIRECTORY="$(abspath $(MODULE_DIR))" \
+	GHOSTEL_HYPOTHESIS_FAILURE_DIR="$(HYPOTHESIS_FAILURE_DIR)" \
+	$(PYTHON) -m unittest test_render.RenderSavedCaseRegressionTest
 
 # Pattern rule: rebuild .elc whenever its .el source is newer.
 # Make's timestamp tracking keeps the byte-compiled files in sync, so
@@ -134,9 +153,10 @@ $(TEST_STAMPS_DIR)/elisp-%.ok: test/%.el test/ghostel-test-helpers.el $(ELC) | $
 		-f ghostel-test-run-elisp
 	@touch $@
 
-$(TEST_STAMPS_DIR)/native-%.ok: test/%.el test/ghostel-test-helpers.el $(TEST_FIXTURES) $(ELC) $(MODULE) | $(TEST_STAMPS_DIR)
+$(TEST_STAMPS_DIR)/native-%.ok: test/%.el test/ghostel-test-helpers.el $(TEST_FIXTURES) $(ELC) $(NATIVE_MODULE_ARTIFACTS) | $(TEST_STAMPS_DIR)
 	@printf '  NATIVE  %s\n' $*
 	@$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp -L test \
+		--eval "(setq ghostel-module-directory (expand-file-name \"$(MODULE_DIR)\" default-directory))" \
 		-l ert -l test/ghostel-test-helpers.el -l $< \
 		-f ghostel-test-run-native
 	@touch $@
@@ -160,14 +180,14 @@ lint: byte-compile package-lint checkdoc docquotes
 # package for evil-ghostel's dependency check -- MELPA's ghostel cannot
 # serve, as the lint runs below leave MELPA out of `package-archives'.
 # An isolated `package-user-dir' keeps `make package-lint' standalone.
-$(LINT_DEPS_STAMP): $(CORE_PACKAGE_FILE) Makefile
-	$(EMACS) --batch $(EMACSFLAGS) -Q \
+$(LINT_DEPS_STAMP): $(CORE_PACKAGE_FILE) $(LINT_HELPERS) Makefile
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp \
 		--eval "(require 'package)" \
 		--eval "(setq package-user-dir \"$(LINT_ELPA_DIR)\")" \
 		--eval "(add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)" \
 		--eval "(package-initialize)" \
-		--eval "(package-refresh-contents)" \
-		--eval "(package-install 'package-lint)" \
+		-l $(LINT_HELPERS) \
+		--eval "(ghostel-lint-install-packages 'package-lint 'compat)" \
 		--eval "(package-install-file (expand-file-name \"$(CORE_PACKAGE_FILE)\"))"
 	@touch $@
 
@@ -224,7 +244,7 @@ $(MELPAZOID_DIR):
 	git clone https://github.com/riscy/melpazoid.git "$@"
 
 melpazoid-ghostel: | $(MELPAZOID_DIR)
-	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files (:defaults "etc" "src" "vendor" "build.zig" "build.zig.zon" "symbols.map"))' \
+	RECIPE='(ghostel :fetcher github :repo "dakra/ghostel" :files (:defaults "etc" "src" "vendor" "build.zig" "build.zig.zon"))' \
 		LOCAL_REPO=$(CURDIR) \
 		make -C "$(MELPAZOID_DIR)"
 

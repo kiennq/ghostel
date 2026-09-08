@@ -41,6 +41,8 @@ The buffer must not be redrawn while a feature inhibits it."
                 ((symbol-function 'ghostel--redraw)
                  (lambda (&rest _)
                    (ert-fail "Inhibited redraw must not call native redraw")))
+                ((symbol-function 'ghostel--get-render-window)
+                 (lambda (&rest _) 'visible-window))
                 ((symbol-function 'run-with-timer)
                  (lambda (delay repeat fn &rest args)
                    (setq timer-delay delay

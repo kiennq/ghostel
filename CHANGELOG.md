@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Windows redraws avoid rewriting terminal rows whose text and renderer-owned
+  properties are unchanged, skip redundant viewport resets for no-op frames,
+  and use bounded pixel anchoring.  Repeated-row and cursor-only updates now
+  impose substantially less work on Emacs redisplay without slowing continuous
+  scrolling.
+- Removed `ghostel-redraw-only-when-selected-window`.  Any Ghostel window on a
+  visible frame can now trigger redraw, while hidden or iconified buffers
+  remain pending.
+- `ghostel-resize-only-when-selected-window` can limit PTY resizing to the
+  selected Ghostel window.  Background geometry changes are applied when that
+  window is selected; the default nil retains all-window adjustment and the
+  existing minibuffer rows-only suppression.
+
 ## [0.53.0] — 2026-09-02
 
 ### Added
@@ -1633,9 +1647,10 @@ All notable changes to this project will be documented in this file.
   itself was anchored only at end-of-line.  The fallback regex
   now defaults to `comint-password-prompt-regexp` (structurally
   anchored at start-of-line or after curated trigger words), and
-  the fallback only runs when `ghostel--remote-shell-p` indicates
-  a remote shell — local raw-mode TUIs (vim, less, htop) don't
-  risk false positives from coincidental cursor-row content.
+  the fallback only runs when `ghostel--password-regex-fallback-p`
+  indicates a remote shell or Windows ConPTY — POSIX local raw-mode
+  TUIs (vim, less, htop) don't risk false positives from coincidental
+  cursor-row content.
   Fixes [#244](https://github.com/dakra/ghostel/issues/244).
 - `consult-line`, `consult-imenu`, and other `goto-char` jumps in
   line mode no longer snap back to the live cursor.  The

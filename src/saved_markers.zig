@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 
 const gt = @import("ghostty-vt");
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const utils = @import("utils.zig");
 
 pub const SavedMarker = struct {
@@ -117,6 +117,7 @@ pub const SavedBufferMarkers = struct {
         self: *SavedBufferMarkers,
         screen: *gt.Screen,
         env: emacs.Env,
+        skip_unchanged_window_start: bool,
     ) void {
         self.unpin(screen, env);
 
@@ -130,7 +131,11 @@ pub const SavedBufferMarkers = struct {
 
         for (self.windows.items) |w| {
             _ = env.f("set-window-point", .{ w.window, w.point.pos });
-            _ = env.f("set-window-start", .{ w.window, w.start.pos, env.t() });
+            if (!skip_unchanged_window_start or
+                env.cast(usize, env.f("window-start", .{w.window})) != w.start.pos)
+            {
+                _ = env.f("set-window-start", .{ w.window, w.start.pos, env.t() });
+            }
         }
 
         self.windows.clearRetainingCapacity();

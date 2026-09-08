@@ -113,6 +113,7 @@ const Pty = struct {
 pty: Pty,
 pid: sys.pid_t = -1,
 wake_pipe: [2]sys.fd_t = .{ -1, -1 },
+command_pipe: [2]sys.fd_t = .{ -1, -1 },
 
 pub const EventWriter = struct {
     pub const Fd = sys.fd_t;
@@ -190,6 +191,45 @@ fn failChild(msg: []const u8, err: []const u8) noreturn {
     std.c._exit(1);
 }
 
+pub const Reaper = struct {
+    pty: Pty,
+    pid: sys.pid_t,
+
+    pub fn deinitAndWait(self: *@This()) u32 {
+        std.debug.assert(self.pid > 0);
+        self.pty.deinit();
+
+        while (true) {
+            var status: c_int = undefined;
+            switch (sys.errno(sys.waitpid(self.pid, &status, 0))) {
+                .SUCCESS => {
+                    if (c.WIFEXITED(status)) return @intCast(c.WEXITSTATUS(status));
+                    if (c.WIFSIGNALED(status)) return @intCast(128 + c.WTERMSIG(status));
+                    return 255;
+                },
+                .INTR => continue,
+                else => return 255,
+            }
+        }
+    }
+};
+
+fn createNonblockingPipe(pipe: *[2]sys.fd_t) !void {
+    if (sys.errno(sys.pipe(pipe)) != .SUCCESS) return error.PipeCreationFailed;
+    errdefer closePipe(pipe);
+
+    // pipe2 is unavailable on macOS, so set both properties after creation.
+    for (pipe.*) |fd| {
+        _ = try fcntl(fd, sys.F.SETFD, sys.FD_CLOEXEC);
+        const flags = try fcntl(fd, sys.F.GETFL, 0);
+        _ = try fcntl(
+            fd,
+            sys.F.SETFL,
+            flags | @as(u32, @bitCast(sys.O{ .NONBLOCK = true })),
+        );
+    }
+}
+
 pub fn init(alloc: Allocator, _: std.Io, initial_cols: u16, initial_rows: u16, params: backend_types.ProcessParams) !Self {
     var self = Self{ .pty = try .init() };
     errdefer self.pty.deinit();
@@ -203,18 +243,11 @@ pub fn init(alloc: Allocator, _: std.Io, initial_cols: u16, initial_rows: u16, p
     const args = try arena.allocSentinel(?[*:0]const u8, params.args.len, null);
     for (params.args, 0..) |arg, i| args[i] = arg;
 
-    if (sys.errno(sys.pipe(&self.wake_pipe)) != .SUCCESS) {
-        return error.PipeCreationFailed;
-    }
-    errdefer {
-        _ = sys.close(self.wake_pipe[0]);
-        _ = sys.close(self.wake_pipe[1]);
-    }
+    try createNonblockingPipe(&self.wake_pipe);
+    errdefer closePipe(&self.wake_pipe);
 
-    // This is racy but benign. pipe2 would be better but doesn't exist on macOS.
-    for (self.wake_pipe) |fd| {
-        _ = try fcntl(fd, sys.F.SETFD, sys.FD_CLOEXEC);
-    }
+    try createNonblockingPipe(&self.command_pipe);
+    errdefer closePipe(&self.command_pipe);
 
     const flags = try fcntl(self.pty.primary_fd, sys.F.GETFL, 0);
     _ = try fcntl(
@@ -272,7 +305,7 @@ pub fn write(
         switch (sys.errno(written)) {
             .SUCCESS => return .{ .written = @intCast(written) },
 
-            .PIPE, .IO, .SRCH, .NXIO => return .interrupted,
+            .PIPE, .IO, .SRCH, .NXIO => return error.ProcessExited,
 
             .AGAIN => {
                 var pollfds = [_]sys.pollfd{
@@ -309,7 +342,7 @@ pub fn write(
     }
 }
 
-pub fn drain(self: *Self, stream: anytype) !bool {
+pub fn drain(self: *Self, stream: anytype) !backend_types.DrainResult {
     var buf: [4096]u8 = undefined;
 
     var pollfds = [_]sys.pollfd{
@@ -323,21 +356,34 @@ pub fn drain(self: *Self, stream: anytype) !bool {
             .events = sys.POLL.IN,
             .revents = undefined,
         },
+        .{
+            .fd = self.command_pipe[0],
+            .events = sys.POLL.IN,
+            .revents = undefined,
+        },
     };
     if (sys.errno(pollWithRetry(&pollfds, -1)) != .SUCCESS) {
         return error.PollFailed;
     }
-    if (pollfds[1].revents != 0) return false;
+    if (pollfds[1].revents != 0) return .stopped;
+    if (pollfds[2].revents != 0) {
+        self.clearCommandWake();
+        return .command;
+    }
 
     const eof = pollfds[0].revents & sys.POLL.HUP != 0;
+    var drained = false;
     while (true) {
         const len = sys.read(self.pty.primary_fd, &buf, buf.len);
-        if (len == 0) return !eof;
+        if (len == 0) return if (eof) .finished else if (drained) .output else .finished;
         switch (sys.errno(len)) {
-            .SUCCESS => try stream.nextSlice(buf[0..@intCast(len)]),
+            .SUCCESS => {
+                drained = true;
+                try stream.nextSlice(buf[0..@intCast(len)]);
+            },
             .INTR => continue,
-            .AGAIN => return !eof,
-            .BADF, .IO => return false,
+            .AGAIN => return if (eof) .finished else .output,
+            .BADF, .IO => return .finished,
             else => return error.ReadFailed,
         }
     }
@@ -345,31 +391,131 @@ pub fn drain(self: *Self, stream: anytype) !bool {
 
 pub fn finishDrain(_: *Self, _: anytype) !void {}
 
+pub fn wakeCommands(self: *Self) void {
+    if (self.command_pipe[1] == -1) return;
+    _ = writeWithRetry(self.command_pipe[1], "W");
+}
+
+pub fn clearCommandWake(self: *Self) void {
+    clearPipe(self.command_pipe[0]);
+}
+
 pub fn requestStop(self: *Self, _: std.Thread) void {
-    if (self.wake_pipe[1] != -1) {
-        _ = writeWithRetry(self.wake_pipe[1], "X");
-    }
+    if (self.wake_pipe[1] == -1) return;
+    _ = writeWithRetry(self.wake_pipe[1], "S");
+}
+
+pub fn takeForReaper(self: *Self) Reaper {
+    const reaper = Reaper{
+        .pty = self.pty,
+        .pid = self.pid,
+    };
+    self.pty.primary_fd = -1;
+    self.pty.replica_fd = -1;
+    self.pid = -1;
+    return reaper;
 }
 
 pub fn replicaName(self: *Self) []const u8 {
     return self.pty.replicaName();
 }
 
-pub fn deinitAndWait(self: *Self) u32 {
-    std.debug.assert(self.pid > 0);
-    self.pty.deinit();
-    _ = sys.close(self.wake_pipe[0]);
-    _ = sys.close(self.wake_pipe[1]);
-    while (true) {
-        var status: c_int = undefined;
-        switch (sys.errno(sys.waitpid(self.pid, &status, 0))) {
-            .SUCCESS => {
-                if (c.WIFEXITED(status)) return @intCast(c.WEXITSTATUS(status));
-                if (c.WIFSIGNALED(status)) return @intCast(128 + c.WTERMSIG(status));
-            },
+pub fn closeWakeEndpoints(self: *Self) void {
+    closePipe(&self.wake_pipe);
+    closePipe(&self.command_pipe);
+}
 
+pub fn deinitAndWait(self: *Self) u32 {
+    self.closeWakeEndpoints();
+    var reaper = self.takeForReaper();
+    return reaper.deinitAndWait();
+}
+
+fn clearPipe(fd: sys.fd_t) void {
+    if (fd == -1) return;
+
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = sys.read(fd, &buf, buf.len);
+        switch (sys.errno(n)) {
+            .SUCCESS => {},
             .INTR => continue,
-            else => return 255,
+            .AGAIN => return,
+            else => return,
         }
+        if (n == 0 or n < buf.len) return;
     }
+}
+
+fn closePipe(pipe: *[2]sys.fd_t) void {
+    if (pipe[0] != -1) {
+        _ = sys.close(pipe[0]);
+        pipe[0] = -1;
+    }
+    if (pipe[1] != -1) {
+        _ = sys.close(pipe[1]);
+        pipe[1] = -1;
+    }
+}
+
+test "wakeCommands signals command pipe after reaper handoff" {
+    var command_pipe: [2]sys.fd_t = .{ -1, -1 };
+    try createNonblockingPipe(&command_pipe);
+    defer closePipe(&command_pipe);
+
+    var process = Self{
+        .pty = .{},
+        .pid = 42,
+        .command_pipe = command_pipe,
+    };
+
+    _ = process.takeForReaper();
+    process.wakeCommands();
+
+    var pollfds = [_]sys.pollfd{.{
+        .fd = command_pipe[0],
+        .events = sys.POLL.IN,
+        .revents = undefined,
+    }};
+    const ready = pollWithRetry(&pollfds, 0);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(ready));
+    try std.testing.expectEqual(@as(c_int, 1), ready);
+    try std.testing.expect(pollfds[0].revents & sys.POLL.IN != 0);
+
+    var buf: [1]u8 = undefined;
+    const n = sys.read(command_pipe[0], &buf, buf.len);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(n));
+    try std.testing.expectEqual(@as(isize, 1), n);
+    try std.testing.expectEqualStrings("W", &buf);
+}
+
+test "requestStop signals wake pipe after reaper handoff" {
+    var wake_pipe: [2]sys.fd_t = .{ -1, -1 };
+    try createNonblockingPipe(&wake_pipe);
+    defer closePipe(&wake_pipe);
+
+    var process = Self{
+        .pty = .{},
+        .pid = 42,
+        .wake_pipe = wake_pipe,
+    };
+
+    _ = process.takeForReaper();
+    process.requestStop(undefined);
+
+    var pollfds = [_]sys.pollfd{.{
+        .fd = wake_pipe[0],
+        .events = sys.POLL.IN,
+        .revents = undefined,
+    }};
+    const ready = pollWithRetry(&pollfds, 0);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(ready));
+    try std.testing.expectEqual(@as(c_int, 1), ready);
+    try std.testing.expect(pollfds[0].revents & sys.POLL.IN != 0);
+
+    var buf: [1]u8 = undefined;
+    const n = sys.read(wake_pipe[0], &buf, buf.len);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(n));
+    try std.testing.expectEqual(@as(isize, 1), n);
+    try std.testing.expectEqualStrings("S", &buf);
 }
