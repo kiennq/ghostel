@@ -40,7 +40,7 @@ the input region back after each redraw so the user's typing is
 not clobbered."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (setq ghostel-detect-password-prompts nil)
+    (setq-local ghostel-detect-password-prompts nil)
     (set-window-buffer (selected-window) buf)
     (setq ghostel--process 'fake-proc)
     ;; First prompt with OSC 133 A/B markers.
@@ -338,14 +338,17 @@ but the cursor is at the end of the REPL's prompt."
             (ghostel-line-mode)
             (should (eq ghostel--input-mode 'line))
             (should-not buffer-read-only)
+            (should-not inhibit-read-only)
             (goto-char (marker-position ghostel--line-input-end))
             (insert "1+1")
             (ghostel-line-mode-send)
             (should-not buffer-read-only)
+            (should-not inhibit-read-only)
             (ghostel-semi-char-mode)
-            ;; Live semi-char: writable, edits intercepted by the
-            ;; after-change forwarding hook.
-            (should-not buffer-read-only)
+            ;; Live semi-char: read-only behind a local inhibit slot, so
+            ;; edits are intercepted by the after-change forwarding hook.
+            (should buffer-read-only)
+            (should inhibit-read-only)
             (should (equal sent "1+1"))
             (should (equal encoded "return"))))
       (kill-buffer buf))))
@@ -2036,7 +2039,7 @@ The deferred entry stays armed across redraws with no detectable
 prompt and engages on the redraw that exposes one."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (setq ghostel-detect-password-prompts nil)
+    (setq-local ghostel-detect-password-prompts nil)
     (set-window-buffer (selected-window) buf)
     (setq ghostel--process 'fake-proc)
     ;; Arm exactly as `ghostel--apply-initial-input-mode' would.
@@ -2060,7 +2063,7 @@ prompt and engages on the redraw that exposes one."
   "A manual mode switch before the first prompt cancels deferred line entry."
   :tags '(native)
   (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
-    (setq ghostel-detect-password-prompts nil)
+    (setq-local ghostel-detect-password-prompts nil)
     (set-window-buffer (selected-window) buf)
     (setq ghostel--process 'fake-proc)
     (setq ghostel--pending-initial-line-mode t)
