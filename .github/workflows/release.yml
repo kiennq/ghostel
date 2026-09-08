@@ -163,11 +163,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          conpty_args=()
+          build_args=(-Doptimize=ReleaseFast -Dcpu=baseline)
           if [ "${{ runner.os }}" = "Windows" ]; then
-            conpty_args=(-Dwindows-conpty-package-dir=conpty-package)
+            build_args+=(-Dwindows-conpty-package-dir=conpty-package)
           fi
-          build_args=(-Doptimize=ReleaseFast -Dcpu=baseline "${conpty_args[@]}")
           if [ -n "${{ matrix.target }}" ]; then
             build_args=(-Dtarget=${{ matrix.target }} "${build_args[@]}")
           fi
@@ -196,7 +195,6 @@ jobs:
             dyn-loader-module${{ matrix.suffix }}
             ghostel-module${{ matrix.suffix }}
             ghostel-module.json
-            ghostel-module.version
           )
           if [[ "${{ matrix.platform }}" == "x86_64-windows" ]]; then
             files+=(conpty.dll x64/OpenConsole.exe)
