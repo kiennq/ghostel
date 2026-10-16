@@ -47,6 +47,7 @@ Falling back to (selected-window) sized the PTY from whatever window
 happened to be focused at call time, which rarely matches where the
 buffer eventually shows up."
   (let ((buf (generate-new-buffer "ghostel-exec-test"))
+        (ghostel-term "xterm-ghostty")
         captured)
     (unwind-protect
         (progn
