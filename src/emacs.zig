@@ -30,6 +30,25 @@ const DebugUserPtr = struct {
 /// explicitly free them before atexit fires. This allows us to check for
 /// memory leaks on exit.
 var debug_userptrs: std.ArrayList(DebugUserPtr) = .empty;
+var active_native_readers: std.atomic.Value(usize) = .init(0);
+
+pub fn nativeReaderStarted() void {
+    _ = active_native_readers.fetchAdd(1, .monotonic);
+}
+
+pub fn nativeReaderStopped() void {
+    const previous = active_native_readers.fetchSub(1, .release);
+    std.debug.assert(previous > 0);
+}
+
+fn waitForNativeReaders() void {
+    while (active_native_readers.load(.acquire) != 0) {
+        std.Thread.yield() catch |err| {
+            std.log.err("Failed to yield while waiting for native reader shutdown: {any}", .{err});
+            return;
+        };
+    }
+}
 
 pub const FunctionEntry = struct {
     name: [:0]const u8,
@@ -45,7 +64,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     pub fn intern(self: Env, name: [*:0]const u8) Value {
@@ -183,6 +204,37 @@ pub const Env = struct {
         return @ptrCast(@alignCast(raw_ptr));
     }
 
+    /// Return a user pointer only when its finalizer matches FINALIZER.
+    ///
+    /// Handoff handles can be dispatched to an older loader generation, so
+    /// never cast one of these opaque values based on its address alone.
+    pub fn getUserPtrWithFinalizer(
+        self: Env,
+        comptime T: type,
+        val: Value,
+        finalizer: Finalizer,
+    ) error{EmacsNonLocalExit}!?*T {
+        try self.checkNonLocalExit();
+        const raw_ptr = self.raw.get_user_ptr.?(self.raw, val);
+        try self.checkNonLocalExit();
+        if (raw_ptr == null) return null;
+
+        const expected_finalizer: *const Finalizer = &finalizer;
+        if (builtin.mode == .debug) {
+            for (debug_userptrs.items) |item| {
+                if (item.ptr == raw_ptr and item.finalizer == expected_finalizer) {
+                    return @ptrCast(@alignCast(raw_ptr));
+                }
+            }
+        }
+
+        const get_finalizer = self.raw.get_user_finalizer orelse return null;
+        const actual_finalizer = get_finalizer(self.raw, val);
+        try self.checkNonLocalExit();
+        if (actual_finalizer != expected_finalizer) return null;
+        return @ptrCast(@alignCast(raw_ptr));
+    }
+
     pub fn cast(self: Env, T: type, val: Value) T {
         const ty = @typeInfo(T);
         return switch (ty) {
@@ -294,7 +346,7 @@ pub const Env = struct {
     }
 
     pub fn vecSize(self: Env, vec: Value) c_long {
-        return self.raw.vec_size.?(self.raw, vec);
+        return @intCast(self.raw.vec_size.?(self.raw, vec));
     }
 
     pub fn nonLocalExitCheck(self: Env) FuncallExit {
@@ -338,6 +390,8 @@ pub const Env = struct {
             if (shouldQuit(self.raw)) return error.EmacsQuit;
         }
     }
+
+    // --- Function registration ---
 
     pub fn makeFunction(
         self: Env,
@@ -392,9 +446,22 @@ pub const Env = struct {
         _ = self.f("fset", .{ self.intern(entry.name), fun });
     }
 
-    /// Register a named Elisp function backed by a C function.
-    pub fn registerFunctions(self: Env, comptime entries: []const FunctionEntry) void {
-        inline for (entries) |*entry| self.registerFunction(entry);
+    /// Bind one loader-owned function. Ghostel exports use FunctionEntry arrays.
+    pub fn bindFunction(
+        self: Env,
+        name: [*:0]const u8,
+        min_arity: i32,
+        max_arity: i32,
+        func: *const fn (?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,
+        docstring: [*:0]const u8,
+    ) void {
+        const fun = self.makeFunction(min_arity, max_arity, func, docstring, null);
+        _ = self.f("fset", .{ self.intern(name), fun });
+    }
+
+    /// Call (provide 'feature).
+    pub fn provide(self: Env, feature: [*:0]const u8) void {
+        _ = self.funcall(sym.provide, &[_]Value{self.intern(feature)});
     }
 
     pub fn makeUnibyteString(self: Env, str: []const u8) Value {
@@ -406,15 +473,22 @@ pub const Env = struct {
     }
 
     /// Signal an error with a message string.
-    pub fn signalError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
             sym.@"error",
-            self.f("list", .{self.format("ghostel: " ++ msg, objects)}),
+            self.f("list", .{msg}),
         );
     }
 
-    pub fn message(self: Env, msg: []const u8, objects: anytype) void {
-        const all_args = [1]Value{self.makeString(msg)} ++ self.makeValues(objects);
+    pub fn signalErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        self.nonLocalExitSignal(
+            sym.@"error",
+            self.f("list", .{self.format("ghostel: " ++ fmt, args)}),
+        );
+    }
+
+    pub fn message(self: Env, comptime fmt: []const u8, args: anytype) void {
+        const all_args = [1]Value{self.makeString(fmt)} ++ self.makeValues(args);
         _ = self.funcall(sym.message, &all_args);
     }
 
@@ -423,10 +497,10 @@ pub const Env = struct {
         return self.funcall(sym.format, &all_args);
     }
 
-    pub fn logError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn logError(self: Env, comptime fmt: []const u8, args: anytype) void {
         _ = self.f("display-warning", .{
             sym.ghostel,
-            self.format("ghostel: " ++ msg, objects),
+            self.format("ghostel: " ++ fmt, args),
             sym.@":error",
         });
     }
@@ -483,8 +557,12 @@ const interned_symbols = [_][:0]const u8{
     ":test",
     ":underline",
     ":width",
+    "add-hook",
     "add-text-properties",
+    "boundp",
     "bright",
+    "buffer-modified-tick",
+    "buffer-substring-no-properties",
     "car",
     "cdr",
     "center",
@@ -524,6 +602,7 @@ const interned_symbols = [_][:0]const u8{
     "forward-line",
     "fset",
     "get-buffer-window-list",
+    "get-text-property",
     "getenv",
     "gethash",
     "ghostel",
@@ -536,6 +615,8 @@ const interned_symbols = [_][:0]const u8{
     "ghostel--debug-log-vt",
     "ghostel--defer",
     "ghostel--face-hex-color",
+    "ghostel--handoff-reply",
+    "ghostel--handoff-resize",
     "ghostel--handle-notification",
     "ghostel--kitty-image-cache",
     "ghostel--line-spacing-pixels",
@@ -553,6 +634,7 @@ const interned_symbols = [_][:0]const u8{
     "ghostel--set-title",
     "ghostel--term-cols",
     "ghostel--term-rows",
+    "ghostel--native-transport-term",
     "ghostel--update-directory",
     "ghostel-bold",
     "ghostel-comint--update-dir",
@@ -574,6 +656,7 @@ const interned_symbols = [_][:0]const u8{
     "image-type-available-p",
     "insert",
     "keymap",
+    "dark",
     "light",
     "line",
     "line-number-at-pos",
@@ -586,6 +669,7 @@ const interned_symbols = [_][:0]const u8{
     "min-width",
     "mouse-face",
     "multibyte-string-p",
+    "next-property-change",
     "nil",
     "nth",
     "numberp",
@@ -602,6 +686,7 @@ const interned_symbols = [_][:0]const u8{
     "puthash",
     "query-font",
     "quit",
+    "remhash",
     "reverse",
     "run-at-time",
     "selected-window",
@@ -642,6 +727,12 @@ fn SymbolCache(comptime symbols: []const [:0]const u8) type {
 }
 
 pub var sym: SymbolCache(&interned_symbols) = undefined;
+var sym_initialized = false;
+var debug_hook_installed = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
@@ -649,11 +740,7 @@ pub fn initModule(alloc: Allocator, raw: *c.emacs_env) void {
     module_alloc = alloc;
 
     const env = Env.init(raw);
-    inline for (@typeInfo(@TypeOf(sym)).@"struct".field_names) |field_name| {
-        @field(sym, field_name) = env.makeGlobalRef(env.intern(field_name));
-    }
-
-    if (builtin.mode == .debug) {
+    if (builtin.mode == .debug and !debug_hook_installed) {
         const cleanup_fn = env.makeFunction(
             0,
             0,
@@ -668,7 +755,16 @@ pub fn initModule(alloc: Allocator, raw: *c.emacs_env) void {
             cleanup_fn,
             env.makeInteger(90),
         });
+        debug_hook_installed = true;
     }
+}
+
+pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
+    inline for (@typeInfo(@TypeOf(sym)).@"struct".field_names) |field_name| {
+        @field(sym, field_name) = env.makeGlobalRef(env.intern(field_name));
+    }
+    sym_initialized = true;
 }
 
 fn debugKillEmacsHook(_: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
@@ -676,7 +772,7 @@ fn debugKillEmacsHook(_: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*any
         user_ptr.finalizer(user_ptr.ptr);
     }
     debug_userptrs.deinit(module_alloc);
-    @import("NativeProcess.zig").waitForReaders();
+    waitForNativeReaders();
     return sym.nil;
 }
 
@@ -690,7 +786,7 @@ test "Emacs error checks preserve signals and throws" {
     };
     var raw = std.mem.zeroes(c.emacs_env);
     raw.non_local_exit_check = &Stub.check;
-    const env = Env.init(&raw);
+    const env = Env{ .raw = &raw };
     try env.checkNonLocalExit();
 
     for ([_]c.enum_emacs_funcall_exit{ c.emacs_funcall_exit_signal, c.emacs_funcall_exit_throw }) |status| {
@@ -698,4 +794,58 @@ test "Emacs error checks preserve signals and throws" {
         try std.testing.expectError(error.EmacsNonLocalExit, env.checkNonLocalExit());
         try std.testing.expectEqual(status, Stub.status);
     }
+}
+
+test "typed user pointer guard checks debug finalizer identity before casting" {
+    if (builtin.mode != .debug) return error.SkipZigTest;
+
+    const Stub = struct {
+        var raw_ptr: UserPtr = null;
+        var raw_finalizer: ?*const Finalizer = null;
+
+        fn getUserPtr(_: RawEnv, _: Value) callconv(.c) UserPtr {
+            return raw_ptr;
+        }
+
+        fn getUserFinalizer(_: RawEnv, _: Value) callconv(.c) ?*const Finalizer {
+            return raw_finalizer;
+        }
+
+        fn check(_: RawEnv) callconv(.c) c.enum_emacs_funcall_exit {
+            return c.emacs_funcall_exit_return;
+        }
+
+        fn terminalFinalizer(_: ?*anyopaque) callconv(.c) void {}
+        fn childFinalizer(_: ?*anyopaque) callconv(.c) void {}
+        fn debugWrapper(_: ?*anyopaque) callconv(.c) void {}
+    };
+
+    var terminal_payload: u64 = 0;
+    var child_payload: u64 = 0;
+    const terminal_ptr: UserPtr = &terminal_payload;
+    const child_ptr: UserPtr = &child_payload;
+    const terminal_finalizer: Finalizer = Stub.terminalFinalizer;
+    const child_finalizer: Finalizer = Stub.childFinalizer;
+    var entries = [_]DebugUserPtr{
+        .{ .ptr = terminal_ptr, .finalizer = &terminal_finalizer },
+        .{ .ptr = child_ptr, .finalizer = &child_finalizer },
+    };
+    const previous_debug_userptrs = debug_userptrs;
+    debug_userptrs = .{ .items = entries[0..], .capacity = entries.len };
+    defer debug_userptrs = previous_debug_userptrs;
+
+    var raw = std.mem.zeroes(c.emacs_env);
+    raw.get_user_ptr = &Stub.getUserPtr;
+    raw.get_user_finalizer = &Stub.getUserFinalizer;
+    raw.non_local_exit_check = &Stub.check;
+    const env = Env{ .raw = &raw };
+
+    Stub.raw_ptr = terminal_ptr;
+    Stub.raw_finalizer = &Stub.debugWrapper;
+    const terminal = try env.getUserPtrWithFinalizer(u64, undefined, Stub.terminalFinalizer);
+    try std.testing.expect(terminal == &terminal_payload);
+
+    Stub.raw_ptr = child_ptr;
+    const child = try env.getUserPtrWithFinalizer(u64, undefined, Stub.terminalFinalizer);
+    try std.testing.expect(child == null);
 }

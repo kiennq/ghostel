@@ -9,7 +9,7 @@ const GhostelTerm = @import("GhostelTerm.zig");
 const GlyphMetricsCache = @import("GlyphMetricsCache.zig");
 const KittyRenderer = @import("KittyRenderer.zig");
 const SavedBufferMarkers = @import("saved_markers.zig").SavedBufferMarkers;
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const utils = @import("utils.zig");
 
 const style_face = @import("style_face.zig");
@@ -57,6 +57,9 @@ span: SpanContent,
 
 /// Graphics layout and image realization, with its own renderer state.
 kitty: KittyRenderer,
+/// Builds one dirty row while an adjacent span is pending, so unchanged rows
+/// can be skipped without widening the rewrite range.
+row_span: SpanContent,
 
 /// Cached font metrics and rendering parameters that affect glyph layout.
 /// When any field changes between redraws the viewport is fully invalidated.
@@ -80,6 +83,14 @@ const BufferRegion = struct {
     max: usize,
 };
 
+const RenderSpan = struct {
+    start_val: emacs.Value,
+    old_end_val: emacs.Value,
+    node: *gt.PageList.List.Node,
+    adjusted_line_start: usize,
+    has_content_dirty: bool,
+};
+
 const ScreenId = struct {
     key: gt.ScreenSet.Key,
     generation: usize,
@@ -99,6 +110,19 @@ const FontInfo = struct {
 };
 
 pub fn init(alloc: Allocator, env: emacs.Env, term: *gt.Terminal) !Self {
+    return initWithGeometry(alloc, env, term, 1, 1, 1);
+}
+
+pub fn initWithGeometry(
+    alloc: Allocator,
+    env: emacs.Env,
+    term: *gt.Terminal,
+    cell_w: u32,
+    cell_h: u32,
+    pixel_scale: u32,
+) !Self {
+    if (cell_w == 0 or cell_h == 0 or pixel_scale == 0) return error.InvalidSize;
+
     const s = emacs.sym;
 
     env.defvarLocal("ghostel--query-font-cache", env.f("make-hash-table", .{
@@ -115,10 +139,18 @@ pub fn init(alloc: Allocator, env: emacs.Env, term: *gt.Terminal) !Self {
         ),
         .rendered_screen = currentScreenId(term),
         .rendered_cursor = null,
-        .pending_resize = .{ .cols = term.cols, .rows = term.rows, .cell_w = 1, .cell_h = 1 },
+        .pending_resize = .{
+            .cols = term.cols,
+            .rows = term.rows,
+            .cell_w = cell_w,
+            .cell_h = cell_h,
+            .pixel_scale = pixel_scale,
+        },
         .span = .{ .alloc = alloc },
         .kitty = .init(alloc, env),
+        .row_span = .{ .alloc = alloc },
     };
+    errdefer renderer.deinit();
     try renderer.commitResize(env);
     return renderer;
 }
@@ -127,6 +159,7 @@ pub fn deinit(self: *Self) void {
     self.saved_markers.deinit(self.alloc);
     self.span.deinit();
     self.kitty.deinit();
+    self.row_span.deinit();
     self.untrackActivePinIfLive();
     if (self.font_info) |*fi| fi.deinit(self.alloc);
 }
@@ -184,7 +217,13 @@ pub fn redraw(self: *Self, env: emacs.Env, force_full: bool, force_sync: bool) !
 
     const screen = self.term.screens.active;
     try self.saved_markers.save(self.alloc, env);
-    defer self.saved_markers.restoreAndClear(screen, env);
+    const before_render_tick = env.cast(i64, env.f("buffer-modified-tick", .{}));
+    defer self.saved_markers.restoreAndClear(
+        screen,
+        env,
+        !force_full and !force_sync and
+            before_render_tick == env.cast(i64, env.f("buffer-modified-tick", .{})),
+    );
 
     if (force_full) try self.clear(env);
     try self.updateFontInfo(env);
@@ -732,6 +771,41 @@ pub const SpanContent = struct {
         self.node = null;
     }
 
+    pub fn append(self: *SpanContent, other: *const SpanContent) !void {
+        if (self.node) |node| {
+            if (other.node) |other_node| std.debug.assert(node == other_node);
+        } else {
+            self.node = other.node;
+        }
+
+        const byte_offset = self.text.items.len;
+        const char_offset = self.char_len;
+
+        try self.text.appendSlice(self.alloc, other.text.items);
+        for (other.line_wraps.items) |offset| {
+            try self.line_wraps.append(self.alloc, char_offset + offset);
+        }
+        for (other.adjust_cells.items) |cell| {
+            var adjusted = cell;
+            adjusted.char_start += char_offset;
+            adjusted.char_end += char_offset;
+            adjusted.text_start += byte_offset;
+            adjusted.text_end += byte_offset;
+            try self.adjust_cells.append(self.alloc, adjusted);
+        }
+        for (other.runs.items) |run| {
+            var adjusted = run;
+            adjusted.start_char += char_offset;
+            adjusted.end_char += char_offset;
+            try self.runs.append(self.alloc, adjusted);
+        }
+
+        if (other.cursor_char_pos) |pos| {
+            self.cursor_char_pos = char_offset + pos;
+        }
+        self.char_len += other.char_len;
+    }
+
     pub fn deinit(self: *SpanContent) void {
         self.text.deinit(self.alloc);
         self.line_wraps.deinit(self.alloc);
@@ -952,13 +1026,248 @@ fn findGlyphString(
     return if (env.isNil(gstring)) null else gstring;
 }
 
-fn addRowToSpan(self: *Self, env: emacs.Env, row_pin: gt.Pin) !usize {
-    return try self.span.addRow(
+fn addRowToSpan(
+    self: *Self,
+    env: emacs.Env,
+    content: *SpanContent,
+    row_pin: gt.Pin,
+) !usize {
+    return try content.addRow(
         env,
         self,
         row_pin,
         if (self.font_info) |f| f.coverage else std.math.maxInt(u32),
     );
+}
+
+fn propertyEquals(
+    env: emacs.Env,
+    pos: usize,
+    property: emacs.Value,
+    expected: emacs.Value,
+) bool {
+    return env.isNotNil(env.f("equal", .{
+        env.f("get-text-property", .{ pos, property }),
+        expected,
+    }));
+}
+
+fn propsMatchAt(
+    self: *Self,
+    env: emacs.Env,
+    pos: usize,
+    node: *gt.PageList.List.Node,
+    key: ?*const CellPropKey,
+    image: ?emacs.Value,
+) !bool {
+    const s = emacs.sym;
+    const expected_face = if (key) |k|
+        (try self.getFace(env, node, k)) orelse env.nil()
+    else
+        env.nil();
+    if (!propertyEquals(env, pos, s.face, expected_face)) return false;
+
+    if (image) |expected_image| {
+        if (!propertyEquals(env, pos, s.display, expected_image) or
+            !propertyEquals(env, pos, s.@"ghostel-kitty", env.t()))
+        {
+            return false;
+        }
+    } else if (env.isNotNil(env.f("get-text-property", .{
+        pos,
+        s.@"ghostel-kitty",
+    }))) {
+        return false;
+    }
+
+    var expected_help_echo = env.nil();
+    var expected_mouse_face = env.nil();
+    var expected_keymap = env.nil();
+    var expected_link_id = env.nil();
+    if (key) |k| if (k.hyperlink_id != 0) {
+        const link = resolveHyperlink(node.page(), k.hyperlink_id) orelse return false;
+        expected_help_echo = env.makeString(link.uri);
+        expected_mouse_face = s.highlight;
+        expected_keymap = env.symbolValue("ghostel-link-map");
+        expected_link_id = switch (link.id) {
+            .explicit => |id| env.makeString(id),
+            .implicit => |id| env.makeInteger(@intCast(id)),
+        };
+    };
+
+    if (env.isNotNil(expected_link_id)) {
+        if (!propertyEquals(env, pos, s.@"help-echo", expected_help_echo) or
+            !propertyEquals(env, pos, s.@"mouse-face", expected_mouse_face) or
+            !propertyEquals(env, pos, s.keymap, expected_keymap) or
+            !propertyEquals(env, pos, s.@"ghostel-link-id", expected_link_id))
+        {
+            return false;
+        }
+    } else if (env.isNotNil(env.f("get-text-property", .{
+        pos,
+        s.@"ghostel-link-id",
+    }))) {
+        return false;
+    }
+
+    const is_prompt = if (key) |k| k.semantic_content == .prompt else false;
+    const is_input = if (key) |k| k.semantic_content == .input else false;
+    if (!propertyEquals(env, pos, s.@"ghostel-prompt", if (is_prompt) env.t() else env.nil()) or
+        !propertyEquals(env, pos, s.@"ghostel-input", if (is_input) env.t() else env.nil()))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+fn spanPropertiesMatch(
+    self: *Self,
+    env: emacs.Env,
+    span: *const RenderSpan,
+    content: *const SpanContent,
+) !bool {
+    for (content.runs.items) |*run| {
+        if (run.start_char >= run.end_char) continue;
+
+        const start = env.cast(usize, span.start_val) + run.start_char;
+        const end = env.cast(usize, span.start_val) + run.end_char;
+        const key = if (run.key) |*value| value else null;
+        const image = run.image;
+        var pos = start;
+        while (pos < end) {
+            if (!try propsMatchAt(self, env, pos, span.node, key, image)) return false;
+
+            const next_val = env.f("next-property-change", .{
+                env.makeValue(pos),
+                env.nil(),
+                env.makeValue(end),
+            });
+            const next = if (env.isNil(next_val))
+                end
+            else
+                env.cast(usize, next_val);
+            if (next <= pos or next > end) return false;
+            pos = next;
+        }
+    }
+
+    var byte_pos: usize = 0;
+    var char_pos: usize = 0;
+    while (byte_pos < content.text.items.len) : (char_pos += 1) {
+        if (content.text.items[byte_pos] == '\n') {
+            var expected = false;
+            for (content.line_wraps.items) |offset| {
+                if (offset == char_pos) {
+                    expected = true;
+                    break;
+                }
+            }
+
+            const actual = env.isNotNil(env.f("get-text-property", .{
+                env.cast(usize, span.start_val) + char_pos,
+                emacs.sym.@"ghostel-wrap",
+            }));
+            if (actual != expected) return false;
+        }
+
+        const sequence_len = std.unicode.utf8ByteSequenceLength(
+            content.text.items[byte_pos],
+        ) catch return false;
+        byte_pos += sequence_len;
+    }
+
+    return true;
+}
+
+fn spanImagesMatch(
+    env: emacs.Env,
+    span: *const RenderSpan,
+    content: *const SpanContent,
+) !bool {
+    for (content.runs.items) |*run| {
+        if (run.start_char >= run.end_char) continue;
+
+        const start = env.cast(usize, span.start_val) + run.start_char;
+        const end = env.cast(usize, span.start_val) + run.end_char;
+        var pos = start;
+        while (pos < end) {
+            if (run.image) |image| {
+                if (!propertyEquals(env, pos, emacs.sym.display, image) or
+                    !propertyEquals(env, pos, emacs.sym.@"ghostel-kitty", env.t()))
+                {
+                    return false;
+                }
+            } else if (env.isNotNil(env.f("get-text-property", .{
+                pos,
+                emacs.sym.@"ghostel-kitty",
+            }))) {
+                return false;
+            }
+
+            const next_val = env.f("next-property-change", .{
+                env.makeValue(pos),
+                env.nil(),
+                env.makeValue(end),
+            });
+            const next = if (env.isNil(next_val))
+                end
+            else
+                env.cast(usize, next_val);
+            if (next <= pos or next > end) return false;
+            pos = next;
+        }
+    }
+
+    return true;
+}
+
+fn spanMatchesBuffer(
+    self: *Self,
+    env: emacs.Env,
+    span: *const RenderSpan,
+    content: *const SpanContent,
+) !bool {
+    const start = env.cast(usize, span.start_val);
+    const end = env.cast(usize, span.old_end_val);
+    if (end <= start or content.text.items.len == 0) return false;
+
+    const old_text = env.f("buffer-substring-no-properties", .{
+        span.start_val,
+        span.old_end_val,
+    });
+    if (env.isNil(env.f("equal", .{
+        old_text,
+        env.makeString(content.text.items),
+    }))) {
+        return false;
+    }
+
+    if (!span.has_content_dirty) return try spanImagesMatch(env, span, content);
+    return try self.spanPropertiesMatch(env, span, content);
+}
+
+fn publishCursorCharPos(
+    env: emacs.Env,
+    content: *const SpanContent,
+    span_start: usize,
+) void {
+    if (content.cursor_char_pos) |pos| {
+        env.set(
+            "ghostel--cursor-char-pos",
+            span_start + pos,
+        );
+    }
+}
+
+fn flushRenderSpan(self: *Self, env: emacs.Env, span: *const RenderSpan) !void {
+    if (try self.spanMatchesBuffer(env, span, &self.span)) {
+        publishCursorCharPos(env, &self.span, env.cast(usize, span.start_val));
+        return;
+    }
+
+    _ = env.f("delete-region", .{ span.start_val, span.old_end_val });
+    try self.flushSpan(env);
 }
 
 fn flushSpan(self: *Self, env: emacs.Env) !void {
@@ -999,12 +1308,7 @@ fn flushSpan(self: *Self, env: emacs.Env) !void {
         });
     }
 
-    if (self.span.cursor_char_pos) |pos| {
-        env.set(
-            "ghostel--cursor-char-pos",
-            @as(usize, @intCast(span_start)) + pos,
-        );
-    }
+    publishCursorCharPos(env, &self.span, span_start);
 }
 
 fn isSameRow(a: gt.Pin, b: gt.Pin) bool {
@@ -1036,23 +1340,20 @@ fn render(
     try self.kitty.prepare(env, self.term, self.size.cell_w, self.size.cell_h, self.size.pixel_scale);
 
     var eob = false;
-    var current_span: ?struct {
-        start_val: emacs.Value,
-        node: *const gt.PageList.List.Node,
-        adjusted_line_start: usize,
-    } = null;
+    var current_span: ?RenderSpan = null;
 
     var it = start_pin.rowIterator(.right_down, null);
     while (it.next()) |row_pin| {
         const row = row_pin.rowAndCell().row;
         eob = eob or env.isNotNil(env.f("eobp", .{}));
+        const content_dirty = row_pin.isDirty();
+
         const clean = !eob and !(try self.isRowDirty(row_pin));
         if (current_span) |*span| {
             // Style and hyperlink ids are page-local, so flush before
             // crossing a page boundary.
             if (clean or span.node != row_pin.node) {
-                _ = env.f("delete-region", .{ span.start_val, env.f("point", .{}) });
-                try self.flushSpan(env);
+                try self.flushRenderSpan(env, span);
                 current_span = null;
             }
         }
@@ -1062,25 +1363,66 @@ fn render(
         const old_line_end_val = env.f("point", .{});
 
         if (!clean) {
-            if (current_span == null) {
-                current_span = .{
-                    .start_val = line_start_val,
-                    .node = row_pin.node,
-                    .adjusted_line_start = env.cast(usize, line_start_val),
-                };
+            const candidate = RenderSpan{
+                .start_val = line_start_val,
+                .old_end_val = old_line_end_val,
+                .node = row_pin.node,
+                .adjusted_line_start = env.cast(usize, line_start_val),
+                .has_content_dirty = content_dirty,
+            };
+            var row_changed = true;
+            var new_line_len: usize = 0;
+
+            if (current_span) |*span| {
+                self.row_span.clear();
+                new_line_len = try self.addRowToSpan(env, &self.row_span, row_pin);
+                if (try self.spanMatchesBuffer(env, &candidate, &self.row_span)) {
+                    _ = env.f("goto-char", .{span.old_end_val});
+                    try self.flushRenderSpan(env, span);
+                    current_span = null;
+                    const matched_row_start = env.cast(usize, env.f("point", .{}));
+                    publishCursorCharPos(
+                        env,
+                        &self.row_span,
+                        matched_row_start,
+                    );
+                    _ = env.f("forward-line", .{1});
+                    row_changed = false;
+                    self.row_span.clear();
+                } else {
+                    try self.span.append(&self.row_span);
+                    self.row_span.clear();
+                    span.old_end_val = old_line_end_val;
+                    span.has_content_dirty =
+                        span.has_content_dirty or content_dirty;
+                }
+            } else {
                 self.span.clear();
+                new_line_len = try self.addRowToSpan(env, &self.span, row_pin);
+                if (try self.spanMatchesBuffer(env, &candidate, &self.span)) {
+                    publishCursorCharPos(
+                        env,
+                        &self.span,
+                        env.cast(usize, line_start_val),
+                    );
+                    row_changed = false;
+                    self.span.clear();
+                } else {
+                    current_span = candidate;
+                }
             }
 
-            const new_line_len = try self.addRowToSpan(env, row_pin);
-            const line_start = env.cast(usize, line_start_val);
-            const old_line_len = env.cast(usize, old_line_end_val) - line_start;
-            if (old_line_len > 0) {
-                self.saved_markers.adjustRegion(
-                    current_span.?.adjusted_line_start,
-                    old_line_len,
-                    new_line_len,
-                );
-                current_span.?.adjusted_line_start += new_line_len;
+            if (row_changed) {
+                const line_start = env.cast(usize, line_start_val);
+                const old_line_len = env.cast(usize, old_line_end_val) - line_start;
+                if (old_line_len > 0) {
+                    self.saved_markers.adjustRegion(
+                        current_span.?.adjusted_line_start,
+                        old_line_len,
+                        new_line_len,
+                    );
+                    current_span.?.adjusted_line_start += new_line_len;
+                }
             }
         }
 
@@ -1088,8 +1430,7 @@ fn render(
     }
 
     if (current_span) |*span| {
-        _ = env.f("delete-region", .{ span.start_val, env.f("point", .{}) });
-        try self.flushSpan(env);
+        try self.flushRenderSpan(env, span);
     }
 }
 

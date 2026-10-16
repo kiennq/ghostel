@@ -15,7 +15,9 @@ Stubs out `ghostel--spawn-pty' so no real process is spawned.  BODY
 runs with the stub in place."
   (declare (indent 1))
   `(let (,capture)
-     (cl-letf (((symbol-function 'ghostel--spawn-pty)
+     (cl-letf (((symbol-function 'ghostel--resolve-local-executable)
+                #'identity)
+               ((symbol-function 'ghostel--spawn-pty)
                 (lambda (program args &rest _)
                   (setq ,capture (cons program args))
                   nil)))
@@ -36,7 +38,9 @@ wraps them in `/bin/sh -c', see
 need to exercise the PTY matrix here."
   (declare (indent 1))
   `(let (,capture)
-     (cl-letf (((symbol-function 'ghostel--spawn-process)
+     (cl-letf (((symbol-function 'ghostel--resolve-local-executable)
+                #'identity)
+               ((symbol-function 'ghostel--spawn-process)
                 (lambda (program program-args remote-p)
                   (setq ,capture
                         (list :program program
@@ -329,7 +333,8 @@ pushed terminfo dir is needed for the whole session besides."
       (should (equal "--norc" (nth 4 args)))
       (should (equal "-c" (nth 5 args)))
       ;; exec -l <quoted-program>; no extra args.
-      (should (equal (format "exec -l %s" (shell-quote-argument "/bin/zsh"))
+      (should (equal (format "exec -l %s"
+                             (ghostel--posix-shell-quote-argument "/bin/zsh"))
                      (nth 6 args))))))
 
 (ert-deftest ghostel-test-macos-login-wrap-hushlogin ()
@@ -351,7 +356,7 @@ pushed terminfo dir is needed for the whole session besides."
     (let* ((wrap (ghostel--macos-login-wrap "/bin/bash" '("--login" "--posix")))
            (cmd (nth 6 (cdr wrap))))
       (should (equal (concat "exec -l "
-                             (mapconcat #'shell-quote-argument
+                             (mapconcat #'ghostel--posix-shell-quote-argument
                                         '("/bin/bash" "--login" "--posix")
                                         " "))
                      cmd)))))
@@ -478,6 +483,7 @@ pushed terminfo dir is needed for the whole session besides."
              ;; bash invocation.  Login-wrap behavior is covered by its own
              ;; dedicated tests.
              (ghostel-macos-login-shell nil)
+             (system-type 'gnu/linux)
              (default-directory "/tmp/"))
         (ghostel--start-process)
         (let ((env (plist-get capture :env)))
@@ -562,8 +568,8 @@ former defaulted to t and throttled bursty TUI redraws."
 (ert-deftest ghostel-test-spawn-ixon-disabled-c-q-reaches-child ()
   "DC1 (0x11) reaches the child instead of being eaten by XON/XOFF flow control.
 With `ixon' enabled (the PTY default) the line discipline swallows
-DC1 and DC3; ghostel disables it — natively in C
-\(`PtyProcess'), and via `-ixon' in the Emacs-path `stty' wrapper — so
+DC1 and DC3; ghostel disables it in the native POSIX PTY backend and via
+`-ixon' in the Emacs-path `stty' wrapper — so
 the direct key binding and send-next-key can deliver these bytes.
 Driven through both PTY backends."
   :tags '(native posix)
@@ -639,6 +645,7 @@ sentinel value, and verify the value reached `make-process'.  Also
 verifies the hook fires in the spawning buffer with `default-directory'
 intact (with-editor's `with-editor--setup' reads `default-directory')."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (ghostel-test--with-pty-matrix backend
     (let (captured-buffer
           captured-default-directory)
@@ -666,6 +673,7 @@ intact (with-editor's `with-editor--setup' reads `default-directory')."
 (ert-deftest ghostel-test-child-cwd-follows-default-directory-with-tilde ()
   "Child process starts in `default-directory', including abbreviated home paths."
   :tags '(native)
+  (skip-unless (ghostel-test--posix-sh-p))
   (let* ((home-dir (file-name-as-directory (expand-file-name "~")))
          (tmpdir (file-name-as-directory
                   (make-temp-file (expand-file-name "ghostel-cwd-test-"

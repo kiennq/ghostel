@@ -184,17 +184,18 @@ ENTER is called at a shell prompt, with input written to the bridge recorded."
 (ert-deftest ghostel-test-end-terminal ()
   "An ended terminal is a read-only snapshot that sends and reports nothing."
   :tags '(native)
-  (let (sent changes)
+  (let (sent)
     (ghostel-bridge-test--with-terminal
         (:size '(40 . 10) :send (lambda (data) (push data sent))
                :resize #'ignore :send-files #'ignore)
       (ghostel-write-output "\e[?1000h\e[?1004h\e[?2026hshown")
       (ghostel-set-program-status '(("" :state working)))
-      (add-hook 'ghostel-readonly-change-hook
-                (lambda () (push buffer-read-only changes)) nil t)
+      (should buffer-read-only)
+      (should (eq inhibit-read-only t))
       (ghostel-end-terminal)
       (should buffer-read-only)
-      (should (equal '(t) changes))
+      (should-not inhibit-read-only)
+      (should-error (insert "x") :type 'buffer-read-only)
       (should-not (ghostel--mouse-tracking-p ghostel--term))
       (should-not (ghostel--mode-enabled ghostel--term 1004))
       (should-not ghostel-program-status)
@@ -212,16 +213,18 @@ ENTER is called at a shell prompt, with input written to the bridge recorded."
   (let (sent)
     (ghostel-bridge-test--with-terminal (:size '(40 . 10) :send #'ignore)
       (ghostel-end-terminal)
+      (should-not inhibit-read-only)
       (ghostel-make-terminal buffer :size '(40 . 10)
                              :send (lambda (data) (push data sent)))
-      (should-not buffer-read-only)
+      (should buffer-read-only)
+      (should (eq inhibit-read-only t))
       (ghostel-send-string "typed")
       (should (equal '("typed") sent)))))
 
 (ert-deftest ghostel-test-end-terminal-in-line-mode ()
   "A terminal ended in line mode is read-only and drops the typed input."
   :tags '(native)
-  (let (sent)
+  (let (sent changes)
     (ghostel-bridge-test--with-terminal
         (:size '(40 . 10) :send (lambda (data) (push data sent)))
       (ghostel-write-output "\e]133;A\e\\$ \e]133;B\e\\")
@@ -229,9 +232,13 @@ ENTER is called at a shell prompt, with input written to the bridge recorded."
       (ghostel-line-mode)
       (insert "typed")
       (setq sent nil)
+      (add-hook 'ghostel-readonly-change-hook
+                (lambda () (push buffer-read-only changes)) nil t)
       (ghostel-end-terminal)
       (should (eq 'semi-char ghostel--input-mode))
       (should buffer-read-only)
+      (should-not inhibit-read-only)
+      (should (equal '(t) changes))
       (should-not sent)
       (should-not (string-match-p "typed" (buffer-string))))))
 
@@ -376,7 +383,8 @@ ENTER is called at a shell prompt, with input written to the bridge recorded."
   (let (sent)
     (ghostel-bridge-test--with-terminal
         (:size '(40 . 10) :send (lambda (data) (push data sent)))
-      (should-not buffer-read-only)
+      (should buffer-read-only)
+      (should (eq inhibit-read-only t))
       (cl-letf (((symbol-function 'ghostel--on-user-input)
                  (lambda () (ert-fail "counted as typed"))))
         (ghostel-send-string "raw" t))

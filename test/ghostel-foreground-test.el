@@ -95,6 +95,8 @@ never equal to `ghostel--pid'."
       ;; The sampling site is guarded by `ghostel--get-render-window',
       ;; so the buffer must be displayed for redraws to run it.
       (set-window-buffer (selected-window) buf)
+      ;; Batch waits do not redisplay the newly visible buffer.
+      (ghostel--pre-redisplay (selected-window))
       (let* ((calls nil)
              (ghostel-foreground-change-functions
               (list (lambda (buffer pid comm)

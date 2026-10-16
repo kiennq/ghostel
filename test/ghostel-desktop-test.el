@@ -330,6 +330,7 @@ buffer was kept for."
     (should desktop-save-buffer)
     (let ((ghostel-kill-buffer-on-exit nil)
           (proc (ghostel-test--dummy-process "desk-dead-drop" buf)))
+      (setq-local ghostel--process proc)
       (ghostel--sentinel proc "finished\n")
       (should (buffer-live-p buf))
       (should-not desktop-save-buffer))))

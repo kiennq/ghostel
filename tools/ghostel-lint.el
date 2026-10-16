@@ -5,13 +5,39 @@
 
 ;;; Commentary:
 
-;; Entry points for the Makefile's `checkdoc' and `docquotes' targets:
-;; each checks the files named on the command line and exits non-zero on
-;; a problem.  Development tooling, not part of the ghostel package.
+;; Entry points for the Makefile's lint targets.  Development tooling,
+;; not part of the ghostel package.
 
 ;;; Code:
 
 (require 'checkdoc)
+(require 'package)
+(require 'seq)
+
+(defun ghostel-lint-install-packages (&rest packages)
+  "Install PACKAGES, retrying transient archive failures up to three times."
+  (let ((attempt 0)
+        last-error)
+    (while (and (< attempt 3)
+                (not (seq-every-p #'package-installed-p packages)))
+      (setq attempt (1+ attempt))
+      (condition-case err
+          (progn
+            (package-refresh-contents)
+            (dolist (package packages)
+              (unless (package-installed-p package)
+                (package-install package))))
+        (error
+         (setq last-error err)
+         (message "Package setup attempt %d/3 failed: %s"
+                  attempt (error-message-string err))))
+      (when (and (< attempt 3)
+                 (not (seq-every-p #'package-installed-p packages)))
+        (sleep-for attempt)))
+    (unless (seq-every-p #'package-installed-p packages)
+      (if last-error
+          (signal (car last-error) (cdr last-error))
+        (error "Package setup failed for %S" packages)))))
 
 (defun ghostel-lint--files ()
   "Return and consume the files named on the command line.
