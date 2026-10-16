@@ -30,6 +30,25 @@ const DebugUserPtr = struct {
 /// explicitly free them before atexit fires. This allows us to check for
 /// memory leaks on exit.
 var debug_userptrs: std.ArrayList(DebugUserPtr) = .empty;
+var active_native_readers: std.atomic.Value(usize) = .init(0);
+
+pub fn nativeReaderStarted() void {
+    _ = active_native_readers.fetchAdd(1, .monotonic);
+}
+
+pub fn nativeReaderStopped() void {
+    const previous = active_native_readers.fetchSub(1, .release);
+    std.debug.assert(previous > 0);
+}
+
+fn waitForNativeReaders() void {
+    while (active_native_readers.load(.acquire) != 0) {
+        std.Thread.yield() catch |err| {
+            std.log.err("Failed to yield while waiting for native reader shutdown: {any}", .{err});
+            return;
+        };
+    }
+}
 
 pub const FunctionEntry = struct {
     name: [:0]const u8,
@@ -45,7 +64,9 @@ pub const Env = struct {
     raw: *c.emacs_env,
 
     pub fn init(raw: *c.emacs_env) Env {
-        return .{ .raw = raw };
+        const env = Env{ .raw = raw };
+        ensureSymbols(env);
+        return env;
     }
 
     pub fn intern(self: Env, name: [*:0]const u8) Value {
@@ -294,7 +315,7 @@ pub const Env = struct {
     }
 
     pub fn vecSize(self: Env, vec: Value) c_long {
-        return self.raw.vec_size.?(self.raw, vec);
+        return @intCast(self.raw.vec_size.?(self.raw, vec));
     }
 
     pub fn nonLocalExitCheck(self: Env) FuncallExit {
@@ -333,6 +354,8 @@ pub const Env = struct {
             if (shouldQuit(self.raw)) return error.EmacsQuit;
         }
     }
+
+    // --- Function registration ---
 
     pub fn makeFunction(
         self: Env,
@@ -387,9 +410,22 @@ pub const Env = struct {
         _ = self.f("fset", .{ self.intern(entry.name), fun });
     }
 
-    /// Register a named Elisp function backed by a C function.
-    pub fn registerFunctions(self: Env, comptime entries: []const FunctionEntry) void {
-        inline for (entries) |*entry| self.registerFunction(entry);
+    /// Bind one loader-owned function. Ghostel exports use FunctionEntry arrays.
+    pub fn bindFunction(
+        self: Env,
+        name: [*:0]const u8,
+        min_arity: i32,
+        max_arity: i32,
+        func: *const fn (?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value,
+        docstring: [*:0]const u8,
+    ) void {
+        const fun = self.makeFunction(min_arity, max_arity, func, docstring, null);
+        _ = self.f("fset", .{ self.intern(name), fun });
+    }
+
+    /// Call (provide 'feature).
+    pub fn provide(self: Env, feature: [*:0]const u8) void {
+        _ = self.funcall(sym.provide, &[_]Value{self.intern(feature)});
     }
 
     /// Create a unibyte string (for binary data like PNG images).
@@ -404,15 +440,22 @@ pub const Env = struct {
     }
 
     /// Signal an error with a message string.
-    pub fn signalError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn signalError(self: Env, msg: []const u8) void {
         self.nonLocalExitSignal(
             sym.@"error",
-            self.f("list", .{self.format("ghostel: " ++ msg, objects)}),
+            self.f("list", .{msg}),
         );
     }
 
-    pub fn message(self: Env, msg: []const u8, objects: anytype) void {
-        const all_args = [1]Value{self.makeString(msg)} ++ self.makeValues(objects);
+    pub fn signalErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
+        self.nonLocalExitSignal(
+            sym.@"error",
+            self.f("list", .{self.format("ghostel: " ++ fmt, args)}),
+        );
+    }
+
+    pub fn message(self: Env, comptime fmt: []const u8, args: anytype) void {
+        const all_args = [1]Value{self.makeString(fmt)} ++ self.makeValues(args);
         _ = self.funcall(sym.message, &all_args);
     }
 
@@ -421,10 +464,10 @@ pub const Env = struct {
         return self.funcall(sym.format, &all_args);
     }
 
-    pub fn logError(self: Env, comptime msg: []const u8, objects: anytype) void {
+    pub fn logError(self: Env, comptime fmt: []const u8, args: anytype) void {
         _ = self.f("display-warning", .{
             sym.ghostel,
-            self.format("ghostel: " ++ msg, objects),
+            self.format("ghostel: " ++ fmt, args),
             sym.@":error",
         });
     }
@@ -479,12 +522,14 @@ const interned_symbols = [_][:0]const u8{
     ":test",
     ":underline",
     ":width",
+    "add-hook",
     "bright",
+    "boundp",
+    "buffer-modified-tick",
+    "buffer-substring-no-properties",
     "car",
-    "cdr",
-    "char-after",
-    "clrhash",
     "composition-get-gstring",
+    "cdr",
     "cons",
     "current-buffer",
     "dash",
@@ -500,6 +545,7 @@ const interned_symbols = [_][:0]const u8{
     "encode-coding-string",
     "eobp",
     "eq",
+    "equal",
     "erase-buffer",
     "error",
     "expand-file-name",
@@ -516,6 +562,7 @@ const interned_symbols = [_][:0]const u8{
     "forward-line",
     "fset",
     "get-buffer-window-list",
+    "get-text-property",
     "getenv",
     "gethash",
     "ghostel",
@@ -576,6 +623,7 @@ const interned_symbols = [_][:0]const u8{
     "min-width",
     "mouse-face",
     "multibyte-string-p",
+    "next-property-change",
     "nil",
     "nth",
     "numberp",
@@ -590,8 +638,8 @@ const interned_symbols = [_][:0]const u8{
     "puthash",
     "query-font",
     "quit",
+    "remhash",
     "reverse",
-    "run-at-time",
     "selected-window",
     "set",
     "set-marker",
@@ -628,6 +676,12 @@ fn SymbolCache(comptime symbols: []const [:0]const u8) type {
 }
 
 pub var sym: SymbolCache(&interned_symbols) = undefined;
+var sym_initialized = false;
+var debug_hook_installed = false;
+
+fn ensureSymbols(env: Env) void {
+    if (!sym_initialized) initSymbols(env);
+}
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
@@ -635,11 +689,7 @@ pub fn initModule(alloc: Allocator, raw: *c.emacs_env) void {
     module_alloc = alloc;
 
     const env = Env.init(raw);
-    inline for (@typeInfo(@TypeOf(sym)).@"struct".field_names) |field_name| {
-        @field(sym, field_name) = env.makeGlobalRef(env.intern(field_name));
-    }
-
-    if (builtin.mode == .debug) {
+    if (builtin.mode == .debug and !debug_hook_installed) {
         const cleanup_fn = env.makeFunction(
             0,
             0,
@@ -654,7 +704,16 @@ pub fn initModule(alloc: Allocator, raw: *c.emacs_env) void {
             cleanup_fn,
             env.makeInteger(90),
         });
+        debug_hook_installed = true;
     }
+}
+
+pub fn initSymbols(env: Env) void {
+    if (sym_initialized) return;
+    inline for (@typeInfo(@TypeOf(sym)).@"struct".field_names) |field_name| {
+        @field(sym, field_name) = env.makeGlobalRef(env.intern(field_name));
+    }
+    sym_initialized = true;
 }
 
 fn debugKillEmacsHook(_: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
@@ -662,6 +721,6 @@ fn debugKillEmacsHook(_: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*any
         user_ptr.finalizer(user_ptr.ptr);
     }
     debug_userptrs.deinit(module_alloc);
-    @import("NativeProcess.zig").waitForReaders();
+    waitForNativeReaders();
     return sym.nil;
 }

@@ -5,7 +5,7 @@
 /// and calls into Elisp to apply image overlays.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const GhostelTerm = @import("GhostelTerm.zig");
 const gt = @import("ghostty-vt");
 const ppm = @import("ppm.zig");

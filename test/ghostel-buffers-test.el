@@ -261,10 +261,11 @@ It runs in the annotated buffer; nil and errors add nothing."
 
 (defun ghostel-buffers-test--proj-stub (root)
   "Return a `project-current' stub: project rooted at ROOT, else nil."
-  (lambda (&optional _maybe-prompt &rest rest)
-    (let ((dir (or (car rest) default-directory)))
-      (when (and dir (string-prefix-p root (expand-file-name dir)))
-        (cons 'transient root)))))
+  (let ((root (file-name-as-directory (expand-file-name root))))
+    (lambda (&optional _maybe-prompt &rest rest)
+      (let ((dir (or (car rest) default-directory)))
+        (when (and dir (string-prefix-p root (expand-file-name dir)))
+          (cons 'transient root))))))
 
 (ert-deftest ghostel-test-project-buffers-default-directory ()
   "Scope `default-directory' matches buffers under the project root."
