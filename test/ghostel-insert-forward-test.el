@@ -58,11 +58,12 @@ and the PTY writers are stubbed, so no native module is needed."
     (should (null sent))))
 
 (ert-deftest ghostel-test-insert-forward-star-spec-commands-run ()
-  "`(interactive \"*\")' commands run: the buffer is writable.
-`buffer-read-only' is nil in live terminal-input modes; the edits
-these commands make are intercepted by the after-change hook."
+  "`(interactive \"*\")' commands run behind the read-only barrier.
+Live terminal-input buffers keep `buffer-read-only' non-nil while
+local `inhibit-read-only' lets the after-change hook intercept edits."
   (ghostel-insert-forward-test--with-live-buffer
-    (should-not buffer-read-only)
+    (should buffer-read-only)
+    (should inhibit-read-only)
     (barf-if-buffer-read-only)
     (call-interactively
      (lambda () (interactive "*") (insert "hi")))
@@ -108,9 +109,11 @@ REDRAWS collects the stub's (BUFFER FORCE) arguments, newest first."
       (ghostel-insert-forward-test--with-fake-repair redraws
         (delete-region (point-min) (point-max))
         (should ghostel--pending-redraw)
-        (ghostel--pre-redisplay nil)
-        (should (equal redraws (list (list (current-buffer) nil))))
-        (should (equal (buffer-string) "abc"))))))
+        (save-window-excursion
+          (set-window-buffer (selected-window) (current-buffer))
+          (ghostel--pre-redisplay (selected-window))
+          (should (equal redraws (list (list (current-buffer) nil))))
+          (should (equal (buffer-string) "abc")))))))
 
 (ert-deftest ghostel-test-insert-forward-repairs-replacements ()
   "A replacement of rendered text is repaired, never forwarded."
@@ -197,6 +200,8 @@ Sent raw, a \\r would execute the pending input in the shell."
   (ghostel-insert-forward-test--with-live-buffer
     (setq ghostel--inhibit-insert-forwarding t)
     (ghostel--sync-read-only)
+    (should buffer-read-only)
+    (should-not inhibit-read-only)
     (should-error (insert "x") :type 'buffer-read-only)
     (should (null sent))))
 
@@ -210,8 +215,12 @@ Sent raw, a \\r would execute the pending input in the shell."
       (ghostel-copy-mode)
       (should-error (insert "x") :type 'buffer-read-only)
       (should-error (barf-if-buffer-read-only) :type 'buffer-read-only)
+      (should buffer-read-only)
+      (should-not inhibit-read-only)
       (ghostel-readonly-exit)
       (should (eq ghostel--input-mode 'semi-char))
+      (should buffer-read-only)
+      (should inhibit-read-only)
       (insert "y")
       (should (equal sent '("y")))
       (should (equal (buffer-string) "")))))
@@ -240,49 +249,41 @@ This is the seam `ghostel-ime' uses to protect its composition inserts."
     (let ((ghostel-kill-buffer-on-exit nil))
       (delete-process proc)
       (ghostel--sentinel proc "finished\n")
+      (should buffer-read-only)
+      (should-not inhibit-read-only)
       (should-error (insert "x") :type 'buffer-read-only)
       (should (null sent)))))
 
-(ert-deftest ghostel-test-insert-forward-no-local-inhibit-read-only ()
-  "`inhibit-read-only' never becomes buffer-local (issue #570).
-A buffer-local binding would make `(let ((inhibit-read-only t)) ...)'
-entered in the ghostel buffer rebind only the local slot, breaking
-writes to other read-only buffers made from inside the let."
+(ert-deftest ghostel-test-insert-forward-local-inhibit-read-only-state ()
+  "The local `inhibit-read-only' slot follows the forwarding state.
+Live semi-char/char input uses it behind the read-only barrier;
+copy/Emacs modes, opt-out, and dead terminals restore the plain
+read-only barrier."
   (ghostel-insert-forward-test--with-live-buffer
     (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
               ((symbol-function 'ghostel--anchor-window) #'ignore)
               ((symbol-function 'ghostel-force-redraw) #'ignore)
               ((symbol-function 'ghostel--adjust-size) #'ignore))
-      (should-not (local-variable-p 'inhibit-read-only))
+      (should buffer-read-only)
+      (should (eq inhibit-read-only t))
+      (should (local-variable-p 'inhibit-read-only))
       (ghostel-char-mode)
-      (should-not (local-variable-p 'inhibit-read-only))
+      (should buffer-read-only)
+      (should (eq inhibit-read-only t))
       (ghostel-copy-mode)
-      (should-not (local-variable-p 'inhibit-read-only))
+      (should buffer-read-only)
+      (should-not inhibit-read-only)
       (ghostel-emacs-mode)
-      (should-not (local-variable-p 'inhibit-read-only))
+      (should buffer-read-only)
+      (should-not inhibit-read-only)
       (ghostel-semi-char-mode)
-      (should-not (local-variable-p 'inhibit-read-only))
+      (should buffer-read-only)
+      (should (eq inhibit-read-only t))
       (let ((ghostel-kill-buffer-on-exit nil))
         (delete-process proc)
         (ghostel--sentinel proc "finished\n"))
-      (should-not (local-variable-p 'inhibit-read-only)))))
-
-(ert-deftest ghostel-test-insert-forward-inhibit-read-only-let-reaches-other-buffers ()
-  "A global `inhibit-read-only' let-binding works across buffers (issue #570).
-`window--display-buffer' and friends bind `inhibit-read-only' with the
-ghostel buffer current and then write to another read-only buffer
-\(e.g. *Completions*); that write must not signal."
-  (ghostel-insert-forward-test--with-live-buffer
-    (let ((other (generate-new-buffer " *ghostel-570-other*")))
-      (unwind-protect
-          (progn
-            (with-current-buffer other
-              (setq buffer-read-only t))
-            (let ((inhibit-read-only t))
-              (with-current-buffer other
-                (insert "x")))
-            (should (equal (with-current-buffer other (buffer-string)) "x")))
-        (kill-buffer other)))))
+      (should buffer-read-only)
+      (should-not inhibit-read-only))))
 
 (provide 'ghostel-insert-forward-test)
 ;;; ghostel-insert-forward-test.el ends here
