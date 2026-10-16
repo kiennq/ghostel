@@ -29,6 +29,13 @@ pub const WriteResult = union(enum) {
     interrupted,
 };
 
+pub const DrainResult = enum {
+    output,
+    command,
+    finished,
+    stopped,
+};
+
 test "CancellationToken delegates cancellation checks" {
     const Context = struct {
         checked: *bool,
@@ -48,4 +55,19 @@ test "CancellationToken delegates cancellation checks" {
     };
     try token.check();
     try std.testing.expect(checked);
+}
+
+test "CancellationToken propagates cancellation errors" {
+    const Context = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    const context = Context{};
+    const token = CancellationToken{
+        .context = &context,
+        .check_fn = Context.check,
+        .poll_interval = .fromMilliseconds(20),
+    };
+    try std.testing.expectError(error.Cancelled, token.check());
 }
