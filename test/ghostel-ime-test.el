@@ -26,7 +26,8 @@
   "A non-nil `ghostel-inhibit-redraw-functions' reschedules the redraw.
 The buffer must not be redrawn while a feature inhibits it."
   (ghostel-test--with-compile-buffer buf
-    (let ((old-timer (run-with-timer 1000 nil #'ignore))
+    (let ((ghostel-redraw-only-when-selected-window nil)
+          (old-timer (run-with-timer 1000 nil #'ignore))
           timer-delay timer-repeat timer-fn timer-args)
       (setq-local ghostel--redraw-timer old-timer)
       (setq-local ghostel--term 'fake-term)
@@ -41,6 +42,8 @@ The buffer must not be redrawn while a feature inhibits it."
                 ((symbol-function 'ghostel--redraw)
                  (lambda (&rest _)
                    (ert-fail "Inhibited redraw must not call native redraw")))
+                ((symbol-function 'ghostel--get-render-window)
+                 (lambda (&rest _) 'visible-window))
                 ((symbol-function 'run-with-timer)
                  (lambda (delay repeat fn &rest args)
                    (setq timer-delay delay
