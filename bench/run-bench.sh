@@ -112,9 +112,37 @@ fi
 
 # Verify ghostel module exists
 MODULE=""
-for ext in dylib so; do
-    if [ -f "$GHOSTEL_DIR/ghostel-module.$ext" ]; then
-        MODULE="$GHOSTEL_DIR/ghostel-module.$ext"
+case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+        MODULE_CANDIDATES=(
+            "$GHOSTEL_DIR/ghostel-module.dll"
+            "$GHOSTEL_DIR/zig-out/bin/ghostel-module.dll"
+            "$GHOSTEL_DIR/ghostel-module.dylib"
+            "$GHOSTEL_DIR/ghostel-module.so"
+            "$GHOSTEL_DIR/zig-out/lib/ghostel-module.dylib"
+            "$GHOSTEL_DIR/zig-out/lib/ghostel-module.so"
+        )
+        ;;
+    Darwin*)
+        MODULE_CANDIDATES=(
+            "$GHOSTEL_DIR/ghostel-module.dylib"
+            "$GHOSTEL_DIR/zig-out/lib/ghostel-module.dylib"
+            "$GHOSTEL_DIR/ghostel-module.so"
+            "$GHOSTEL_DIR/zig-out/lib/ghostel-module.so"
+        )
+        ;;
+    *)
+        MODULE_CANDIDATES=(
+            "$GHOSTEL_DIR/ghostel-module.so"
+            "$GHOSTEL_DIR/zig-out/lib/ghostel-module.so"
+            "$GHOSTEL_DIR/ghostel-module.dylib"
+            "$GHOSTEL_DIR/zig-out/lib/ghostel-module.dylib"
+        )
+        ;;
+esac
+for candidate in "${MODULE_CANDIDATES[@]}"; do
+    if [ -f "$candidate" ]; then
+        MODULE="$candidate"
         break
     fi
 done
@@ -123,6 +151,16 @@ if [ -z "$MODULE" ]; then
     exit 1
 fi
 echo "ghostel module: $MODULE"
+MODULE_DIR="$(cd "$(dirname "$MODULE")" && pwd)"
+case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+        if command -v cygpath >/dev/null 2>&1; then
+            MODULE_DIR="$(cygpath -m "$MODULE_DIR")"
+        fi
+        ;;
+esac
+MODULE_DIR_ELISP="${MODULE_DIR//\\/\\\\}"
+MODULE_DIR_ELISP="${MODULE_DIR_ELISP//\"/\\\"}"
 
 # Verify vterm
 if [ "$INCLUDE_VTERM" = "t" ]; then
@@ -151,6 +189,7 @@ LOAD_PATH="-L $GHOSTEL_DIR/lisp"
 
 # Build eval expression
 EVAL="(progn"
+EVAL="$EVAL (setq ghostel-module-directory \"$MODULE_DIR_ELISP\")"
 [ -n "$SIZE" ] && EVAL="$EVAL (setq ghostel-bench-data-size $SIZE)"
 [ -n "$ITERS" ] && EVAL="$EVAL (setq ghostel-bench-iterations $ITERS)"
 [ -n "$MIN_DURATION" ] && EVAL="$EVAL (setq ghostel-bench-min-duration $MIN_DURATION)"
