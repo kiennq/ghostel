@@ -7,6 +7,7 @@ const RefCount = @import("RefCount.zig").RefCount;
 const c = @import("posix_c");
 
 const Self = @This();
+pub const ForegroundHandle = sys.fd_t;
 const WRITE_CHUNK_SIZE = 4096;
 
 const log = std.log.scoped(.NativeProcessHandler);
@@ -89,9 +90,13 @@ const Pty = struct {
     /// a separately opened replica fd is not the caller's controlling terminal,
     /// so the kernel rejects the ioctl there with ENOTTY.
     pub fn foregroundPgid(self: *@This()) ?i32 {
-        if (self.primary_fd == -1) return null;
+        return foregroundPgidForFd(self.primary_fd);
+    }
+
+    fn foregroundPgidForFd(fd: sys.fd_t) ?i32 {
+        if (fd == -1) return null;
         var pgid: c.pid_t = undefined;
-        if (sys.errno(c.ioctl(self.primary_fd, c.TIOCGPGRP, &pgid)) != .SUCCESS) return null;
+        if (sys.errno(c.ioctl(fd, c.TIOCGPGRP, &pgid)) != .SUCCESS) return null;
         if (pgid <= 0) return null;
         return @intCast(pgid);
     }
@@ -130,48 +135,78 @@ const Pty = struct {
 
 alloc: Allocator,
 pty: Pty,
-wake_pipe: [2]sys.fd_t = .{ -1, -1 },
-waiter: *Waiter,
+wake_read_fd: sys.fd_t = -1,
+wake_write_fd: sys.fd_t = -1,
+command_read_fd: sys.fd_t = -1,
+command_write_fd: sys.fd_t = -1,
+child: ?*ChildProcess = null,
+waiter: ?*ChildWaiter = null,
 
 // The backend moves during initialization and retirement. Keep the waiter's
-// shared state at a stable address until deinitAndWait joins its thread.
-const Waiter = struct {
+// shared state at a stable address until its thread is joined by the reaper.
+const ChildWaiter = struct {
+    // Borrowed from the backend/reaper; that owner retains the initial ref
+    // until this thread has been joined.
     child: *ChildProcess,
     thread: std.Thread = undefined,
     exited: std.atomic.Value(bool) = .init(false),
     exit_code: u32 = undefined,
+    exit_read_fd: sys.fd_t = -1,
+    exit_write_fd: sys.fd_t = -1,
 
-    fn start(self: *Waiter, wake_fd: sys.fd_t) !void {
-        self.thread = std.Thread.spawn(.{}, run, .{ self, wake_fd }) catch |err| {
-            // No waiter owns the child yet. Do not leak it if thread creation
-            // fails, including children that ignore terminal hangup.
-            self.child.terminate() catch |kill_err| {
-                log.err("Failed to terminate child after thread creation failed: {any}", .{kill_err});
-            };
-            _ = self.child.wait() catch |wait_err| blk: {
-                log.err("Failed to wait for child after thread creation failed: {any}", .{wait_err});
-                break :blk 255;
-            };
+    fn start(alloc: Allocator, child: *ChildProcess) !*ChildWaiter {
+        const self = alloc.create(ChildWaiter) catch |err| {
+            terminateAndWait(child);
             return err;
         };
+        errdefer alloc.destroy(self);
+
+        var exit_pipe = openNonblockingPipe() catch |err| {
+            terminateAndWait(child);
+            return err;
+        };
+        errdefer closePipe(&exit_pipe);
+
+        self.* = .{
+            .child = child,
+            .exit_read_fd = exit_pipe[0],
+            .exit_write_fd = exit_pipe[1],
+        };
+        // libc may reject a small custom stack with EINVAL at pthread_create
+        // when static TLS exceeds it, even if setting the stack size succeeded.
+        self.thread = std.Thread.spawn(
+            .{ .stack_size = std.Thread.SpawnConfig.default_stack_size },
+            run,
+            .{self},
+        ) catch |err| {
+            // No waiter owns the child yet. Do not leak it if thread creation
+            // fails, including children that ignore terminal hangup.
+            terminateAndWait(child);
+            return err;
+        };
+        exit_pipe = .{ -1, -1 };
+        return self;
     }
 
-    fn hasExited(self: *const Waiter) bool {
+    fn hasExited(self: *const ChildWaiter) bool {
         return self.exited.load(.acquire);
     }
 
-    fn wait(self: *Waiter) u32 {
+    fn joinAndDestroy(self: *ChildWaiter, alloc: Allocator) u32 {
         self.thread.join();
-        return self.exit_code;
+        const exit_code = self.exit_code;
+        closeEndpoints(&self.exit_read_fd, &self.exit_write_fd);
+        alloc.destroy(self);
+        return exit_code;
     }
 
-    fn run(self: *Waiter, wake_fd: sys.fd_t) void {
+    fn run(self: *ChildWaiter) void {
         self.exit_code = self.child.wait() catch |err| blk: {
             log.err("Failed to wait for native child: {any}", .{err});
             break :blk 255;
         };
         self.exited.store(true, .release);
-        _ = writeWithRetry(wake_fd, "X");
+        _ = writeWithRetry(self.exit_write_fd, "X");
     }
 };
 
@@ -256,6 +291,16 @@ pub const ChildProcess = struct {
     }
 };
 
+fn terminateAndWait(child: *ChildProcess) void {
+    child.terminate() catch |err| {
+        log.err("Failed to terminate child during setup cleanup: {any}", .{err});
+    };
+    _ = child.wait() catch |err| blk: {
+        log.err("Failed to wait for child during setup cleanup: {any}", .{err});
+        break :blk 255;
+    };
+}
+
 pub const EventWriter = struct {
     pub const Fd = sys.fd_t;
 
@@ -332,14 +377,55 @@ fn failChild(msg: []const u8, err: []const u8) noreturn {
     std.c._exit(1);
 }
 
-pub fn init(alloc: Allocator, io: std.Io, size: backend_types.WinSize, params: backend_types.ProcessParams) !Self {
-    const waiter = try alloc.create(Waiter);
-    errdefer alloc.destroy(waiter);
-    const child = try alloc.create(ChildProcess);
-    errdefer alloc.destroy(child);
+pub const Reaper = struct {
+    alloc: Allocator,
+    pty: Pty,
+    child: *ChildProcess,
+    /// Original PID for exit framing only; all process control uses child.
+    pid: i64,
+    waiter: ?*ChildWaiter,
 
-    var self = Self{ .alloc = alloc, .pty = try .init(), .waiter = waiter };
+    pub fn deinitAndWait(self: *@This()) u32 {
+        self.pty.deinit();
+        const exit_code = if (self.waiter) |waiter|
+            waiter.joinAndDestroy(self.alloc)
+        else
+            waitChild(self.child);
+        self.waiter = null;
+        self.child.refcount.release();
+        return exit_code;
+    }
+};
+
+fn openNonblockingPipe() ![2]sys.fd_t {
+    var pipe: [2]sys.fd_t = .{ -1, -1 };
+    if (sys.errno(sys.pipe(&pipe)) != .SUCCESS) return error.PipeCreationFailed;
+    errdefer closePipe(&pipe);
+
+    // pipe2 is unavailable on macOS, so set both properties after creation.
+    for (pipe) |fd| {
+        _ = try fcntl(fd, sys.F.SETFD, sys.FD_CLOEXEC);
+        const flags = try fcntl(fd, sys.F.GETFL, 0);
+        _ = try fcntl(
+            fd,
+            sys.F.SETFL,
+            flags | @as(u32, @bitCast(sys.O{ .NONBLOCK = true })),
+        );
+    }
+    return pipe;
+}
+
+fn waitChild(child: *ChildProcess) u32 {
+    return child.wait() catch |err| {
+        log.err("Failed to wait for native child in reaper: {any}", .{err});
+        return 255;
+    };
+}
+
+pub fn init(alloc: Allocator, io: std.Io, size: backend_types.WinSize, params: backend_types.ProcessParams) !Self {
+    var self = Self{ .alloc = alloc, .pty = try .init() };
     errdefer self.pty.deinit();
+    errdefer self.closeWakeEndpoints();
     try self.pty.resize(size);
 
     var arena_allocator = std.heap.ArenaAllocator.init(alloc);
@@ -350,18 +436,13 @@ pub fn init(alloc: Allocator, io: std.Io, size: backend_types.WinSize, params: b
     const args = try arena.allocSentinel(?[*:0]const u8, params.args.len, null);
     for (params.args, 0..) |arg, i| args[i] = arg;
 
-    if (sys.errno(sys.pipe(&self.wake_pipe)) != .SUCCESS) {
-        return error.PipeCreationFailed;
-    }
-    errdefer {
-        _ = sys.close(self.wake_pipe[0]);
-        _ = sys.close(self.wake_pipe[1]);
-    }
+    const wake_pipe = try openNonblockingPipe();
+    self.wake_read_fd = wake_pipe[0];
+    self.wake_write_fd = wake_pipe[1];
 
-    // This is racy but benign. pipe2 would be better but doesn't exist on macOS.
-    for (self.wake_pipe) |fd| {
-        _ = try fcntl(fd, sys.F.SETFD, sys.FD_CLOEXEC);
-    }
+    const command_pipe = try openNonblockingPipe();
+    self.command_read_fd = command_pipe[0];
+    self.command_write_fd = command_pipe[1];
 
     const flags = try fcntl(self.pty.primary_fd, sys.F.GETFL, 0);
     _ = try fcntl(
@@ -370,14 +451,17 @@ pub fn init(alloc: Allocator, io: std.Io, size: backend_types.WinSize, params: b
         flags | @as(u32, @bitCast(sys.O{ .NONBLOCK = true })),
     );
 
+    const child = try alloc.create(ChildProcess);
+    errdefer alloc.destroy(child);
+
     const pid = sys.fork();
     if (sys.errno(pid) != .SUCCESS) return error.ForkFailed;
     if (pid != 0) {
         // This is the parent, child started successfully.
         self.pty.closeReplica();
         child.* = .{ .alloc = alloc, .io = io, .handle = pid };
-        waiter.* = .{ .child = child };
-        try waiter.start(self.wake_pipe[1]);
+        self.child = child;
+        self.waiter = try ChildWaiter.start(alloc, child);
         return self;
     }
 
@@ -400,7 +484,11 @@ pub fn init(alloc: Allocator, io: std.Io, size: backend_types.WinSize, params: b
 }
 
 pub fn childHandle(self: *const Self) *ChildProcess {
-    return self.waiter.child;
+    return self.child orelse unreachable;
+}
+
+fn childHasExited(self: *const Self) bool {
+    return if (self.waiter) |waiter| waiter.hasExited() else false;
 }
 
 pub fn resize(self: *Self, size: backend_types.WinSize) !void {
@@ -411,11 +499,33 @@ pub fn foregroundPgid(self: *Self) ?i32 {
     return self.pty.foregroundPgid();
 }
 
+pub fn duplicateForegroundHandle(self: *Self) ?ForegroundHandle {
+    const fd = sys.dup(self.pty.primary_fd);
+    if (sys.errno(fd) != .SUCCESS) return null;
+    _ = fcntl(fd, sys.F.SETFD, sys.FD_CLOEXEC) catch {
+        _ = sys.close(fd);
+        return null;
+    };
+    return fd;
+}
+
+pub fn foregroundPgidForHandle(handle: ?ForegroundHandle) ?i32 {
+    return Pty.foregroundPgidForFd(handle orelse return null);
+}
+
+pub fn closeForegroundHandle(handle: ?ForegroundHandle) void {
+    if (handle) |fd| _ = sys.close(fd);
+}
+
 pub fn write(
     self: *Self,
     data: []const u8,
     cancellation: ?backend_types.CancellationToken,
 ) !backend_types.WriteResult {
+    if (self.childHasExited()) {
+        if (self.waiter) |waiter| drainPipe(waiter.exit_read_fd);
+        return error.ProcessExited;
+    }
     if (data.len == 0) return .{ .written = 0 };
 
     const chunk = data[0..@min(data.len, WRITE_CHUNK_SIZE)];
@@ -425,7 +535,7 @@ pub fn write(
         switch (sys.errno(written)) {
             .SUCCESS => return .{ .written = @intCast(written) },
 
-            .PIPE, .IO, .SRCH, .NXIO => return .interrupted,
+            .PIPE, .IO, .SRCH, .NXIO => return error.ProcessExited,
 
             .AGAIN => {
                 var pollfds = [_]sys.pollfd{
@@ -435,7 +545,12 @@ pub fn write(
                         .revents = undefined,
                     },
                     .{
-                        .fd = self.wake_pipe[0],
+                        .fd = self.wake_read_fd,
+                        .events = sys.POLL.IN,
+                        .revents = undefined,
+                    },
+                    .{
+                        .fd = if (self.waiter) |waiter| waiter.exit_read_fd else -1,
                         .events = sys.POLL.IN,
                         .revents = undefined,
                     },
@@ -450,8 +565,16 @@ pub fn write(
                 const ready = pollWithRetry(&pollfds, timeout);
                 if (sys.errno(ready) != .SUCCESS) return error.IoFailed;
                 if (ready == 0) {
+                    if (self.childHasExited()) {
+                        if (self.waiter) |waiter| drainPipe(waiter.exit_read_fd);
+                        return error.ProcessExited;
+                    }
                     try cancellation.?.check();
                     continue;
+                }
+                if (pollfds[2].revents != 0 or self.childHasExited()) {
+                    if (self.waiter) |waiter| drainPipe(waiter.exit_read_fd);
+                    return error.ProcessExited;
                 }
                 if (pollfds[1].revents != 0) return .interrupted;
                 continue;
@@ -462,9 +585,9 @@ pub fn write(
     }
 }
 
-pub fn drain(self: *Self, stream: anytype) !bool {
-    var buf: [4096]u8 = undefined;
-
+pub fn drain(self: *Self, stream: anytype) !backend_types.DrainResult {
+    const waiter = self.waiter;
+    const child_exited_before_poll = self.childHasExited();
     var pollfds = [_]sys.pollfd{
         .{
             .fd = self.pty.primary_fd,
@@ -472,80 +595,194 @@ pub fn drain(self: *Self, stream: anytype) !bool {
             .revents = undefined,
         },
         .{
-            .fd = self.wake_pipe[0],
+            .fd = self.wake_read_fd,
+            .events = sys.POLL.IN,
+            .revents = undefined,
+        },
+        .{
+            .fd = self.command_read_fd,
+            .events = sys.POLL.IN,
+            .revents = undefined,
+        },
+        .{
+            .fd = if (waiter) |child_waiter| child_waiter.exit_read_fd else -1,
             .events = sys.POLL.IN,
             .revents = undefined,
         },
     };
-    if (sys.errno(pollWithRetry(&pollfds, -1)) != .SUCCESS) {
+    const timeout: c_int = if (child_exited_before_poll) 0 else -1;
+    if (sys.errno(pollWithRetry(&pollfds, timeout)) != .SUCCESS) {
         return error.PollFailed;
     }
-    const exited = self.waiter.hasExited();
-    const wake_requested = pollfds[1].revents != 0;
-    const pty_hung_up = pollfds[0].revents & sys.POLL.HUP != 0;
-    if (wake_requested and !exited) return false;
+    var child_exited = child_exited_before_poll;
+    if (pollfds[3].revents != 0) {
+        if (waiter) |child_waiter| {
+            drainPipe(child_waiter.exit_read_fd);
+            child_exited = child_waiter.hasExited();
+        }
+    }
 
-    // Child exit is independent of PTY hangup: background jobs can keep the
-    // replica open. Keep reading until EAGAIN, EOF, or an error before stopping
-    // on child exit; the buffer size only limits each individual read.
-    const eof = exited or pty_hung_up;
+    const stop_ready = pollfds[1].revents != 0;
+    if (stop_ready) {
+        drainPipe(self.wake_read_fd);
+        return if (child_exited) .finished else .stopped;
+    }
+
+    const command_ready = pollfds[2].revents != 0;
+    if (command_ready and !child_exited) {
+        drainPipe(self.command_read_fd);
+        return .command;
+    }
+
+    const pty_hung_up =
+        pollfds[0].revents & (sys.POLL.HUP | sys.POLL.ERR) != 0;
+    const pty_ready = pollfds[0].revents & sys.POLL.IN != 0;
+    if (child_exited or pty_hung_up) {
+        try self.drainRemainingPty(stream);
+        return .finished;
+    }
+    if (!pty_ready) return .output;
+
+    return self.drainReadyPty(stream);
+}
+
+fn drainReadyPty(self: *Self, stream: anytype) !backend_types.DrainResult {
+    var buf: [4096]u8 = undefined;
     while (true) {
         const len = sys.read(self.pty.primary_fd, &buf, buf.len);
-        if (len == 0) return !eof;
+        if (len == 0) return .finished;
         switch (sys.errno(len)) {
             .SUCCESS => try stream.nextSlice(buf[0..@intCast(len)]),
             .INTR => continue,
-            .AGAIN => return !eof,
-            .BADF, .IO => return false,
+            .AGAIN => return .output,
+            .BADF, .IO => return .finished,
             else => return error.ReadFailed,
         }
     }
 }
 
-pub fn finishDrain(_: *Self, _: anytype) !void {}
-
-pub fn requestStop(self: *Self) void {
-    if (self.wake_pipe[1] != -1) {
-        _ = writeWithRetry(self.wake_pipe[1], "X");
+fn drainRemainingPty(self: *Self, stream: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const len = sys.read(self.pty.primary_fd, &buf, buf.len);
+        if (len == 0) return;
+        switch (sys.errno(len)) {
+            .SUCCESS => try stream.nextSlice(buf[0..@intCast(len)]),
+            .INTR => continue,
+            // Final draining is best-effort once the descriptor is empty,
+            // hung up, or otherwise no longer readable.
+            else => return,
+        }
     }
+}
+
+pub fn finishDrain(self: *Self, stream: anytype) !void {
+    try self.drainRemainingPty(stream);
+}
+
+pub fn wakeCommands(self: *Self) void {
+    if (self.command_write_fd == -1) return;
+    _ = writeWithRetry(self.command_write_fd, "W");
+}
+
+pub fn clearCommandWake(self: *Self) void {
+    drainPipe(self.command_read_fd);
+}
+
+pub fn requestStop(self: *Self, _: std.Thread) void {
+    if (self.wake_write_fd == -1) return;
+    _ = writeWithRetry(self.wake_write_fd, "S");
+}
+
+pub fn takeForReaper(self: *Self) Reaper {
+    const child = self.child orelse unreachable;
+    const reaper = Reaper{
+        .alloc = self.alloc,
+        .pty = self.pty,
+        .child = child,
+        // Capture before the reaper releases the final backend reference.
+        .pid = child.pidValue(),
+        .waiter = self.waiter,
+    };
+    self.pty = .{};
+    self.child = null;
+    self.waiter = null;
+    return reaper;
 }
 
 pub fn replicaName(self: *Self) []const u8 {
     return self.pty.replicaName();
 }
 
-pub fn deinitAndWait(self: *Self) u32 {
-    self.pty.deinit();
-    // PTY closure can precede child exit. Keep the state and wake pipe alive
-    // until the waiter has published the status and finished its wakeup write.
-    const exit_code = self.waiter.wait();
-    self.waiter.child.refcount.release();
-    self.alloc.destroy(self.waiter);
-    _ = sys.close(self.wake_pipe[0]);
-    _ = sys.close(self.wake_pipe[1]);
-    return exit_code;
+pub fn closeWakeEndpoints(self: *Self) void {
+    closeEndpoints(&self.wake_read_fd, &self.wake_write_fd);
+    closeEndpoints(&self.command_read_fd, &self.command_write_fd);
 }
 
-test "child exit wakeup drains queued output without waiting for hangup" {
+pub fn deinitAndWait(self: *Self) u32 {
+    self.closeWakeEndpoints();
+    var reaper = self.takeForReaper();
+    return reaper.deinitAndWait();
+}
+
+fn drainPipe(fd: sys.fd_t) void {
+    if (fd == -1) return;
+
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const n = sys.read(fd, &buf, buf.len);
+        if (n == 0) return;
+        switch (sys.errno(n)) {
+            .SUCCESS, .INTR => continue,
+            .AGAIN => return,
+            // Wake pipes are advisory; a closed or otherwise unreadable pipe
+            // needs no further draining.
+            else => return,
+        }
+    }
+}
+
+fn closePipe(pipe: *[2]sys.fd_t) void {
+    closeEndpoints(&pipe[0], &pipe[1]);
+}
+
+fn closeEndpoints(read_fd: *sys.fd_t, write_fd: *sys.fd_t) void {
+    if (read_fd.* != -1) {
+        _ = sys.close(read_fd.*);
+        read_fd.* = -1;
+    }
+    if (write_fd.* != -1) {
+        _ = sys.close(write_fd.*);
+        write_fd.* = -1;
+    }
+}
+
+test "drain finishes when child exits with replica held open" {
     const testing = std.testing;
     var output_pipe: [2]sys.fd_t = undefined;
     try testing.expectEqual(sys.E.SUCCESS, sys.errno(sys.pipe(&output_pipe)));
-    defer for (output_pipe) |fd| {
-        _ = sys.close(fd);
-    };
+    defer closePipe(&output_pipe);
     _ = try fcntl(output_pipe[0], sys.F.SETFL, @as(u32, @bitCast(sys.O{ .NONBLOCK = true })));
 
-    var wake_pipe: [2]sys.fd_t = undefined;
-    try testing.expectEqual(sys.E.SUCCESS, sys.errno(sys.pipe(&wake_pipe)));
-    defer for (wake_pipe) |fd| {
-        _ = sys.close(fd);
-    };
+    var wake_pipe = try openNonblockingPipe();
+    defer closePipe(&wake_pipe);
+    var command_pipe = try openNonblockingPipe();
+    defer closePipe(&command_pipe);
+    var exit_pipe = try openNonblockingPipe();
+    defer closePipe(&exit_pipe);
 
-    var waiter: Waiter = .{ .child = undefined };
-    var backend: Self = .{
+    var waiter: ChildWaiter = .{
+        .child = undefined,
+        .exit_read_fd = exit_pipe[0],
+        .exit_write_fd = exit_pipe[1],
+    };
+    var process = Self{
         .alloc = testing.allocator,
         .pty = .{ .primary_fd = output_pipe[0] },
-        .wake_pipe = wake_pipe,
+        .wake_read_fd = wake_pipe[0],
+        .wake_write_fd = wake_pipe[1],
+        .command_read_fd = command_pipe[0],
+        .command_write_fd = command_pipe[1],
         .waiter = &waiter,
     };
     var stream: struct {
@@ -560,13 +797,11 @@ test "child exit wakeup drains queued output without waiting for hangup" {
     const output = "final stdout and stderr";
     try testing.expectEqual(@as(isize, output.len), writeWithRetry(output_pipe[1], output));
     waiter.exited.store(true, .release);
-    backend.requestStop();
+    try testing.expectEqual(@as(isize, 1), writeWithRetry(exit_pipe[1], "X"));
 
-    // Keep the output writer open: only the exit wakeup can terminate drain.
-    try testing.expect(!try backend.drain(&stream));
+    try testing.expectEqual(backend_types.DrainResult.finished, try process.drain(&stream));
     try testing.expectEqualStrings(output, stream.data.items);
 }
-
 const TestChild = struct {
     child: *ChildProcess,
     release_fd: sys.fd_t,
@@ -674,4 +909,147 @@ test "native spawn releases allocations on allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.spawn, .{});
+}
+test "finishDrain captures remaining PTY output" {
+    const testing = std.testing;
+    var output_pipe: [2]sys.fd_t = undefined;
+    try testing.expectEqual(sys.E.SUCCESS, sys.errno(sys.pipe(&output_pipe)));
+    defer closePipe(&output_pipe);
+    _ = try fcntl(output_pipe[0], sys.F.SETFL, @as(u32, @bitCast(sys.O{ .NONBLOCK = true })));
+
+    var wake_pipe = try openNonblockingPipe();
+    defer closePipe(&wake_pipe);
+    var command_pipe = try openNonblockingPipe();
+    defer closePipe(&command_pipe);
+
+    var process = Self{
+        .alloc = testing.allocator,
+        .pty = .{ .primary_fd = output_pipe[0] },
+        .wake_read_fd = wake_pipe[0],
+        .wake_write_fd = wake_pipe[1],
+        .command_read_fd = command_pipe[0],
+        .command_write_fd = command_pipe[1],
+    };
+    var stream: struct {
+        data: std.ArrayList(u8) = .empty,
+
+        pub fn nextSlice(self: *@This(), bytes: []const u8) !void {
+            try self.data.appendSlice(testing.allocator, bytes);
+        }
+    } = .{};
+    defer stream.data.deinit(testing.allocator);
+
+    const output = "remaining PTY output";
+    try testing.expectEqual(@as(isize, output.len), writeWithRetry(output_pipe[1], output));
+    process.wakeCommands();
+
+    try testing.expectEqual(backend_types.DrainResult.command, try process.drain(&stream));
+    try process.finishDrain(&stream);
+    try testing.expectEqualStrings(output, stream.data.items);
+}
+
+test "wake endpoints stay usable after reaper handoff" {
+    var wake_pipe = try openNonblockingPipe();
+    defer closePipe(&wake_pipe);
+    var command_pipe = try openNonblockingPipe();
+    defer closePipe(&command_pipe);
+
+    var child = ChildProcess{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .handle = 42,
+    };
+    var process = Self{
+        .alloc = std.testing.allocator,
+        .pty = .{},
+        .wake_read_fd = wake_pipe[0],
+        .wake_write_fd = wake_pipe[1],
+        .command_read_fd = command_pipe[0],
+        .command_write_fd = command_pipe[1],
+        .child = &child,
+    };
+
+    _ = process.takeForReaper();
+    process.wakeCommands();
+    process.requestStop(undefined);
+
+    var pollfds = [_]sys.pollfd{
+        .{ .fd = command_pipe[0], .events = sys.POLL.IN, .revents = undefined },
+        .{ .fd = wake_pipe[0], .events = sys.POLL.IN, .revents = undefined },
+    };
+    const ready = pollWithRetry(&pollfds, 0);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(ready));
+    try std.testing.expectEqual(@as(c_int, 2), ready);
+    try std.testing.expect(pollfds[0].revents & sys.POLL.IN != 0);
+    try std.testing.expect(pollfds[1].revents & sys.POLL.IN != 0);
+
+    var buf: [1]u8 = undefined;
+    const command_n = sys.read(command_pipe[0], &buf, buf.len);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(command_n));
+    try std.testing.expectEqual(@as(isize, 1), command_n);
+    try std.testing.expectEqualStrings("W", &buf);
+
+    const wake_n = sys.read(wake_pipe[0], &buf, buf.len);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(wake_n));
+    try std.testing.expectEqual(@as(isize, 1), wake_n);
+    try std.testing.expectEqualStrings("S", &buf);
+}
+
+test "requestStop wakes poll after reaper handoff" {
+    var wake_pipe = try openNonblockingPipe();
+    defer closePipe(&wake_pipe);
+
+    var child = ChildProcess{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .handle = 42,
+    };
+    var process = Self{
+        .alloc = std.testing.allocator,
+        .pty = .{},
+        .wake_read_fd = wake_pipe[0],
+        .wake_write_fd = wake_pipe[1],
+        .child = &child,
+    };
+
+    _ = process.takeForReaper();
+    process.requestStop(undefined);
+
+    var pollfds = [_]sys.pollfd{.{
+        .fd = wake_pipe[0],
+        .events = sys.POLL.IN,
+        .revents = undefined,
+    }};
+    const ready = pollWithRetry(&pollfds, 0);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(ready));
+    try std.testing.expectEqual(@as(c_int, 1), ready);
+    try std.testing.expect(pollfds[0].revents & sys.POLL.IN != 0);
+
+    var buf: [1]u8 = undefined;
+    const n = sys.read(wake_pipe[0], &buf, buf.len);
+    try std.testing.expectEqual(sys.E.SUCCESS, sys.errno(n));
+    try std.testing.expectEqual(@as(isize, 1), n);
+    try std.testing.expectEqualStrings("S", &buf);
+}
+
+test "reaper retains child pid after waiting" {
+    const testing = std.testing;
+    const pid = sys.fork();
+    if (sys.errno(pid) != .SUCCESS) return error.ForkFailed;
+    if (pid == 0) std.c._exit(37);
+
+    const child = try testing.allocator.create(ChildProcess);
+    child.* = .{ .alloc = testing.allocator, .io = testing.io, .handle = pid };
+    errdefer child.refcount.release();
+    const waiter = try ChildWaiter.start(testing.allocator, child);
+    var reaper = Reaper{
+        .alloc = testing.allocator,
+        .pty = .{},
+        .child = child,
+        .pid = child.pidValue(),
+        .waiter = waiter,
+    };
+
+    try testing.expectEqual(@as(u32, 37), reaper.deinitAndWait());
+    try testing.expectEqual(@as(i64, pid), reaper.pid);
 }

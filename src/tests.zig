@@ -7,7 +7,8 @@ test {
     _ = @import("fixed_array_list.zig");
     _ = @import("RefCount.zig");
     _ = @import("input.zig");
-    _ = @import("handler.zig");
+    _ = @import("RingQueue.zig");
+    _ = @import("version.zig");
     if (builtin.os.tag == .windows) {
         _ = @import("ConPtyProcess.zig");
     } else {

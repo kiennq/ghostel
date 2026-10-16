@@ -27,7 +27,8 @@ Check the [documentation](https://dakra.github.io/ghostel/#features) for a full 
 
 ## Quick Start
 
-**Requirements:** Emacs 28.1+ with dynamic module support, on macOS, Linux, FreeBSD, Android/Termux, or native Windows.
+**Requirements:** Emacs 28.1+ with dynamic module support, on macOS, Linux,
+FreeBSD, Android/Termux, or native Windows 10/11 with ConPTY support.
 On first use Ghostel **offers to download a prebuilt native module**.
 No toolchain or build step required.
 
