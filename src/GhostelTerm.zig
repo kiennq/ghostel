@@ -6,7 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const GhostelHandler = @import("handler.zig").GhostelHandler;
 const Renderer = @import("Renderer.zig");
@@ -15,13 +15,16 @@ const input = @import("input.zig");
 const utils = @import("utils.zig");
 const parseHexColor = utils.parseHexColor;
 const platform = @import("platform.zig");
+const pty_utils = @import("pty_utils.zig");
+
 const NativeProcess = @import("NativeProcess.zig");
 const ChildProcess = NativeProcess.ChildProcess;
 const RefCount = @import("RefCount.zig").RefCount;
 const WinSize = @import("backend_types.zig").WinSize;
 const ChannelFd = NativeProcess.ChannelFd;
 const ProcessParams = NativeProcess.ProcessParams;
-const pty_utils = @import("pty_utils.zig");
+const ProcessPid = i64;
+const HandoffProtocolVersion = 1;
 
 const Self = @This();
 
@@ -38,12 +41,15 @@ stream: gt.Stream(GhostelHandler(*Self)),
 string_buffer: ?[]u8 = null,
 renderer: Renderer,
 process: ?*NativeProcess = null,
+/// Desired native output-refresh gate; owned by the Emacs thread.
+refresh_enabled: bool = true,
 /// Last window size sent to the PTY.
 pty_size: WinSize = .{ .cols = 0, .rows = 0 },
 /// Light/dark as classified by Emacs for `ghostel-default`; reported via CSI 996/997.
 color_scheme: gt.device_status.ColorScheme = .dark,
 /// Name and version answered to XTVERSION; null answers libghostty's default.
 xtversion: ?[]u8 = null,
+emacs_process_pid: ?i64 = null,
 
 /// Create a new terminal with the given dimensions and scrollback.
 pub fn init(
@@ -96,7 +102,7 @@ pub fn destroy(self: *Self) void {
 }
 
 pub fn redraw(self: *Self, force_full: bool, force_sync: bool) !bool {
-    try self.lock();
+    if (!self.mutex.tryLock()) return false;
     defer self.unlock();
 
     const env = emacs.current_env orelse return false;
@@ -108,6 +114,20 @@ pub fn redraw(self: *Self, force_full: bool, force_sync: bool) !bool {
         if (!std.meta.eql(size, self.pty_size)) {
             try proc.resizePty(size);
             self.pty_size = size;
+        }
+    } else if (try nativeTransportTerm(env)) |transport_term| {
+        const size = self.winSize();
+        if (!std.meta.eql(size, self.pty_size)) {
+            try env.checkNonLocalExit();
+            const result = env.f("ghostel--handoff-resize", .{
+                transport_term,
+                size.rows,
+                size.cols,
+                size.xpixel,
+                size.ypixel,
+            });
+            try env.checkNonLocalExit();
+            if (env.eq(result, env.t())) self.pty_size = size;
         }
     } else if (!std.meta.eql(pre_size, .{ self.terminal.cols, self.terminal.rows })) {
         // Emacs-owned PTYs carry no pixel geometry.
@@ -127,6 +147,13 @@ fn winSize(self: *Self) WinSize {
         .xpixel = std.math.lossyCast(u16, self.terminal.width_px),
         .ypixel = std.math.lossyCast(u16, self.terminal.height_px),
     };
+}
+
+fn queueTransportResizeIfChanged(cached: *WinSize, requested: WinSize, queue: anytype) !bool {
+    if (std.meta.eql(cached.*, requested)) return false;
+    try queue.enqueue(requested);
+    cached.* = requested;
+    return true;
 }
 
 /// Set the color palette (256 entries). The terminal must be locked.
@@ -149,16 +176,50 @@ pub fn ptyWrite(self: *Self, data: []const u8) !void {
     } else {
         const bytes = env.makeUnibyteString(data);
         _ = env.f("ghostel--pty-out", .{bytes});
-        const exit = env.nonLocalExitGet();
-        if (exit.status == .signal) {
-            env.nonLocalExitClear();
-            if (env.eq(exit.symbol, emacs.sym.quit)) env.nonLocalExitSignal(exit.symbol, exit.data);
-        }
+        preserveTerminalReplyExit(env);
     }
 }
 
 pub fn ptyWriteFromTerminal(self: *Self, data: []const u8) void {
-    self.ptyWrite(data) catch {};
+    if (emacs.current_env) |env| {
+        const transport_term = nativeTransportTerm(env) catch |err| {
+            std.log.err("ghostel: Failed to inspect native transport handle: {any}", .{err});
+            return;
+        };
+        if (transport_term) |transport| {
+            const bytes = env.makeUnibyteString(data);
+            if (env.nonLocalExitCheck() == .normal) {
+                _ = env.f("ghostel--handoff-reply", .{ transport, bytes });
+            }
+            preserveTerminalReplyExit(env);
+            return;
+        }
+    }
+
+    self.ptyWrite(data) catch |err| {
+        std.log.err("ghostel: Failed to write to PTY from terminal: {any}", .{err});
+    };
+}
+
+fn preserveTerminalReplyExit(env: emacs.Env) void {
+    const exit = env.nonLocalExitGet();
+    if (exit.status == .signal) {
+        env.nonLocalExitClear();
+        if (env.eq(exit.symbol, emacs.sym.quit)) {
+            env.nonLocalExitSignal(exit.symbol, exit.data);
+        }
+    }
+}
+
+fn nativeTransportTerm(env: emacs.Env) !?emacs.Value {
+    const var_symbol = emacs.sym.@"ghostel--native-transport-term";
+    const is_bound = env.f("boundp", .{var_symbol});
+    try env.checkNonLocalExit();
+    if (env.isNil(is_bound)) return null;
+
+    const value = env.symbolValue("ghostel--native-transport-term");
+    try env.checkNonLocalExit();
+    return if (env.isNotNil(value)) value else null;
 }
 
 /// Replace the terminal with the snapshot DATA.  The terminal must have no
@@ -167,6 +228,41 @@ pub fn ptyWriteFromTerminal(self: *Self, data: []const u8) void {
 pub fn restoreSnapshot(self: *Self, env: emacs.Env, data: []const u8) !void {
     try self.lock();
     defer self.unlock();
+    try self.restoreSnapshotLocked(env, data, null, false);
+}
+
+pub fn restoreHandoffSnapshot(
+    self: *Self,
+    env: emacs.Env,
+    data: []const u8,
+    cell_w: u32,
+    cell_h: u32,
+    pixel_scale: u32,
+    color_scheme: gt.device_status.ColorScheme,
+) !void {
+    if (!self.mutex.tryLock()) return error.TerminalBusy;
+    defer self.unlock();
+    try self.restoreSnapshotLocked(env, data, .{
+        .cell_w = cell_w,
+        .cell_h = cell_h,
+        .pixel_scale = pixel_scale,
+    }, true);
+    self.color_scheme = color_scheme;
+}
+
+const RestoreGeometry = struct {
+    cell_w: u32,
+    cell_h: u32,
+    pixel_scale: u32,
+};
+
+fn restoreSnapshotLocked(
+    self: *Self,
+    env: emacs.Env,
+    data: []const u8,
+    geometry: ?RestoreGeometry,
+    require_ground: bool,
+) !void {
     if (self.process != null) return error.TerminalHasProcess;
 
     var reader: std.Io.Reader = .fixed(data);
@@ -175,6 +271,13 @@ pub fn restoreSnapshot(self: *Self, env: emacs.Env, data: []const u8) !void {
         .kitty_image_storage_limit = self.options.kitty_image_storage_limit,
     });
     defer decoded.deinit(self.alloc);
+
+    if (require_ground) {
+        switch (decoded.continuation) {
+            .ground => {},
+            .bytes => return error.UnsupportedSnapshotContinuation,
+        }
+    }
 
     // The old terminal and renderer stay intact until the new renderer
     // exists, so a failure leaves the terminal as it was.
@@ -189,8 +292,23 @@ pub fn restoreSnapshot(self: *Self, env: emacs.Env, data: []const u8) !void {
         entry.value.*.kitty_images.image_limits = self.options.kitty_image_loading_limits;
     }
     self.terminal.modes.default = self.options.default_modes;
+    if (require_ground and builtin.os.tag == .windows) {
+        // ConPTY has no scrollback to pull into the viewport on reattach.
+        self.terminal.flags.resize_pull_scrollback = false;
+    }
 
-    const renderer = Renderer.init(self.alloc, env, &self.terminal) catch |err| {
+    const renderer = if (geometry) |size|
+        Renderer.initWithGeometry(
+            self.alloc,
+            env,
+            &self.terminal,
+            size.cell_w,
+            size.cell_h,
+            size.pixel_scale,
+        )
+    else
+        Renderer.init(self.alloc, env, &self.terminal);
+    const new_renderer = renderer catch |err| {
         self.terminal.deinit(self.alloc);
         self.terminal = old_terminal;
         return err;
@@ -198,12 +316,14 @@ pub fn restoreSnapshot(self: *Self, env: emacs.Env, data: []const u8) !void {
     // The old renderer's pin lives in the old terminal's page list.
     self.renderer.term = &old_terminal;
     self.renderer.deinit();
-    self.renderer = renderer;
+    self.renderer = new_renderer;
     old_terminal.deinit(self.alloc);
 
-    switch (decoded.continuation) {
-        .ground => {},
-        .bytes => |bytes| self.stream.nextSlice(bytes),
+    if (!require_ground) {
+        switch (decoded.continuation) {
+            .ground => {},
+            .bytes => |bytes| self.stream.nextSlice(bytes),
+        }
     }
 }
 
@@ -373,15 +493,45 @@ pub fn spawnNativeProcess(
     return child;
 }
 
+pub fn setRefreshEnabled(self: *Self, enabled: bool) void {
+    self.refresh_enabled = enabled;
+    if (self.process) |process| process.setRefreshEnabled(enabled);
+}
+
 pub fn killNativeProcess(self: *Self) void {
     if (self.process) |process| {
+        process.deinit();
         self.process = null;
-        process.requestStop();
-        process.refcount.release();
     }
 }
 
+pub fn isProcessLive(self: *Self) bool {
+    if (self.process) |process| {
+        return process.isRunning();
+    } else if (emacs.current_env) |env| {
+        return self.emacsProcessMaybeLive() and
+            env.isNotNil(env.symbolValue("ghostel--process"));
+    }
+
+    return false;
+}
+
+fn emacsProcessMaybeLive(self: *Self) bool {
+    const pid = self.emacs_process_pid orelse return true;
+    if (builtin.os.tag == .windows) return true;
+
+    const posix_pid = std.math.cast(std.posix.pid_t, pid) orelse return false;
+    std.posix.kill(posix_pid, 0) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
+        else => return false,
+    };
+    return true;
+}
+
 pub fn isPasswordMode(self: *Self) !bool {
+    if (builtin.os.tag == .windows) return false;
+
     if (self.process) |process| {
         return pty_utils.isPasswordMode(process.replicaName());
     } else if (emacs.current_env) |env| {
@@ -389,11 +539,15 @@ pub fn isPasswordMode(self: *Self) !bool {
         if (env.isNil(process)) return false;
         const tty_name_val = env.f("process-tty-name", .{process});
         if (env.isNil(tty_name_val)) return false;
-        const tty_name = try env.extractStringAlloc(
+
+        const tty_name = env.extractStringAlloc(
             self.alloc,
             tty_name_val,
             &self.string_buffer,
-        );
+        ) catch |err| switch (err) {
+            error.ExtractStringFailed => return false,
+            else => return err,
+        };
         return pty_utils.isPasswordMode(tty_name);
     }
 
@@ -410,10 +564,12 @@ var module_io: std.Io = undefined;
 var temp_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 var temp_dir: []const u8 = undefined;
 
-pub fn initModule(allocator: Allocator, io: std.Io, env: emacs.Env) !void {
+pub fn setModuleRuntime(allocator: Allocator, io: std.Io) void {
     module_alloc = allocator;
     module_io = io;
-    env.registerFunctions(&emacs_functions);
+}
+
+pub fn setModuleEnvironment(env: emacs.Env) !void {
     temp_dir = try env.extractString(env.f("temporary-file-directory", .{}), &temp_dir_buf);
 }
 
@@ -422,6 +578,12 @@ fn terminalFinalize(ptr: ?*anyopaque) callconv(.c) void {
         const term: *Self = @ptrCast(@alignCast(p));
         term.deinit();
     }
+}
+
+fn getHandoffTerm(env: emacs.Env, value: emacs.Value) !*Self {
+    const term = try env.getUserPtrWithFinalizer(Self, value, terminalFinalize);
+    if (term) |ptr| return ptr;
+    return error.InvalidTerminalHandle;
 }
 
 fn childFinalize(ptr: ?*anyopaque) callconv(.c) void {
@@ -463,6 +625,14 @@ fn getProcessEnvironment(alloc: Allocator, env: emacs.Env) !std.process.Environ.
     }
 
     return env_map;
+}
+
+fn validateHandoffStream(stream: anytype) !void {
+    if (!stream.ground()) return error.VtParserNotGround;
+    // A new renderer can start with no saved titles; control-mode data
+    // cannot be discarded without changing how the output is parsed.
+    if (stream.handler.control_mode or stream.handler.control_buf.items.len != 0)
+        return error.UnsupportedHandlerState;
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +718,42 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         },
     },
     .{
+        .name = "ghostel--get-title",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Get the terminal title.
+        \\
+        \\(ghostel--get-title TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                try term.lock();
+                defer term.unlock();
+                const title = term.terminal.getTitle();
+                return if (title) |t| env.makeString(t) else env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--get-pwd",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Get the terminal's working directory from OSC 7.
+        \\
+        \\(ghostel--get-pwd TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                try term.lock();
+                defer term.unlock();
+                const pwd = term.terminal.getPwd();
+                return if (pwd) |p| env.makeString(p) else env.nil();
+            }
+        },
+    },
+    .{
         .name = "ghostel--write-vt",
         .arity = .{ 2, 2 },
         .doc =
@@ -584,6 +790,247 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         },
     },
     .{
+        .name = "ghostel--handoff-version",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return the renderer-handoff protocol version for this generation.
+        \\
+        \\Version 1 guarantees the fixed snapshot, commit, cancel, restore,
+        \\resize, and reply exports.  Pass nil to probe the active generation,
+        \\or a terminal handle to probe the generation that owns it.
+        \\
+        \\(ghostel--handoff-version TERM-OR-NIL)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                try env.checkNonLocalExit();
+                if (env.raw.get_user_finalizer == null) return env.nil();
+                if (env.isNil(args[0])) return env.makeInteger(HandoffProtocolVersion);
+
+                const term = try env.getUserPtrWithFinalizer(
+                    Self,
+                    args[0],
+                    terminalFinalize,
+                );
+                if (term == null) return env.nil();
+                return env.makeInteger(HandoffProtocolVersion);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--handoff-snapshot",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Create a ground-state snapshot and optionally stage a live native PTY.
+        \\
+        \\Return (BYTES ROWS COLS CELL-W CELL-H PIXEL-SCALE SCHEME), or nil if busy.
+        \\Saved window titles do not carry over to the replacement renderer.
+        \\CAPTURE non-nil arms bounded output staging only after the snapshot value
+        \\has been created successfully.
+        \\
+        \\(ghostel--handoff-snapshot TERM CAPTURE)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = try getHandoffTerm(env, args[0]);
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+
+                const capture = env.isNotNil(args[1]);
+                const process = term.process;
+                if (capture) {
+                    const proc = process orelse return error.NativeProcessRequired;
+                    if (proc.owner != term or !proc.attached.load(.acquire) or !proc.isRunning()) {
+                        return error.ProcessExited;
+                    }
+                    try validateHandoffStream(&proc.stream);
+                } else {
+                    if (process != null) return error.TerminalHasProcess;
+                    try validateHandoffStream(&term.stream);
+                }
+                if (term.renderer.pending_resize != null) return error.ResizePending;
+
+                var writer = std.Io.Writer.Allocating.init(module_alloc);
+                defer writer.deinit();
+                try gt.snapshot.encode(
+                    module_alloc,
+                    &writer.writer,
+                    &term.terminal,
+                    .{ .continuation = .ground },
+                );
+
+                const size = term.renderer.size;
+                const color_scheme = switch (term.color_scheme) {
+                    .light => emacs.sym.light,
+                    .dark => emacs.sym.dark,
+                };
+                const bytes = env.makeUnibyteString(writer.written());
+                try env.checkNonLocalExit();
+                const result = env.list(.{
+                    bytes,
+                    size.rows,
+                    size.cols,
+                    size.cell_w,
+                    size.cell_h,
+                    size.pixel_scale,
+                    color_scheme,
+                });
+                try env.checkNonLocalExit();
+
+                if (capture) try process.?.beginHandoff();
+                return result;
+            }
+        },
+    },
+    .{
+        .name = "ghostel--handoff-commit",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Commit a staged native PTY cutover, returning nil when busy or unavailable.
+        \\
+        \\(ghostel--handoff-commit TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = try getHandoffTerm(env, args[0]);
+                const process = term.process orelse return env.nil();
+                return env.makeValue(process.commitHandoff() == .committed);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--handoff-cancel",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Asynchronously roll an unfinished native PTY handoff back to its old parser.
+        \\
+        \\A committed raw transport is never reverted.
+        \\
+        \\(ghostel--handoff-cancel TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = try getHandoffTerm(env, args[0]);
+                const process = term.process orelse return env.nil();
+                return env.makeValue(process.cancelHandoff());
+            }
+        },
+    },
+    .{
+        .name = "ghostel--handoff-restore",
+        .arity = .{ 6, 6 },
+        .doc =
+        \\Restore a ground-state snapshot into a processless candidate renderer.
+        \\
+        \\SCHEME is the host-assigned `light' or `dark' color scheme.
+        \\
+        \\(ghostel--handoff-restore FRESH-TERM BYTES CELL-W CELL-H PIXEL-SCALE SCHEME)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = try getHandoffTerm(env, args[0]);
+                const cell_w = std.math.cast(u32, env.cast(i64, args[2])) orelse return error.OutOfRange;
+                const cell_h = std.math.cast(u32, env.cast(i64, args[3])) orelse return error.OutOfRange;
+                const pixel_scale = std.math.cast(u32, env.cast(i64, args[4])) orelse return error.OutOfRange;
+                if (cell_w == 0 or cell_h == 0 or pixel_scale == 0) return error.InvalidSize;
+                const color_scheme: gt.device_status.ColorScheme =
+                    if (env.eq(args[5], emacs.sym.light))
+                        .light
+                    else if (env.eq(args[5], emacs.sym.dark))
+                        .dark
+                    else
+                        return error.InvalidColorScheme;
+                try env.checkNonLocalExit();
+
+                const raw = try env.extractStringAlloc(module_alloc, args[1], &term.string_buffer);
+                try env.checkNonLocalExit();
+                try term.restoreHandoffSnapshot(
+                    env,
+                    raw,
+                    cell_w,
+                    cell_h,
+                    pixel_scale,
+                    color_scheme,
+                );
+                return env.t();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--handoff-resize",
+        .arity = .{ 5, 5 },
+        .doc =
+        \\Queue a committed renderer resize on its native transport PTY.
+        \\
+        \\(ghostel--handoff-resize TRANSPORT-TERM ROWS COLS XPIXEL YPIXEL)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = try getHandoffTerm(env, args[0]);
+                const rows = std.math.cast(u16, env.cast(i64, args[1])) orelse return error.OutOfRange;
+                const cols = std.math.cast(u16, env.cast(i64, args[2])) orelse return error.OutOfRange;
+                const xpixel = std.math.cast(u16, env.cast(i64, args[3])) orelse return error.OutOfRange;
+                const ypixel = std.math.cast(u16, env.cast(i64, args[4])) orelse return error.OutOfRange;
+                if (rows == 0 or cols == 0) return error.InvalidSize;
+                try env.checkNonLocalExit();
+
+                const process = term.process orelse return env.nil();
+                var queue = struct {
+                    process: *NativeProcess,
+
+                    fn enqueue(self: *@This(), size: WinSize) !void {
+                        try self.process.resizePty(size);
+                    }
+                }{ .process = process };
+                _ = try queueTransportResizeIfChanged(&term.pty_size, .{
+                    .rows = rows,
+                    .cols = cols,
+                    .xpixel = xpixel,
+                    .ypixel = ypixel,
+                }, &queue);
+                return env.t();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--handoff-reply",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Queue a terminal-generated reply on its native transport using reply backpressure.
+        \\
+        \\(ghostel--handoff-reply TRANSPORT-TERM BYTES)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = try getHandoffTerm(env, args[0]);
+                const bytes = try env.extractStringAlloc(module_alloc, args[1], &term.string_buffer);
+                try env.checkNonLocalExit();
+                const process = term.process orelse return env.nil();
+                process.ptyWriteFromTerminal(bytes);
+                return env.t();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--set-refresh-enabled",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Set whether TERM sends output-only native refresh notifications.
+        \\
+        \\Semantic terminal callbacks are not gated.
+        \\
+        \\(ghostel--set-refresh-enabled TERM ENABLED)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                if (env.isNil(args[0])) return env.nil();
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                term.setRefreshEnabled(env.isNotNil(args[1]));
+                return env.nil();
+            }
+        },
+    },
+    .{
         .name = "ghostel--write-pty",
         .arity = .{ 2, 2 },
         .doc =
@@ -601,6 +1048,22 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const raw = try env.extractStringAlloc(module_alloc, args[1], &term.string_buffer);
                 try term.ptyWrite(raw);
                 return env.t();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--set-process-pid",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Cache the local Emacs PTY child process id for TERM.
+        \\
+        \\(ghostel--set-process-pid TERM PID)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
+                term.emacs_process_pid = env.cast(i64, args[1]);
+                return env.nil();
             }
         },
     },
@@ -875,7 +1338,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 const mode: gt.modes.Mode = gt.modes.modeFromInt(mode_int, false) orelse {
                     return error.InvalidModeValue;
                 };
-                try term.lock();
+                if (!term.mutex.tryLock()) return env.nil();
                 defer term.unlock();
                 return if (term.terminal.modes.get(mode)) env.t() else env.nil();
             }
@@ -954,7 +1417,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         \\Spawn COMMAND on a PTY for TERM and return a retained child handle.
         \\
         \\COMMAND is a list of argv strings.  PIPE receives Lisp event forms
-        \\followed by a numeric exit status, then closes.
+        \\followed by a PID-tagged exit marker, then closes.
         \\Use `ghostel--native-child-pid' to retrieve its PID.
         \\
         \\(ghostel--spawn-native-process TERM COMMAND PIPE)
@@ -991,7 +1454,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                     cmd.items,
                     &process_env,
                     cwd,
-                    env.openChannel(pipe_val),
+                    @intCast(env.openChannel(pipe_val)),
                 );
                 errdefer {
                     child.terminate() catch |err| {
@@ -1117,4 +1580,191 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
             }
         },
     },
+    .{
+        .name = "ghostel--native-uri-at",
+        .arity = .{ 3, 3 },
+        .doc =
+        \\Get URI at ROW-from-bottom and COL.
+        \\
+        \\(ghostel--native-uri-at TERM ROW COL)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                const row_from_bottom = env.extractInteger(args[1]);
+                const col = env.extractInteger(args[2]);
+                const total_rows = term.terminal.screens.active.pages.total_rows;
+                if (col < 0 or col >= term.terminal.cols) return env.nil();
+                // The Emacs buffer always carries a trailing newline, so the line
+                // immediately after the last content row produces row_from_bottom == 0.
+                if (row_from_bottom <= 0 or row_from_bottom > total_rows) return env.nil();
+                const row = total_rows - @as(usize, @intCast(row_from_bottom));
+                const point = gt.Point{ .screen = .{
+                    .x = @intCast(col),
+                    .y = @intCast(row),
+                } };
+                const pin = term.terminal.screens.active.pages.pin(point) orelse return env.nil();
+                const cell = pin.rowAndCell().cell;
+                if (!cell.hyperlink) {
+                    return env.nil();
+                }
+                const page = pin.node.page();
+                const link_id = page.lookupHyperlink(cell) orelse return env.nil();
+                const entry = page.hyperlink_set.get(page.memory, link_id);
+                const uri = entry.uri.slice(page.memory);
+                return env.makeString(uri);
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll",
+        .arity = .{ 2, 2 },
+        .doc =
+        \\Scroll the terminal viewport by DELTA lines.
+        \\
+        \\(ghostel--scroll TERM DELTA)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                const delta = env.extractInteger(args[1]);
+                term.terminal.scrollViewport(.{ .delta = @intCast(delta) });
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-top",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the top of scrollback.
+        \\
+        \\(ghostel--scroll-top TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                term.terminal.scrollViewport(.top);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--scroll-bottom",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Scroll the terminal viewport to the bottom.
+        \\
+        \\(ghostel--scroll-bottom TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                term.terminal.scrollViewport(.bottom);
+                return env.nil();
+            }
+        },
+    },
+    .{
+        .name = "ghostel--cursor-pending-wrap-p",
+        .arity = .{ 1, 1 },
+        .doc =
+        \\Return t if the cursor is in pending-wrap state.
+        \\
+        \\(ghostel--cursor-pending-wrap-p TERM)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                const term = env.getUserPtr(Self, args[0]) orelse return env.nil();
+                if (!term.mutex.tryLock()) return env.nil();
+                defer term.unlock();
+                return if (term.terminal.screens.active.cursor.pending_wrap) env.t() else env.nil();
+            }
+        },
+    },
 };
+
+test "refresh gate defaults enabled and updates the native process" {
+    var term = Self{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .terminal = undefined,
+        .options = .{
+            .rows = 24,
+            .cols = 80,
+            .max_scrollback_bytes = 5 * 1024 * 1024,
+            .kitty_image_storage_limit = 320 * 1024 * 1024,
+            .kitty_image_loading_limits = .{
+                .file = false,
+                .temporary_file = .disabled,
+                .shared_memory = false,
+            },
+            .default_modes = .{ .grapheme_cluster = true },
+        },
+        .stream = undefined,
+        .renderer = undefined,
+    };
+    try std.testing.expect(term.refresh_enabled);
+
+    var process = NativeProcess{
+        .alloc = std.testing.allocator,
+        .io = undefined,
+        .backend = undefined,
+        .event_writer = .{ .fd = -1 },
+        .replica_name = undefined,
+        .child_pid = 4242,
+        .owner = &term,
+        .stream = undefined,
+        .thread = undefined,
+    };
+    defer process.event_buf.deinit(process.alloc);
+    term.process = &process;
+
+    term.setRefreshEnabled(false);
+    try std.testing.expect(!term.refresh_enabled);
+    try std.testing.expect(!process.refresh_enabled.load(.acquire));
+
+    term.setRefreshEnabled(true);
+    try std.testing.expect(term.refresh_enabled);
+    try std.testing.expect(process.refresh_enabled.load(.acquire));
+}
+
+test "transport resize deduplicates and commits its cache only after enqueue" {
+    const Recorder = struct {
+        calls: usize = 0,
+        fail: bool = false,
+
+        fn enqueue(self: *@This(), _: WinSize) !void {
+            self.calls += 1;
+            if (self.fail) return error.ResizeQueueFailed;
+        }
+    };
+
+    var cached = WinSize{ .cols = 80, .rows = 24, .xpixel = 800, .ypixel = 480 };
+    var recorder = Recorder{};
+
+    try std.testing.expect(!try queueTransportResizeIfChanged(&cached, cached, &recorder));
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+
+    const committed = WinSize{ .cols = 100, .rows = 30, .xpixel = 1000, .ypixel = 600 };
+    try std.testing.expect(try queueTransportResizeIfChanged(&cached, committed, &recorder));
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqualDeep(committed, cached);
+
+    recorder.fail = true;
+    const failed = WinSize{ .cols = 120, .rows = 40, .xpixel = 1200, .ypixel = 800 };
+    try std.testing.expectError(
+        error.ResizeQueueFailed,
+        queueTransportResizeIfChanged(&cached, failed, &recorder),
+    );
+    try std.testing.expectEqual(@as(usize, 2), recorder.calls);
+    try std.testing.expectEqualDeep(committed, cached);
+}
