@@ -60,7 +60,7 @@ OSC 8 hyperlinks are applied during the redraw itself."
   :group 'ghostel)
 
 (defcustom ghostel-file-detection-path-regex
-  "[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']*[^] \t\n\r:\"<>(){}[`'.,;!?]"
+  "\\(?:[[:alpha:]]:\\)?[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']*[^] \t\n\r:\"<>(){}[`'.,;!?]"
   "Regex matching the PATH portion of a file:line[:col] reference.
 Ghostel adds the leading boundary anchor and the `:LINE[:COL]' tail,
 so the value must contain neither.  The final class excludes sentence
