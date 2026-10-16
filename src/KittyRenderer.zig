@@ -2,7 +2,7 @@
 //! No Lisp values survive a module call here: Emacs owns the image cache.
 const std = @import("std");
 const gt = @import("ghostty-vt");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const pixels = @import("image_composition.zig");
 const png = @import("png.zig");
 const ppm = @import("ppm.zig");

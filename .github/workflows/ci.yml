@@ -55,8 +55,8 @@ jobs:
         run: bash .github/scripts/install-emacs.sh
 
       - name: Run package-lint, checkdoc, docquotes
-        # `make package-lint' self-provisions its deps (package-lint from
-        # MELPA + a local ghostel install) into an isolated package-user-dir.
+        # `make package-lint' provisions a pinned linter and a local Ghostel
+        # install in an isolated package-user-dir.
         run: make package-lint checkdoc docquotes
 
   test-zig:
