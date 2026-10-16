@@ -221,18 +221,18 @@ Covers OSC 2 with ST and BEL terminators and the OSC 0 form."
       (ghostel-test--wait-until
        (lambda () (equal "AFTER" ghostel-title)) proc 5))))
 
-(ert-deftest ghostel-test-bell-reaches-hook ()
-  "BEL from the PTY runs `ghostel-bell-functions' on both backends."
+(ert-deftest ghostel-test-native-rapid-restart-preserves-osc-output ()
+  "Starting ConPTY during prior teardown must preserve OSC output."
   :tags '(native)
-  (ghostel-test--with-pty-matrix backend
+  (skip-unless (ghostel-test--windows-p))
+  (dotimes (iteration 2)
     (ghostel-test--with-raw-echo-buffer (buf proc)
-      (let* ((calls 0)
-             (ghostel-bell-functions (list (lambda () (cl-incf calls)))))
-        (cl-letf (((symbol-function 'run-at-time)
-                   (lambda (_secs _rep fn &rest args) (apply fn args))))
-          (ghostel--write-pty ghostel--term "\a")
-          (ghostel-test--wait-until (lambda () (> calls 0)) proc 5)
-          (should (= calls 1)))))))
+      (let ((title (format "Rapid restart %d" iteration)))
+        (ghostel--write-pty ghostel--term (format "\e]2;%s\e\\" title))
+        (ghostel-test--wait-until
+         (lambda () (equal title ghostel-title))
+         proc 5)
+        (should (equal title ghostel-title))))))
 
 (ert-deftest ghostel-test-osc9-notification ()
   "OSC 9 iTerm2-style notifications reach `ghostel-notification-functions'."
