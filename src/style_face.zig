@@ -5,7 +5,7 @@
 /// propertized text for `comint-preoutput-filter-functions') use the same
 /// SGR-to-face plist mapping.
 const std = @import("std");
-const emacs = @import("emacs.zig");
+const emacs = @import("emacs");
 const gt = @import("ghostty-vt");
 const FixedArrayList = @import("fixed_array_list.zig").FixedArrayList;
 

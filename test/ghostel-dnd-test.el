@@ -66,6 +66,7 @@ ours, and the global value must stay untouched."
 
 (ert-deftest ghostel-test-dnd-file-drop-sends-path ()
   "A file URL dispatched through the dnd layer pastes the path."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (let* ((file (make-temp-file "ghostel-dnd"))
            (sent (unwind-protect
@@ -75,6 +76,7 @@ ours, and the global value must stay untouched."
 
 (ert-deftest ghostel-test-dnd-file-drop-shell-quotes ()
   "A dropped path containing spaces and quotes arrives shell-quoted."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (let* ((dir (make-temp-file "ghostel-dnd" t))
            (file (expand-file-name "it's a file" dir))
@@ -90,6 +92,7 @@ ours, and the global value must stay untouched."
 
 (ert-deftest ghostel-test-dnd-multi-file-drop-space-separated ()
   "Two dropped URLs produce both paths, space-separated."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (let* ((a (make-temp-file "ghostel-dnd-a"))
            (b (make-temp-file "ghostel-dnd-b"))
@@ -102,6 +105,7 @@ ours, and the global value must stay untouched."
 
 (ert-deftest ghostel-test-dnd-hostname-qualified-uri-accepted ()
   "A file://<local hostname>/path URI resolves and pastes the path."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (let* ((file (make-temp-file "ghostel-dnd"))
            (sent (unwind-protect
@@ -112,6 +116,7 @@ ours, and the global value must stay untouched."
 
 (ert-deftest ghostel-test-dnd-nonexistent-path-sent ()
   "A local URI naming a nonexistent file still pastes the path."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (let ((file (make-temp-name "/nonexistent-")))
       (should (equal (ghostel-dnd-test--dispatch (list (concat "file://" file)))
@@ -121,6 +126,7 @@ ours, and the global value must stay untouched."
   "A URI on a foreign host sends nothing and opens nothing.
 The handler still consumes the drop (returns `private') so the dnd
 layer runs no default handler such as `find-file'."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (let ((opened nil))
       (cl-letf (((symbol-function 'dnd-open-local-file)
@@ -132,6 +138,7 @@ layer runs no default handler such as `find-file'."
 
 (ert-deftest ghostel-test-dnd-dead-terminal-opens-file ()
   "A drop into a dead terminal opens the file instead of pasting."
+  :tags '(posix)
   (ghostel-dnd-test--with-mode-buffer
     (delete-process ghostel--process)
     (should-not (process-live-p ghostel--process))

@@ -8,8 +8,8 @@
 
 ## Emacs module function entries
 
-- Functions registered through `emacs.FunctionEntry` should implement `pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) !emacs.Value`.
-- Prefer `try` and `return error.SomeError` inside those functions. `Env.registerFunction` is the boundary that catches errors, logs the stack trace in debug builds, signals an Emacs error, and returns `nil`. This intentionally trades bespoke user-facing messages for lower boilerplate; debug builds provide the developer detail.
+- Functions exposed through `emacs.FunctionEntry` should implement `pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) !emacs.Value`.
+- Prefer `try` and `return error.SomeError` inside those functions. Dyn-loader dispatch through `module.callEntry` is the boundary that catches errors, logs the stack trace in debug builds, signals an Emacs error, and returns `nil`. This intentionally trades bespoke user-facing messages for lower boilerplate; debug builds provide the developer detail.
 - Do not add repetitive `catch |err| { env.logStackTrace(...); env.signalError(...); return env.nil(); }` boilerplate in each registered function.
 - Catch locally only when the local semantics really differ: clearing/handling a module non-local exit, intentionally returning `nil`, or continuing independent items in a loop.
 

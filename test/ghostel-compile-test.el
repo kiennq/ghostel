@@ -605,8 +605,8 @@ has to be one Emacs can actually find."
       (should (equal 1 (length c-calls)))                     ; compile hook
       (should (equal "finished\n" (cdar c-calls))))))
 
-(ert-deftest ghostel-test-compile-existing-local-finish-hook-state-is-available ()
-  "Existing buffer-local compile finish hook state is available at finalization."
+(ert-deftest ghostel-test-compile-buffer-local-finish-hook-state-is-available ()
+  "Buffer-local compile finish hook state is available at finalization."
   (ghostel-test--with-compile-buffer buf
     (let ((finish-called nil)
           (continuation-called nil))
@@ -1180,6 +1180,7 @@ attempts to mutate the buffer signal `buffer-read-only'."
         (let ((buf (ghostel-compile--start "sleep 30" buf-name
                                            default-directory)))
           (with-current-buffer buf
+            (set-window-buffer (selected-window) buf)
             (ghostel-test--wait-for
              ghostel--process
              (lambda () (eq 'run (process-status ghostel--process))))
@@ -1291,6 +1292,7 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
       (let ((kill-buffer-query-functions nil)) (kill-buffer buf-name)))
     (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
               ((symbol-function 'ghostel--new) (lambda (&rest _) 'fake))
+              ((symbol-function 'ghostel--set-refresh-enabled) #'ignore)
               ((symbol-function 'ghostel--apply-palette) #'ignore)
               ((symbol-function 'ghostel--set-size) #'ignore)
               (ghostel--cursor-pos (cons 0 0))
@@ -1326,6 +1328,7 @@ custom MODE / NAME-FUNCTION / HIGHLIGHT-REGEXP survive a revert."
       (let ((kill-buffer-query-functions nil)) (kill-buffer buf-name)))
     (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
               ((symbol-function 'ghostel--new) (lambda (&rest _) 'fake))
+              ((symbol-function 'ghostel--set-refresh-enabled) #'ignore)
               ((symbol-function 'ghostel--apply-palette) #'ignore)
               ((symbol-function 'ghostel--set-size) #'ignore)
               (ghostel--cursor-pos (cons 0 0))
@@ -1393,12 +1396,15 @@ Post-finalize the keys remain bound but the commands refuse to act
           (ghostel-mode)
           (setq ghostel-compile--command "make"
                 ghostel-compile--interactive nil
-                ghostel--process 'fake-process)
+                ghostel--process 'fake-process
+                ghostel--term 'fake
+                ghostel--cursor-pos '(0 . 0))
           (use-local-map ghostel-compile-view-mode-map)
           (cl-letf (((symbol-function 'process-live-p) (lambda (_process) t)))
             (ghostel-compile-switch-to-interactive))
           (should ghostel-compile--interactive)
           (should buffer-read-only)
+          (should inhibit-read-only)
           (should (eq (current-local-map) ghostel-semi-char-mode-map)))
       (kill-buffer buf))))
 
@@ -1430,8 +1436,9 @@ Post-finalize the keys remain bound but the commands refuse to act
 
 After `\\[ghostel-compile-switch-to-interactive]' the local map must
 drop the compilation-style one for `ghostel-semi-char-mode-map', and
-`mode-line-process' must show `:run/i'.  The buffer becomes
-writable, with foreign edits intercepted by the forwarding hook.  After
+`mode-line-process' must show `:run/i'.  The buffer remains read-only,
+with local `inhibit-read-only' allowing the forwarding hook to intercept
+foreign edits.  After
 `\\[ghostel-compile-switch-to-compilation-style]' the buffer must install
 `ghostel-compile-view-mode-map', and the mode-line must read `:run'
 again."
@@ -1448,18 +1455,21 @@ again."
         (let ((buf (ghostel-compile--start "sleep 30" buf-name
                                            default-directory)))
           (with-current-buffer buf
+            (set-window-buffer (selected-window) buf)
             (ghostel-test--wait-for
              ghostel--process
              (lambda () (eq 'run (process-status ghostel--process))))
             ;; Initial state: read-only.
             (should (eq (current-local-map) ghostel-compile-view-mode-map))
             (should buffer-read-only)
+            (should-not inhibit-read-only)
             (should-not ghostel-compile--interactive)
             (should (equal ":run" (cadr (car mode-line-process))))
             ;; Switch to interactive input.
             (ghostel-compile-switch-to-interactive)
             (should ghostel-compile--interactive)
-            (should-not buffer-read-only)
+            (should buffer-read-only)
+            (should inhibit-read-only)
             (should (eq (current-local-map) ghostel-semi-char-mode-map))
             (should (equal ":run/i" (cadr (car mode-line-process))))
             ;; No-op when already interactive.
@@ -1469,6 +1479,7 @@ again."
             (ghostel-compile-switch-to-compilation-style)
             (should-not ghostel-compile--interactive)
             (should buffer-read-only)
+            (should-not inhibit-read-only)
             (should (eq (current-local-map) ghostel-compile-view-mode-map))
             (should (equal ":run" (cadr (car mode-line-process))))
             ;; No-op when already compilation-style.
@@ -1595,9 +1606,10 @@ bytes through the process to confirm they land in the buffer."
             ;; minor mode stealing keys.
             (should (eq major-mode 'ghostel-mode))
             (should-not (bound-and-true-p compilation-minor-mode))
-            ;; Interactive run: writable, foreign edits intercepted by
-            ;; the forwarding hook.
-            (should-not buffer-read-only)
+            ;; Interactive run: renderer-owned read-only buffer with local
+            ;; inhibition allowing foreign edits to reach the forwarding hook.
+            (should buffer-read-only)
+            (should inhibit-read-only)
             ;; Plain letters route through ghostel-mode's self-insert,
             ;; not through compilation-mode's navigation commands.
             (should (eq (key-binding "q") #'ghostel--self-insert))
@@ -1688,6 +1700,7 @@ out-of-band so input typed at an unexpected prompt is visible."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory nil nil)))
           (with-current-buffer buf
+            (set-window-buffer (selected-window) buf)
             (ghostel-test--wait-for
              ghostel--process
              (lambda ()
@@ -1732,6 +1745,7 @@ the flip when ICANON is off."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory nil nil)))
           (with-current-buffer buf
+            (set-window-buffer (selected-window) buf)
             (ghostel-test--wait-for
              ghostel--process
              (lambda ()
@@ -1779,6 +1793,7 @@ ECHO alone on a hit — typed secrets must not render into the buffer."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory nil nil)))
           (with-current-buffer buf
+            (set-window-buffer (selected-window) buf)
             (ghostel-test--wait-for
              ghostel--process
              (lambda ()
@@ -1830,10 +1845,9 @@ normally."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory)))
           (with-current-buffer buf
-            (ghostel-test--wait-for
-             ghostel--process
+            (ghostel-test--wait-until
              (lambda () ghostel-compile--finalized)
-             10)
+             ghostel--process 10)
             (should (equal 7 ghostel-compile--last-exit))
             (let ((text (buffer-substring-no-properties
                          (point-min) (point-max))))
@@ -2211,10 +2225,9 @@ the teardown then destroys."
                                            default-directory)))
           (with-current-buffer buf
             (should-not (get-buffer-window-list buf nil t))
-            (ghostel-test--wait-for
-             ghostel--process
+            (ghostel-test--wait-until
              (lambda () ghostel-compile--finalized)
-             10)
+             ghostel--process 10)
             (let ((text (buffer-substring-no-properties (point-min)
                                                         (point-max))))
               (should (string-match-p "first" text))
@@ -2254,6 +2267,7 @@ record the fragment after the break as the file name."
         (let ((buf (ghostel-compile--start script buf-name
                                            default-directory)))
           (with-current-buffer buf
+            (set-window-buffer (selected-window) buf)
             (setq cols ghostel--term-cols)
             (should (> (length file) cols))
             (ghostel-test--wait-for
@@ -2314,8 +2328,7 @@ still in place."
           (ghostel-compile--finalize buf 0 (current-time))
           (should (eq major-mode 'ghostel-compile-view-mode))
           ;; Unwrapping joined the rows, so the whole path is one run now.
-          ;; Probed at its last character: a Windows drive prefix sits
-          ;; outside the span, which starts at the leading `/'.
+          ;; Probe its last character to cover the final wrapped fragment.
           (goto-char (point-min))
           (should (search-forward file nil t))
           (should (equal uri (get-text-property (1- (match-end 0))
@@ -2343,8 +2356,7 @@ ever, so that row would keep its link forever otherwise."
           (ghostel--schedule-link-detection)
           (should ghostel--cursor-char-pos)
           (ghostel-compile--finalize buf 0 (current-time))
-          ;; Probed at the path's last character: a Windows drive prefix
-          ;; sits outside the span, which starts at the leading `/'.
+          ;; Probe the path's last character on the final wrapped fragment.
           (goto-char (point-min))
           (should (search-forward file nil t))
           (should (equal uri (get-text-property (1- (match-end 0))
