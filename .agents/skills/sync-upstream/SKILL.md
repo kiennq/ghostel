@@ -28,7 +28,8 @@ Treat Ghostel as the commit stack that actually exists on `main`, not as an inve
 8. page-dirty, readonly-safe, and redraw performance tuning
 9. terminal title handling
 10. `ghostel-ignore-cursor-change`
-11. `ghostel-resize-only-when-selected-window`
+11. visible-window redraw deferral
+12. `ghostel-resize-only-when-selected-window`
 
 Preserve those topics while also preserving new upstream behavior. Outside this
 allowlist, prefer upstream and remove stale fork code, unused helpers, inert
@@ -54,6 +55,21 @@ Never reintroduce `backend_handoff_mutex`, synchronous reader joins, child
 waiting, or other backend teardown waits in an Emacs module call. The goal is
 not merely mutex removal: no native process operation should block Emacs while
 waiting for backend ownership, queued work, final output, or child exit.
+
+## Upstream Spawn Boundaries and Routing
+
+When resolving spawn conflicts, preserve upstream's argument flow and backend
+routing:
+
+- `ghostel--spawn-pty (program program-args extra-env &optional remote-p)`
+- `ghostel--spawn-process (program program-args remote-p)`
+- `ghostel--spawn-via-emacs (program program-args &optional remote-p)`
+- Do not thread pre-exec setup, rows/columns, or `stty` through these
+  boundaries.
+- Do not force local Windows native routing when `ghostel-use-native-pty` is
+  nil.
+- Do not reject remote Windows or TRAMP; route through Emacs file handlers as
+  upstream does.
 
 ## Update Workflow
 
@@ -88,14 +104,19 @@ Intermediate commits do not need to build individually. Supplementary changes (e
   behavior unless upstream supersedes it. Do not keep unrelated fork code just
   because it is on the fork side, and never resolve a whole file from the old
   fork.
-- **module.zig owns the dyn-loader ABI.** The fork replaces upstream's direct `env.bindFunction` registration with a loader export table (`ExportId` enum, export manifest array, loader dispatch switch). This is the entire point of the dyn-loader topic. Never resolve a module.zig conflict by keeping the upstream registration style.
+- **module.zig owns the dyn-loader ABI.** The fork derives the loader manifest
+  and dispatcher from the concatenated `FunctionEntry` arrays in
+  `GhostelTerm`, `module.zig`, and `ComintFilter`. Preserve that single-source
+  registry so new upstream `FunctionEntry` values are exported automatically.
+  Never restore the manual `ExportId`/manifest/switch tables or upstream's
+  direct `env.bindFunction` registration style.
 - **render.zig owns readonly-safe rendering.** The fork wraps buffer mutations in `(let ((inhibit-read-only t)) ...)` and adds `ghostel-full-redraw` support. These are the readonly and scrollback-viewport features. Never drop them during a conflict.
 - **NativeProcess.zig owns nonblocking backend delivery.** Preserve the MPSC
   `RingQueue`, producer enqueue-and-wake behavior, reader-only backend
   ownership, detached cleanup, and detached child reaping. Do not resolve a
   lifecycle conflict by adding a backend handoff mutex or joining the reader
   from the Emacs thread.
-- **ghostel.el owns ConPTY coalescing and runtime helpers.** The fork adds `ghostel--conpty-active-p`, `conpty--read-pending`, `ghostel--coalesce-*`, and the loader bootstrap chain. It also owns `ghostel-ignore-cursor-change` and `ghostel-resize-only-when-selected-window`. These are intentional fork behavior.
+- **ghostel.el owns ConPTY coalescing and runtime helpers.** The fork adds `ghostel--conpty-active-p`, `conpty--read-pending`, `ghostel--coalesce-*`, and the loader bootstrap chain. It also owns `ghostel-ignore-cursor-change`, visible-window redraw deferral, and `ghostel-resize-only-when-selected-window`. These are intentional fork behavior.
 - Workflow files: keep the fork's workflow removal intentionally, but do not delete new upstream workflow behavior unless the fork still means to remove it.
 - Shared test files: keep newer upstream tests and helper changes, then reapply the fork delta. Old whole-file resolutions are how upstream-safe tests get regressed.
 - Performance work should stay with the commit that owns it on `main`. If `main` keeps it inside a mega commit, preserve it there.
